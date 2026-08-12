@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.13
+//@display-name ⚡ FLASHBACK Memory v0.10.17
 //@api 3.0
-//@version 0.10.13
+//@version 0.10.17
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,7 +78,30 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.10.13
+ * ⚡ FLASHBACK Memory v0.10.17
+ *
+ * v0.10.17 reduces runtime RAM without reducing retained memories, recall corpus,
+ * candidate limits, or embedding dimensions. Sparse projections keep only compact
+ * derived fields (not the full visible body), the sparse LRU is capped at 384 entries,
+ * recall-shard caching is byte-aware (16 MiB) and does not retain locally-backed dense
+ * vector arrays, and local vector shards cache one decoded Float32 payload instead of
+ * both Base64 and decoded copies.
+ *
+ * ⚡ FLASHBACK Memory v0.10.16
+ *
+ * v0.10.16 additionally gzip-compresses immutable cold archive shard envelopes
+ * with browser CompressionStream. Active-session shards and hot recall indexes stay
+ * uncompressed, and archive bodies are decompressed only when a selected layer is read.
+ *
+ * v0.10.15 separates dense vectors from synchronized record shards. Rebuildable
+ * Float32 vector payloads are written to SafeLocalPluginStorage/IndexedDB as one
+ * sidecar per selected shard, while pluginStorage keeps canonical U+A text, hot
+ * metadata, sparse fields, hashes, and durable vector references. Missing local
+ * payloads fail soft to lexical/exact recall and can be regenerated explicitly.
+ *
+ * v0.10.14 replaces repeated next-session record/vector cloning with bounded
+ * immutable archive layers, manifest-only summary inspection, and source-shard
+ * compaction after durable archive verification.
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -393,9 +416,22 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.13';
+  const PLUGIN_VERSION = '0.10.17';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
+  const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
+  const FLASHBACK_ARCHIVE_SCOPE_PREFIX = 'flashback_archive_v1:';
+  const FLASHBACK_ARCHIVE_MAX_DEPTH = 256;
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_SCHEMA = 'flashback_memory.archive_shard_gzip.v1';
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_ENCODING = 'gzip+base64';
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_MIN_CHARS = 8192;
+  const FLASHBACK_ARCHIVE_SHARD_GZIP_MIN_SAVINGS = 0.08;
+  const FLASHBACK_VECTOR_SHARD_SCHEMA = 'flashback_memory.local_vector_shard.v1';
+  const FLASHBACK_VECTOR_REF_SCHEMA = 'flashback_memory.local_vector_ref.v1';
+  const FLASHBACK_VECTOR_STORAGE_PREFIX = `${PLUGIN_STORAGE_ID}:local-vector-shard:v1:`;
+  const FLASHBACK_VECTOR_STORAGE_MODE = 'local_float32_shard_v1';
+  const FLASHBACK_VECTOR_CACHE_MAX = 20;
+  const FLASHBACK_VECTOR_CACHE_TTL_MS = 10 * 60 * 1000;
   const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
   const MEMORY_SESSION_BRIDGE_PLUGIN_ID = 'flashback_hayaku_bridge';
   const MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
@@ -536,7 +572,7 @@
   const FLASHBACK_CANDIDATE_RRF_K = 52;
   const FLASHBACK_SPARSE_INDEX_VERSION = 2;
   const FLASHBACK_SHARD_INDEX_VERSION = 3;
-  const FLASHBACK_SPARSE_CACHE_MAX = 1600;
+  const FLASHBACK_SPARSE_CACHE_MAX = 384;
   const RECALL_LANES = Object.freeze(['short', 'medium', 'long']);
   const RECALL_LANE_LIMITS = Object.freeze({
     light: Object.freeze({ short: 6, medium: 6, long: 8 }),
@@ -695,7 +731,8 @@
   // splitter is retained so custom/older endpoints stay fail-safe.
   const GEMINI_001_SAFE_INPUT_TOKENS = 1800;
   const GEMINI_2_SAFE_INPUT_TOKENS = 7600;
-  const RECALL_SHARD_CACHE_MAX = 24;
+  const RECALL_SHARD_CACHE_MAX = 24; // hard entry-count safety ceiling; byte budget is authoritative
+  const RECALL_SHARD_CACHE_MAX_BYTES = 16 * 1024 * 1024;
   const RECALL_SHARD_CACHE_TTL_MS = 5 * 60 * 1000;
   const FLASHBACK_STATIC_CONTRACT_CACHE = new Map();
 
@@ -874,7 +911,32 @@
       hits: 0,
       misses: 0,
       evictions: 0,
-      invalidations: 0
+      invalidations: 0,
+      oversizedSkips: 0,
+      bytes: 0,
+      peakBytes: 0,
+      maxBytes: RECALL_SHARD_CACHE_MAX_BYTES
+    },
+    localVectorShardCache: new Map(),
+    localVectorShardStats: {
+      reads: 0,
+      writes: 0,
+      hits: 0,
+      misses: 0,
+      evictions: 0,
+      invalidations: 0,
+      missingPayloads: 0,
+      inlineFallbacks: 0,
+      bytesWritten: 0
+    },
+    archiveCompressionStats: {
+      compressedWrites: 0,
+      plainWrites: 0,
+      decompressions: 0,
+      compressedBytes: 0,
+      rawChars: 0,
+      failures: 0,
+      lastError: ''
     },
     sparseProjectionCache: new Map(),
     sparseProjectionRecordKeys: new Map(),
@@ -5663,8 +5725,80 @@
     manifest: (scopeKey) => `${scopePrefix(scopeKey)}:manifest:v2`,
     shard: (scopeKey, no) => `${scopePrefix(scopeKey)}:records:shard:${String(no).padStart(4, '0')}`,
     commitShard: (scopeKey, commitId, no) => `${scopePrefix(scopeKey)}:records:commit:${commitId}:shard:${String(no).padStart(4, '0')}`,
+    localVectorShard: (scopeKey, commitId, no) => `${FLASHBACK_VECTOR_STORAGE_PREFIX}${keyHash(scopeKey || 'global')}:${text(commitId || 'legacy')}:${String(no).padStart(4, '0')}`,
     worldline: (scopeKey) => `${scopePrefix(scopeKey)}:turn_worldline:v1`
   });
+
+  const flashbackArchiveScopeKey = archiveId => `${FLASHBACK_ARCHIVE_SCOPE_PREFIX}${text(archiveId || '').trim()}`;
+  const flashbackArchiveRefPointer = value => {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    const archiveId = text(source.archiveId || '').trim();
+    const archiveScopeKey = text(source.archiveScopeKey || (archiveId ? flashbackArchiveScopeKey(archiveId) : '')).trim();
+    if (!archiveId || !archiveScopeKey || archiveScopeKey === text(source.ownerScopeKey || '')) return null;
+    return {
+      schema: FLASHBACK_ARCHIVE_REF_SCHEMA,
+      archiveId,
+      archiveScopeKey,
+      generation: Math.max(1, Number(source.generation || 1) || 1),
+      depth: Math.max(1, Number(source.depth || 1) || 1),
+      deltaCount: Math.max(0, Number(source.deltaCount ?? source.recordCount ?? 0) || 0),
+      recordCount: Math.max(0, Number(source.recordCount || 0) || 0),
+      digest: text(source.digest || '').trim(),
+      responseTurnMax: Math.max(0, Number(source.responseTurnMax || 0) || 0),
+      createdAt: text(source.createdAt || ''),
+      updatedAt: text(source.updatedAt || '')
+    };
+  };
+
+  const normalizeFlashbackArchiveRef = value => {
+    const pointer = flashbackArchiveRefPointer(value);
+    if (!pointer) return null;
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    return {
+      ...pointer,
+      parentRef: flashbackArchiveRefPointer(source.parentRef || source.parentArchiveRef)
+    };
+  };
+
+  const flashbackArchiveRecordIdentity = (record = {}) => text(record.permanentHistoryId || '').trim() || stableHash(safeStringify([
+    text(record.sourceHash || ''),
+    text(record.sourceId || ''),
+    normalizeDisplaySourceType(record.sourceType || record.type || ''),
+    Number(record.turnIndex || record.pairIndex || 0) || 0,
+    Number(record.chunkIndex || 0) || 0,
+    text(record.text || '')
+  ]));
+
+  const normalizeFlashbackArchiveMemberIds = (items = []) => {
+    const out = [];
+    const seen = new Set();
+    for (const raw of Array.isArray(items) ? items : []) {
+      const value = text(raw || '').trim();
+      if (!value || seen.has(value)) continue;
+      seen.add(value);
+      out.push(value);
+      if (out.length >= 1000000) break;
+    }
+    return out.sort();
+  };
+
+  const flashbackArchiveMemberDigest = items => stableHash(
+    normalizeFlashbackArchiveMemberIds(items).join('\u0001')
+  );
+
+  const mergeFlashbackArchiveRecords = (...lists) => {
+    const byId = new Map();
+    for (const record of lists.flatMap(list => Array.isArray(list) ? list : [])) {
+      if (!record || typeof record !== 'object' || !isRetainedMemoryRecord(record)) continue;
+      const identity = flashbackArchiveRecordIdentity(record);
+      if (!identity) continue;
+      const current = byId.get(identity);
+      if (!current || parseTimeMs(record.updatedAt || record.createdAt) >= parseTimeMs(current.updatedAt || current.createdAt)) {
+        byId.set(identity, record);
+      }
+    }
+    return Array.from(byId.values()).sort((a, b) => recordSortKey(a).localeCompare(recordSortKey(b)));
+  };
 
   const collectSnapshotScopeCandidates = (snapshot = {}, targetScope = {}) => {
     const out = [];
@@ -5867,7 +6001,17 @@
     episodeChildCount: 0,
     turnWorldlineLiveHash: '',
     turnWorldlineRevision: 0,
-    turnWorldlineBindingPolicyVersion: 0
+    turnWorldlineBindingPolicyVersion: 0,
+    archiveRef: null,
+    archiveOwner: false,
+    archiveId: '',
+    archiveGeneration: 0,
+    archiveDigest: '',
+    vectorStorageMode: '',
+    vectorStorageBackend: '',
+    vectorSidecarCount: 0,
+    vectorSidecarBytes: 0,
+    vectorSidecarMissing: 0
   });
 
   const loadScopeManifest = async (scopeOrKey) => {
@@ -5903,6 +6047,11 @@
       shardCount: clampInt(parsed.shardCount ?? parsed.shards, 0, 100000, 0),
       shardSize: clampInt(parsed.shardSize, 1, 2000, DEFAULTS.shardSize),
       shardIndexVersion: clampInt(parsed.shardIndexVersion, 0, 10, 0),
+      archiveRef: normalizeFlashbackArchiveRef(parsed.archiveRef),
+      archiveOwner: parsed.archiveOwner === true,
+      archiveId: text(parsed.archiveId || ''),
+      archiveGeneration: Math.max(0, Number(parsed.archiveGeneration || 0) || 0),
+      archiveDigest: text(parsed.archiveDigest || ''),
       shardSummaries: Array.isArray(parsed.shardSummaries) ? parsed.shardSummaries.slice(0, 100000) : [],
       nextId: clampInt(parsed.nextId, 1, 1000000000, 1),
       responseTurnMax: clampInt(parsed.responseTurnMax, 0, 10000000, 0),
@@ -5984,11 +6133,13 @@
       copiedFromChatId: next.copiedFromChatId || '',
       copiedFromChatTitle: next.copiedFromChatTitle || ''
     };
-    try {
-      await rememberScope(registryScope, registryExtra);
-    } catch (error) {
-      warn('scope registry update failed', error);
-      queueScopeRegistryRetry(registryScope, registryExtra, error);
+    if (next.archiveOwner !== true && !text(next.scopeKey || '').startsWith(FLASHBACK_ARCHIVE_SCOPE_PREFIX)) {
+      try {
+        await rememberScope(registryScope, registryExtra);
+      } catch (error) {
+        warn('scope registry update failed', error);
+        queueScopeRegistryRetry(registryScope, registryExtra, error);
+      }
     }
     invalidateGuiDataCache('all');
     return next;
@@ -6512,9 +6663,371 @@
     return commitId ? scopeKeys.commitShard(scopeKey, commitId, shardIndex) : scopeKeys.shard(scopeKey, shardIndex);
   };
 
+  const flashbackBytesToBase64 = bytes => {
+    const source = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes || []);
+    try { if (typeof Buffer !== 'undefined') return Buffer.from(source).toString('base64'); } catch (_) {}
+    let binary = '';
+    const chunk = 0x8000;
+    for (let offset = 0; offset < source.length; offset += chunk) {
+      const slice = source.subarray(offset, Math.min(source.length, offset + chunk));
+      for (let index = 0; index < slice.length; index += 1) binary += String.fromCharCode(slice[index]);
+    }
+    if (typeof btoa === 'function') return btoa(binary);
+    throw new Error('FLASHBACK base64 encoder unavailable.');
+  };
+
+  const flashbackBase64ToBytes = encoded => {
+    const raw = text(encoded || '').trim();
+    if (!raw) return new Uint8Array();
+    try { if (typeof Buffer !== 'undefined') return new Uint8Array(Buffer.from(raw, 'base64')); } catch (_) {}
+    if (typeof atob !== 'function') throw new Error('FLASHBACK base64 decoder unavailable.');
+    const binary = atob(raw);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index) & 0xff;
+    return bytes;
+  };
+
+
+  const flashbackArchiveGzipSupported = () => typeof CompressionStream === 'function'
+    && typeof DecompressionStream === 'function'
+    && typeof TextEncoder === 'function'
+    && typeof TextDecoder === 'function'
+    && typeof Response === 'function';
+
+  const flashbackGzipText = async source => {
+    if (!flashbackArchiveGzipSupported()) return null;
+    const input = new Response(new TextEncoder().encode(String(source || ''))).body;
+    if (!input?.pipeThrough) throw new Error('FLASHBACK gzip input stream unavailable.');
+    const compressed = input.pipeThrough(new CompressionStream('gzip'));
+    return new Uint8Array(await new Response(compressed).arrayBuffer());
+  };
+
+  const flashbackGunzipText = async bytesInput => {
+    if (!flashbackArchiveGzipSupported()) throw new Error('FLASHBACK gzip decompression unavailable.');
+    const bytes = bytesInput instanceof Uint8Array ? bytesInput : new Uint8Array(bytesInput || []);
+    const input = new Response(bytes).body;
+    if (!input?.pipeThrough) throw new Error('FLASHBACK gunzip input stream unavailable.');
+    const decompressed = input.pipeThrough(new DecompressionStream('gzip'));
+    return new TextDecoder().decode(await new Response(decompressed).arrayBuffer());
+  };
+
+  const encodeFlashbackShardEnvelope = async (scopeKey, envelope) => {
+    const raw = safeStringify(envelope);
+    const archiveScope = text(scopeKey || '').startsWith(FLASHBACK_ARCHIVE_SCOPE_PREFIX);
+    if (!archiveScope) {
+      return { serialized: raw, compressed: false, rawHash: stableHash(raw), rawChars: raw.length, compressedBytes: 0 };
+    }
+    if (raw.length < FLASHBACK_ARCHIVE_SHARD_GZIP_MIN_CHARS || !flashbackArchiveGzipSupported()) {
+      Runtime.archiveCompressionStats.plainWrites += 1;
+      Runtime.archiveCompressionStats.rawChars += raw.length;
+      return { serialized: raw, compressed: false, rawHash: stableHash(raw), rawChars: raw.length, compressedBytes: 0 };
+    }
+    try {
+      const bytes = await flashbackGzipText(raw);
+      if (!bytes?.length) throw new Error('archive_gzip_empty');
+      const wrapper = {
+        schema: FLASHBACK_ARCHIVE_SHARD_GZIP_SCHEMA,
+        encoding: FLASHBACK_ARCHIVE_SHARD_GZIP_ENCODING,
+        scopeKey: text(scopeKey || ''),
+        commitId: text(envelope?.commitId || ''),
+        shard: Number(envelope?.shard || 0),
+        rawHash: stableHash(raw),
+        rawChars: raw.length,
+        compressedBytes: bytes.byteLength,
+        data: flashbackBytesToBase64(bytes),
+        createdAt: nowIso()
+      };
+      const serialized = safeStringify(wrapper);
+      const savingsRatio = raw.length > 0 ? 1 - (serialized.length / raw.length) : 0;
+      if (serialized.length >= raw.length || savingsRatio < FLASHBACK_ARCHIVE_SHARD_GZIP_MIN_SAVINGS) {
+        Runtime.archiveCompressionStats.plainWrites += 1;
+        Runtime.archiveCompressionStats.rawChars += raw.length;
+        return { serialized: raw, compressed: false, rawHash: wrapper.rawHash, rawChars: raw.length, compressedBytes: 0 };
+      }
+      Runtime.archiveCompressionStats.compressedWrites += 1;
+      Runtime.archiveCompressionStats.rawChars += raw.length;
+      Runtime.archiveCompressionStats.compressedBytes += bytes.byteLength;
+      Runtime.archiveCompressionStats.lastError = '';
+      return { serialized, compressed: true, rawHash: wrapper.rawHash, rawChars: raw.length, compressedBytes: bytes.byteLength };
+    } catch (error) {
+      Runtime.archiveCompressionStats.failures += 1;
+      Runtime.archiveCompressionStats.lastError = compact(error?.message || error, 400);
+      Runtime.archiveCompressionStats.plainWrites += 1;
+      Runtime.archiveCompressionStats.rawChars += raw.length;
+      return { serialized: raw, compressed: false, rawHash: stableHash(raw), rawChars: raw.length, compressedBytes: 0, fallbackError: Runtime.archiveCompressionStats.lastError };
+    }
+  };
+
+  const decodeFlashbackShardEnvelope = async rawInput => {
+    const outer = typeof rawInput === 'string' ? tryJsonParse(rawInput, null) : rawInput;
+    if (!outer || typeof outer !== 'object' || Array.isArray(outer)) return { parsed: outer, compressed: false };
+    if (outer.schema !== FLASHBACK_ARCHIVE_SHARD_GZIP_SCHEMA) return { parsed: outer, compressed: false };
+    try {
+      if (outer.encoding !== FLASHBACK_ARCHIVE_SHARD_GZIP_ENCODING) throw new Error('archive_gzip_encoding_invalid');
+      const raw = await flashbackGunzipText(flashbackBase64ToBytes(outer.data || ''));
+      if (!raw || (outer.rawHash && stableHash(raw) !== text(outer.rawHash))) throw new Error('archive_gzip_digest_mismatch');
+      const parsed = tryJsonParse(raw, null);
+      if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('archive_gzip_body_invalid');
+      Runtime.archiveCompressionStats.decompressions += 1;
+      Runtime.archiveCompressionStats.lastError = '';
+      return { parsed, compressed: true };
+    } catch (error) {
+      Runtime.archiveCompressionStats.failures += 1;
+      Runtime.archiveCompressionStats.lastError = compact(error?.message || error, 400);
+      return { parsed: null, compressed: true, error: Runtime.archiveCompressionStats.lastError };
+    }
+  };
+
+  const flashbackVectorRefFor = (storageKey, item, payloadDigest = '') => ({
+    schema: FLASHBACK_VECTOR_REF_SCHEMA,
+    storage: 'local',
+    storageKey: text(storageKey || ''),
+    recordId: text(item?.recordId || ''),
+    offset: Math.max(0, Number(item?.offset || 0) || 0),
+    length: Math.max(0, Number(item?.length || 0) || 0),
+    digest: text(payloadDigest || ''),
+    mode: FLASHBACK_VECTOR_STORAGE_MODE
+  });
+
+  const normalizeFlashbackVectorRef = value => {
+    const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+    if (source.schema !== FLASHBACK_VECTOR_REF_SCHEMA || source.storage !== 'local' || !text(source.storageKey || '')) return null;
+    return flashbackVectorRefFor(source.storageKey, source, source.digest);
+  };
+
+  const flashbackVectorShardCacheKey = storageKey => text(storageKey || '');
+  const decodedFlashbackVectorShard = payload => {
+    if (!payload || payload.schema !== FLASHBACK_VECTOR_SHARD_SCHEMA || !text(payload.data || '')) return null;
+    try {
+      const bytes = flashbackBase64ToBytes(payload.data);
+      if (!bytes.length || bytes.byteLength % 4 !== 0) return null;
+      const copy = new Uint8Array(bytes.length);
+      copy.set(bytes);
+      const floats = new Float32Array(copy.buffer);
+      if (Number(payload.floatCount || 0) > 0 && floats.length !== Number(payload.floatCount)) return null;
+      return {
+        schema: payload.schema,
+        version: Number(payload.version || 1),
+        scopeKey: text(payload.scopeKey || ''),
+        commitId: text(payload.commitId || ''),
+        shardIndex: Number(payload.shardIndex || 0),
+        itemCount: Number(payload.itemCount || 0),
+        floatCount: floats.length,
+        byteLength: floats.byteLength,
+        items: Array.isArray(payload.items) ? payload.items.map(item => ({
+          recordId: text(item?.recordId || ''),
+          offset: Math.max(0, Number(item?.offset || 0) || 0),
+          length: Math.max(0, Number(item?.length || 0) || 0)
+        })) : [],
+        digest: text(payload.digest || ''),
+        floats
+      };
+    } catch (_) { return null; }
+  };
+
+  const rememberFlashbackVectorShard = (storageKey, payload) => {
+    const cacheKey = flashbackVectorShardCacheKey(storageKey);
+    const decoded = decodedFlashbackVectorShard(payload);
+    if (!cacheKey || !decoded) return false;
+    Runtime.localVectorShardCache.delete(cacheKey);
+    while (Runtime.localVectorShardCache.size >= FLASHBACK_VECTOR_CACHE_MAX) {
+      const oldest = Runtime.localVectorShardCache.keys().next().value;
+      if (!oldest) break;
+      Runtime.localVectorShardCache.delete(oldest);
+      Runtime.localVectorShardStats.evictions += 1;
+    }
+    // Keep exactly one decoded Float32 payload in RAM. The Base64 storage body is
+    // intentionally not retained in the runtime cache after verification.
+    Runtime.localVectorShardCache.set(cacheKey, { ...decoded, at: Date.now() });
+    return true;
+  };
+
+  const invalidateFlashbackVectorShardCache = (storageKey = '') => {
+    const wanted = text(storageKey || '');
+    let removed = 0;
+    for (const key of Array.from(Runtime.localVectorShardCache.keys())) {
+      if (wanted && key !== wanted) continue;
+      Runtime.localVectorShardCache.delete(key);
+      removed += 1;
+    }
+    if (removed) Runtime.localVectorShardStats.invalidations += removed;
+    return removed;
+  };
+
+  const buildFlashbackVectorShardPayload = (scopeKey, commitId, shardIndex, records = []) => {
+    const rows = [];
+    let total = 0;
+    for (const record of Array.isArray(records) ? records : []) {
+      const vector = Array.isArray(record?.vector) ? record.vector.map(Number).filter(Number.isFinite) : [];
+      if (!vector.length) continue;
+      rows.push({ recordId: text(record.id || record.hash || ''), offset: total, length: vector.length, vector });
+      total += vector.length;
+    }
+    if (!rows.length || total <= 0) return null;
+    const floats = new Float32Array(total);
+    const items = [];
+    for (const row of rows) {
+      floats.set(row.vector, row.offset);
+      items.push({ recordId: row.recordId, offset: row.offset, length: row.length });
+    }
+    const data = flashbackBytesToBase64(new Uint8Array(floats.buffer));
+    const digestValue = stableHash(safeStringify({ scopeKey, commitId, shardIndex, items, data }));
+    return {
+      schema: FLASHBACK_VECTOR_SHARD_SCHEMA,
+      version: 1,
+      scopeKey: text(scopeKey || ''),
+      commitId: text(commitId || ''),
+      shardIndex: Number(shardIndex || 0),
+      itemCount: items.length,
+      floatCount: total,
+      byteLength: floats.byteLength,
+      items,
+      data,
+      digest: digestValue,
+      createdAt: nowIso()
+    };
+  };
+
+  const persistFlashbackVectorShard = async (scopeKey, commitId, shardIndex, records = []) => {
+    const payload = buildFlashbackVectorShardPayload(scopeKey, commitId, shardIndex, records);
+    if (!payload) return { ok: false, reason: 'no_vectors', records, sidecarCount: 0, sidecarBytes: 0 };
+    const status = await RisuCompat.localStorageStatus();
+    if (!status.available || !status.writable) {
+      Runtime.localVectorShardStats.inlineFallbacks += 1;
+      return { ok: false, reason: 'local_storage_unavailable', records, sidecarCount: 0, sidecarBytes: 0, backend: status.backend };
+    }
+    const storageKey = scopeKeys.localVectorShard(scopeKey, commitId, shardIndex);
+    const written = await RisuCompat.localSetItem(storageKey, payload);
+    if (!written) {
+      Runtime.localVectorShardStats.inlineFallbacks += 1;
+      return { ok: false, reason: 'local_vector_write_failed', records, sidecarCount: 0, sidecarBytes: 0, backend: status.backend };
+    }
+    const readback = await RisuCompat.localGetItem(storageKey);
+    const parsed = typeof readback === 'string' ? tryJsonParse(readback, null) : readback;
+    if (!parsed || parsed.schema !== FLASHBACK_VECTOR_SHARD_SCHEMA || text(parsed.digest || '') !== payload.digest) {
+      await RisuCompat.localRemoveItem(storageKey).catch?.(() => {});
+      Runtime.localVectorShardStats.inlineFallbacks += 1;
+      return { ok: false, reason: 'local_vector_readback_failed', records, sidecarCount: 0, sidecarBytes: 0, backend: status.backend };
+    }
+    rememberFlashbackVectorShard(storageKey, parsed);
+    const itemById = new Map(payload.items.map(item => [item.recordId, item]));
+    const persistedRecords = records.map(record => {
+      const item = itemById.get(text(record.id || record.hash || ''));
+      if (!item) return record;
+      return {
+        ...record,
+        vector: [],
+        vectorRef: flashbackVectorRefFor(storageKey, item, payload.digest),
+        vectorStorageMode: FLASHBACK_VECTOR_STORAGE_MODE,
+        vectorPayloadLocal: true,
+        dim: item.length
+      };
+    });
+    Runtime.localVectorShardStats.writes += 1;
+    Runtime.localVectorShardStats.bytesWritten += Number(payload.byteLength || 0) || 0;
+    return { ok: true, reason: 'local_vector_sidecar_written', records: persistedRecords, storageKey, payload, sidecarCount: 1, sidecarBytes: Number(payload.byteLength || 0) || 0, backend: status.backend };
+  };
+
+  const loadFlashbackVectorShardPayload = async storageKey => {
+    const cacheKey = flashbackVectorShardCacheKey(storageKey);
+    const cached = Runtime.localVectorShardCache.get(cacheKey);
+    if (cached && Date.now() - Number(cached.at || 0) <= FLASHBACK_VECTOR_CACHE_TTL_MS) {
+      Runtime.localVectorShardCache.delete(cacheKey);
+      Runtime.localVectorShardCache.set(cacheKey, { ...cached, at: Date.now() });
+      Runtime.localVectorShardStats.hits += 1;
+      return Runtime.localVectorShardCache.get(cacheKey);
+    }
+    if (cached) Runtime.localVectorShardCache.delete(cacheKey);
+    const raw = await RisuCompat.localGetItem(storageKey);
+    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+    Runtime.localVectorShardStats.reads += 1;
+    if (!parsed || parsed.schema !== FLASHBACK_VECTOR_SHARD_SCHEMA || !text(parsed.data || '')) {
+      Runtime.localVectorShardStats.misses += 1;
+      return null;
+    }
+    const expectedDigest = stableHash(safeStringify({
+      scopeKey: parsed.scopeKey,
+      commitId: parsed.commitId,
+      shardIndex: parsed.shardIndex,
+      items: parsed.items,
+      data: parsed.data
+    }));
+    if (text(parsed.digest || '') !== expectedDigest || !rememberFlashbackVectorShard(storageKey, parsed)) {
+      Runtime.localVectorShardStats.misses += 1;
+      return null;
+    }
+    return Runtime.localVectorShardCache.get(cacheKey) || null;
+  };
+
+  const hydrateFlashbackVectorRecords = async (records = [], metrics = null) => {
+    const list = Array.isArray(records) ? records : [];
+    const refs = list.map(record => normalizeFlashbackVectorRef(record?.vectorRef)).filter(Boolean);
+    if (!refs.length) return { records: list, missingPayloads: 0, localReads: 0 };
+    const storageKeys = Array.from(new Set(refs.map(ref => ref.storageKey)));
+    const decodedByKey = new Map();
+    for (const storageKey of storageKeys) {
+      const cached = await loadFlashbackVectorShardPayload(storageKey);
+      if (cached?.floats instanceof Float32Array) decodedByKey.set(storageKey, cached.floats);
+    }
+    let missingPayloads = 0;
+    const hydrated = list.map(record => {
+      const ref = normalizeFlashbackVectorRef(record?.vectorRef);
+      if (!ref || (Array.isArray(record.vector) && record.vector.length)) return record;
+      const floats = decodedByKey.get(ref.storageKey);
+      if (!floats || ref.offset + ref.length > floats.length || ref.length <= 0) {
+        missingPayloads += 1;
+        return { ...record, vector: [], vectorPayloadMissing: true, vectorPayloadLocal: true };
+      }
+      // The hydrated Array is request-local. It is never inserted into the recall-shard
+      // cache, so the persistent RAM copy remains the Float32 sidecar above.
+      return {
+        ...record,
+        vector: Array.from(floats.subarray(ref.offset, ref.offset + ref.length)),
+        dim: ref.length,
+        vectorPayloadMissing: false,
+        vectorPayloadLocal: true
+      };
+    });
+    if (missingPayloads) Runtime.localVectorShardStats.missingPayloads += missingPayloads;
+    bumpStorageMetric(metrics, 'localVectorReads', storageKeys.length);
+    bumpStorageMetric(metrics, 'localVectorMissing', missingPayloads);
+    return { records: hydrated, missingPayloads, localReads: storageKeys.length };
+  };
+
+  const removeFlashbackLocalVectorShard = async (scopeKey, commitId, shardIndex) => {
+    const storageKey = scopeKeys.localVectorShard(scopeKey, commitId, shardIndex);
+    invalidateFlashbackVectorShardCache(storageKey);
+    return await RisuCompat.localRemoveItem(storageKey);
+  };
+
   const storageShardChecksum = (records = []) => stableHash(safeStringify(Array.isArray(records) ? records : []));
 
   const recallShardCacheKey = (scopeKey, commitId, shardIndex) => `${text(scopeKey)}\u0000${text(commitId)}\u0000${Number(shardIndex)}`;
+
+  const dropRecallShardCacheEntry = cacheKey => {
+    const entry = Runtime.recallShardCache.get(cacheKey);
+    if (!entry) return false;
+    Runtime.recallShardCache.delete(cacheKey);
+    Runtime.recallShardCacheStats.bytes = Math.max(0, Number(Runtime.recallShardCacheStats.bytes || 0) - Math.max(0, Number(entry.estimatedBytes || 0) || 0));
+    return true;
+  };
+
+  const recallShardCacheRecordForStorage = record => {
+    const ref = normalizeFlashbackVectorRef(record?.vectorRef);
+    if (!ref || !Array.isArray(record?.vector) || !record.vector.length) return record;
+    // Dense vectors backed by the local Float32 sidecar are request-local only. The
+    // shard cache keeps the canonical record/body plus vectorRef, not another Number[].
+    return { ...record, vector: [], dim: Number(record.dim || ref.length || 0) || ref.length, vectorPayloadLocal: true };
+  };
+
+  const estimateRecallShardCacheRecordBytes = record => {
+    if (!record || typeof record !== 'object') return 0;
+    const vectorBytes = Array.isArray(record.vector) ? record.vector.length * 8 : 0;
+    let jsonChars = 0;
+    try { jsonChars = JSON.stringify({ ...record, vector: undefined }).length; }
+    catch (_) { jsonChars = text(record.text || '').length + text(record.title || '').length + 256; }
+    return Math.max(256, jsonChars * 2 + vectorBytes + 192);
+  };
 
   const invalidateRecallShardCache = (scopeKey = '', commitId = '') => {
     const wantedScope = text(scopeKey || '');
@@ -6523,8 +7036,7 @@
     for (const [key, entry] of Runtime.recallShardCache.entries()) {
       if (wantedScope && text(entry?.scopeKey || '') !== wantedScope) continue;
       if (wantedCommit && text(entry?.commitId || '') !== wantedCommit) continue;
-      Runtime.recallShardCache.delete(key);
-      removed += 1;
+      if (dropRecallShardCacheEntry(key)) removed += 1;
     }
     if (removed) Runtime.recallShardCacheStats.invalidations += removed;
     return removed;
@@ -6533,21 +7045,31 @@
   const rememberRecallShardCache = (scopeKey, commitId, shardIndex, records, expectedRecordCount) => {
     if (!scopeKey || !commitId || !Array.isArray(records)) return false;
     const key = recallShardCacheKey(scopeKey, commitId, shardIndex);
-    Runtime.recallShardCache.delete(key);
-    while (Runtime.recallShardCache.size >= RECALL_SHARD_CACHE_MAX) {
+    dropRecallShardCacheEntry(key);
+    const cacheRecords = records.map(recallShardCacheRecordForStorage);
+    const estimatedBytes = cacheRecords.reduce((sum, record) => sum + estimateRecallShardCacheRecordBytes(record), 256);
+    if (estimatedBytes > RECALL_SHARD_CACHE_MAX_BYTES) {
+      Runtime.recallShardCacheStats.oversizedSkips += 1;
+      return false;
+    }
+    while (Runtime.recallShardCache.size >= RECALL_SHARD_CACHE_MAX
+      || Number(Runtime.recallShardCacheStats.bytes || 0) + estimatedBytes > RECALL_SHARD_CACHE_MAX_BYTES) {
       const oldest = Runtime.recallShardCache.keys().next().value;
       if (!oldest) break;
-      Runtime.recallShardCache.delete(oldest);
-      Runtime.recallShardCacheStats.evictions += 1;
+      if (dropRecallShardCacheEntry(oldest)) Runtime.recallShardCacheStats.evictions += 1;
+      else break;
     }
     Runtime.recallShardCache.set(key, {
       scopeKey: text(scopeKey),
       commitId: text(commitId),
       shardIndex: Number(shardIndex),
       expectedRecordCount,
-      records,
+      estimatedBytes,
+      records: cacheRecords,
       at: Date.now()
     });
+    Runtime.recallShardCacheStats.bytes = Math.max(0, Number(Runtime.recallShardCacheStats.bytes || 0)) + estimatedBytes;
+    Runtime.recallShardCacheStats.peakBytes = Math.max(Number(Runtime.recallShardCacheStats.peakBytes || 0), Runtime.recallShardCacheStats.bytes);
     return true;
   };
 
@@ -6574,9 +7096,10 @@
           Runtime.recallShardCache.set(key, { ...cached, at: Date.now() });
           Runtime.recallShardCacheStats.hits += 1;
           bumpStorageMetric(metrics, 'cacheHits');
-          return { missing: false, corrupt: false, records: cached.records, cacheHit: true };
+          const hydratedCached = await hydrateFlashbackVectorRecords(cached.records, metrics);
+          return { missing: false, corrupt: false, records: hydratedCached.records, cacheHit: true, vectorPayloadMissing: hydratedCached.missingPayloads };
         }
-        Runtime.recallShardCache.delete(key);
+        dropRecallShardCacheEntry(key);
         Runtime.recallShardCacheStats.invalidations += 1;
       }
       Runtime.recallShardCacheStats.misses += 1;
@@ -6592,7 +7115,8 @@
       const fallbackRaw = await RisuCompat.getItem(scopeKeys.shard(scopeKey, shardIndex));
       bumpStorageMetric(metrics, 'storageReadMs', Date.now() - fallbackStartedAt);
       bumpStorageMetric(metrics, 'storageReads');
-      const fallbackParsed = typeof fallbackRaw === 'string' ? tryJsonParse(fallbackRaw, null) : fallbackRaw;
+      const fallbackDecoded = await decodeFlashbackShardEnvelope(fallbackRaw);
+      const fallbackParsed = fallbackDecoded.parsed;
       if (fallbackParsed?.commitId === commitId) {
         raw = fallbackRaw;
         fallbackUsed = true;
@@ -6600,8 +7124,10 @@
     }
     if (raw == null || raw === '') return { missing: true, corrupt: false, records: [] };
     const parseStartedAt = Date.now();
-    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+    const decodedEnvelope = await decodeFlashbackShardEnvelope(raw);
+    const parsed = decodedEnvelope.parsed;
     bumpStorageMetric(metrics, 'parseMs', Date.now() - parseStartedAt);
+    if (decodedEnvelope.compressed) bumpStorageMetric(metrics, 'archiveDecompressions');
     const objectPayload = parsed && typeof parsed === 'object' && !Array.isArray(parsed);
     const recordsPayload = objectPayload && Array.isArray(parsed.records) ? parsed.records : (Array.isArray(parsed) ? parsed : null);
     const commitMatches = !commitId || (objectPayload && text(parsed.commitId || '') === commitId);
@@ -6616,10 +7142,12 @@
     if (!recordsPayload || !recordObjectsValid || !commitMatches || !scopeMatches || !shardMatches || !checksumMatches || !recordCountMatches) {
       return { missing: true, corrupt: true, records: [] };
     }
+    const hydrated = await hydrateFlashbackVectorRecords(recordsPayload, metrics);
+    const hydratedRecords = hydrated.records;
     if (options.useCache === true && commitId && objectPayload && parsed.checksum && !fallbackUsed) {
-      rememberRecallShardCache(scopeKey, commitId, shardIndex, recordsPayload, expectedRecordCount);
+      rememberRecallShardCache(scopeKey, commitId, shardIndex, hydratedRecords, expectedRecordCount);
     }
-    return { missing: false, corrupt: false, records: recordsPayload, cacheHit: false };
+    return { missing: false, corrupt: false, records: hydratedRecords, cacheHit: false, vectorPayloadMissing: hydrated.missingPayloads };
   };
 
   const mapOrderedWithConcurrency = async (items = [], concurrency = 1, mapper) => {
@@ -6640,7 +7168,7 @@
     return out;
   };
 
-  const loadScopeRecordsForRecall = async (scopeOrKey, selection = null, options = {}) => {
+  const loadSingleScopeRecordsForRecall = async (scopeOrKey, selection = null, options = {}) => {
     const requestedScopeKey = typeof scopeOrKey === 'string' ? scopeOrKey : text(scopeOrKey?.scopeKey || '');
     const suppliedManifest = options.manifest && typeof options.manifest === 'object'
       && text(options.manifest.scopeKey || '') === text(requestedScopeKey || options.manifest.scopeKey || '')
@@ -6661,6 +7189,8 @@
       storageReads: 0,
       cacheHits: 0,
       cacheMisses: 0,
+      localVectorReads: 0,
+      localVectorMissing: 0,
       shardRequests: indexes.length,
       concurrency: Math.min(RECALL_SHARD_READ_CONCURRENCY, Math.max(1, indexes.length))
     };
@@ -6704,6 +7234,103 @@
     };
   };
 
+  const loadScopeRecordsForRecall = async (scopeOrKey, selection = null, options = {}) => {
+    const local = await loadSingleScopeRecordsForRecall(scopeOrKey, selection, options);
+    const archiveRef = normalizeFlashbackArchiveRef(local.manifest?.archiveRef || options?.manifest?.archiveRef);
+    if (!archiveRef || archiveRef.archiveScopeKey === local.manifest.scopeKey) return local;
+
+    const query = options?.archiveQuery && typeof options.archiveQuery === 'object' ? options.archiveQuery : null;
+    const seen = new Set();
+    const layers = [];
+    let cursor = archiveRef;
+    let missingShards = 0;
+    let corruptShards = 0;
+    let recordCountMismatch = false;
+    let storageReadMs = Number(local.performance?.storageReadMs || 0);
+    let parseMs = Number(local.performance?.parseMs || 0);
+    let checksumMs = Number(local.performance?.checksumMs || 0);
+    let archiveStorageReads = 0;
+    let archiveCacheHits = 0;
+    let archiveShardRequests = 0;
+
+    while (cursor && layers.length < FLASHBACK_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.archiveScopeKey)) {
+        recordCountMismatch = true;
+        break;
+      }
+      seen.add(cursor.archiveScopeKey);
+      const archiveManifest = await loadScopeManifest(cursor.archiveScopeKey);
+      let archiveSelection = null;
+      if (query?.queryText) {
+        archiveSelection = selectRecallShardIndexes(
+          archiveManifest,
+          query.queryText,
+          Array.isArray(query.queryVector) ? query.queryVector : [],
+          query.queryProvider || 'hash',
+          query.queryType || QUERY_TYPES.FACT,
+          query.settings || DEFAULTS,
+          query.queryModel || ''
+        );
+      }
+      const archive = await loadSingleScopeRecordsForRecall(
+        cursor.archiveScopeKey,
+        archiveSelection,
+        { manifest: archiveManifest }
+      );
+      layers.push({ ref: cursor, loaded: archive });
+      missingShards += Math.max(0, Number(archive.manifest?.missingShards || 0) || 0);
+      corruptShards += Math.max(0, Number(archive.manifest?.corruptShards || 0) || 0);
+      recordCountMismatch = recordCountMismatch || archive.manifest?.recordCountMismatch === true
+        || archiveManifest.archiveOwner !== true
+        || text(archiveManifest.archiveId || '') !== cursor.archiveId;
+      archiveStorageReads += Number(archive.performance?.storageReads || 0) || 0;
+      archiveCacheHits += Number(archive.performance?.cacheHits || 0) || 0;
+      archiveShardRequests += Number(archive.performance?.shardRequests || 0) || 0;
+      storageReadMs += Number(archive.performance?.storageReadMs || 0) || 0;
+      parseMs += Number(archive.performance?.parseMs || 0) || 0;
+      checksumMs += Number(archive.performance?.checksumMs || 0) || 0;
+      cursor = normalizeFlashbackArchiveRef(cursor.parentRef || archiveManifest.parentArchiveRef);
+    }
+    if (cursor) recordCountMismatch = true;
+
+    const markedArchiveRecords = layers.slice().reverse().flatMap(({ ref, loaded }) => loaded.records.map(record => ({
+      ...record,
+      archiveReferenceOnly: true,
+      archiveId: ref.archiveId,
+      archiveSourceScopeKey: ref.archiveScopeKey,
+      logicalScopeKey: local.manifest.scopeKey
+    })));
+    const records = mergeRecallRecordLists(markedArchiveRecords, local.records);
+    return {
+      manifest: {
+        ...local.manifest,
+        localCount: local.records.length,
+        archiveCount: markedArchiveRecords.length,
+        expectedCount: Math.max(0, Number(local.manifest.expectedCount || 0) || 0) + Math.max(0, Number(archiveRef.recordCount || 0) || 0),
+        count: records.length,
+        missingShards: Math.max(0, Number(local.manifest.missingShards || 0) || 0) + missingShards,
+        corruptShards: Math.max(0, Number(local.manifest.corruptShards || 0) || 0) + corruptShards,
+        recordCountMismatch: local.manifest.recordCountMismatch === true || recordCountMismatch,
+        archiveRef
+      },
+      records,
+      selection: {
+        ...(local.selection || {}),
+        archiveLayers: layers.map(({ ref, loaded }) => ({ archiveId: ref.archiveId, selection: loaded.selection || null }))
+      },
+      performance: {
+        ...(local.performance || {}),
+        archiveStorageReads,
+        archiveCacheHits,
+        archiveShardRequests,
+        archiveLayers: layers.length,
+        storageReadMs,
+        parseMs,
+        checksumMs
+      }
+    };
+  };
+
   const removeCommitShardSet = async (scopeKey, commitId, shardCount) => {
     const cleanCommitId = text(commitId || '').trim();
     if (!scopeKey || !cleanCommitId) return 0;
@@ -6711,6 +7338,7 @@
     let removed = 0;
     for (let i = 0; i < count; i += 1) {
       await RisuCompat.removeItem(scopeKeys.commitShard(scopeKey, cleanCommitId, i));
+      await removeFlashbackLocalVectorShard(scopeKey, cleanCommitId, i).catch(() => false);
       removed += 1;
     }
     invalidateRecallShardCache(scopeKey, cleanCommitId);
@@ -6727,6 +7355,7 @@
         const key = scopeKeys.commitShard(scopeKey, commitId, i);
         if (options.strict) await requireStorageRemove(key, 'scope commit shard remove');
         else await RisuCompat.removeItem(key);
+        await removeFlashbackLocalVectorShard(scopeKey, commitId, i).catch(() => false);
       }
       const legacyKey = scopeKeys.shard(scopeKey, i);
       if (options.strict) await requireStorageRemove(legacyKey, 'scope legacy shard remove');
@@ -6776,7 +7405,7 @@
     for (const [cacheKey, entry] of Runtime.recallShardCache.entries()) {
       if (text(entry?.scopeKey || '') !== text(scopeKey)) continue;
       if (activeCommitId && text(entry?.commitId || '') === text(activeCommitId)) continue;
-      Runtime.recallShardCache.delete(cacheKey);
+      dropRecallShardCacheEntry(cacheKey);
       Runtime.recallShardCacheStats.invalidations += 1;
     }
     return removed;
@@ -6813,9 +7442,30 @@
       && (removed > 0 || loaded.manifest.externalRetirementVersion < EXTERNAL_RETIREMENT_VERSION)) {
       scheduleExternalRetirement(loaded.manifest.scopeKey, { reason: 'scope_read' });
     }
+    const archiveRef = normalizeFlashbackArchiveRef(loaded.manifest.archiveRef);
+    const archiveState = archiveRef ? await loadFlashbackArchiveChain(archiveRef) : null;
+    const archiveRecords = (archiveState?.recordsList || []).map(record => ({
+      ...record,
+      archiveReferenceOnly: true,
+      archiveId: archiveRef?.archiveId || '',
+      archiveSourceScopeKey: archiveRef?.archiveScopeKey || '',
+      logicalScopeKey: loaded.manifest.scopeKey
+    }));
+    const records = mergeFlashbackArchiveRecords(archiveRecords, retained);
     return {
-      manifest: { ...loaded.manifest, count: retained.length, externalRetirementPending: removed },
-      records: retained
+      manifest: {
+        ...loaded.manifest,
+        localCount: retained.length,
+        archiveCount: archiveRecords.length,
+        expectedCount: records.length,
+        count: records.length,
+        missingShards: Math.max(0, Number(loaded.manifest.missingShards || 0) || 0) + Math.max(0, Number(archiveState?.missingShards || 0) || 0),
+        corruptShards: Math.max(0, Number(loaded.manifest.corruptShards || 0) || 0) + Math.max(0, Number(archiveState?.corruptShards || 0) || 0),
+        recordCountMismatch: loaded.manifest.recordCountMismatch === true || (archiveRef ? archiveState?.verified !== true : false),
+        externalRetirementPending: removed,
+        archiveRef
+      },
+      records
     };
   };
 
@@ -6863,6 +7513,7 @@
     const oldManifest = await loadScopeManifest(scope);
     assertNoForeignScopeCollision(oldManifest, 'scope save');
     let clean = (records || [])
+      .filter(record => record?.archiveReferenceOnly !== true)
       .filter(record => record && typeof record === 'object' && record.text && Array.isArray(record.vector))
       .filter(isRetainedMemoryRecord);
     const derivedRecords = clean.filter(isResponseDerivedIndexRecord);
@@ -6925,10 +7576,14 @@
         try {
         const shard = clean.slice(i * shardSize, (i + 1) * shardSize);
           const summary = buildRecallShardSummary(shard, i, cfg);
-        await requireStorageWrite(scopeKeys.commitShard(scope.scopeKey, commitId, i), safeStringify({ version: 2, shard: i, scopeKey: scope.scopeKey, commitId, checksum: storageShardChecksum(shard), records: shard }), 'scope shard save');
+          const vectorTier = await persistFlashbackVectorShard(scope.scopeKey, commitId, i, shard);
+          const persistedShard = vectorTier.ok ? vectorTier.records : shard;
+          const shardEnvelope = { version: 2, shard: i, scopeKey: scope.scopeKey, commitId, checksum: storageShardChecksum(persistedShard), vectorStorageMode: vectorTier.ok ? FLASHBACK_VECTOR_STORAGE_MODE : 'inline', vectorStorageKey: vectorTier.storageKey || '', records: persistedShard };
+          const encodedShard = await encodeFlashbackShardEnvelope(scope.scopeKey, shardEnvelope);
+          await requireStorageWrite(scopeKeys.commitShard(scope.scopeKey, commitId, i), encodedShard.serialized, 'scope shard save');
           const elapsed = Date.now() - startedAt;
           shardWriteWorkMs += elapsed;
-          return { ok: true, summary, elapsed };
+          return { ok: true, summary, elapsed, vectorTier, archiveCompression: encodedShard };
         } catch (error) {
           const elapsed = Date.now() - startedAt;
           shardWriteWorkMs += elapsed;
@@ -6975,6 +7630,11 @@
       shardIndexVersion: FLASHBACK_SHARD_INDEX_VERSION,
       shardSummaries,
       commitId,
+      vectorStorageMode: shardWriteResults.some(result => result?.vectorTier?.ok) ? FLASHBACK_VECTOR_STORAGE_MODE : 'inline',
+      vectorStorageBackend: shardWriteResults.find(result => result?.vectorTier?.backend)?.vectorTier?.backend || '',
+      vectorSidecarCount: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarCount || 0), 0),
+      vectorSidecarBytes: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarBytes || 0), 0),
+      vectorSidecarMissing: 0,
       nextId: Math.max(oldManifest.nextId || 1, maxNumericId + 1),
       stats,
       responseTurnMax: responseTurnStats.max,
@@ -7002,7 +7662,15 @@
       episodeChildCount: oldManifest.episodeChildCount || 0,
       turnWorldlineLiveHash: oldManifest.turnWorldlineLiveHash || '',
       turnWorldlineRevision: oldManifest.turnWorldlineRevision || 0,
-      turnWorldlineBindingPolicyVersion: oldManifest.turnWorldlineBindingPolicyVersion || 0
+      turnWorldlineBindingPolicyVersion: oldManifest.turnWorldlineBindingPolicyVersion || 0,
+      archiveRef: normalizeFlashbackArchiveRef(oldManifest.archiveRef),
+      archiveOwner: oldManifest.archiveOwner === true,
+      archiveId: text(oldManifest.archiveId || ''),
+      archiveGeneration: Math.max(0, Number(oldManifest.archiveGeneration || 0) || 0),
+      archiveDigest: text(oldManifest.archiveDigest || ''),
+      archiveLinkedAt: text(oldManifest.archiveLinkedAt || ''),
+      archiveCompactedAt: text(oldManifest.archiveCompactedAt || ''),
+      archiveCompactedRecords: Math.max(0, Number(oldManifest.archiveCompactedRecords || 0) || 0)
     };
     let savedManifest;
     try {
@@ -7032,6 +7700,9 @@
         shardWriteWallMs,
         shardWriteWorkMs,
         shardWrites: shardCount,
+        vectorSidecars: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarCount || 0), 0),
+        vectorSidecarBytes: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarBytes || 0), 0),
+        vectorInlineFallbacks: shardWriteResults.filter(result => result?.vectorTier && !result.vectorTier.ok && result.vectorTier.reason !== 'no_vectors').length,
         concurrency: Math.min(STORAGE_SHARD_WRITE_CONCURRENCY, Math.max(1, shardCount))
       }
     };
@@ -7441,7 +8112,16 @@
   const cloneScopeStorage = async (fromScopeMeta, toScope, settings, cloneMeta = {}) => {
     const sourceManifest = await loadScopeManifest(fromScopeMeta);
     const sourceShardCount = Math.max(0, Number(sourceManifest.shardCount || 0) || 0);
-    if (!sourceManifest.scopeKey || sourceShardCount <= 0) return { ok: false, skipped: true, reason: 'source_empty' };
+    const sourceArchiveRef = normalizeFlashbackArchiveRef(sourceManifest.archiveRef);
+    if (!sourceManifest.scopeKey || (sourceShardCount <= 0 && !sourceArchiveRef)) return { ok: false, skipped: true, reason: 'source_empty' };
+    if (sourceArchiveRef) {
+      const archiveVerification = await loadFlashbackArchiveManifestSummary(sourceArchiveRef);
+      if (!archiveVerification.verified) {
+        const error = new Error('scope clone aborted: shared archive reference is not durable.');
+        error.code = 'FLASHBACK_ARCHIVE_REF_INVALID';
+        throw error;
+      }
+    }
     const clonedAt = nowIso();
     const cloneMode = cloneMeta.mode === 'session_handoff' ? 'session_handoff' : 'chat_copy_live';
     const sessionHandoff = cloneMode === 'session_handoff';
@@ -7449,11 +8129,15 @@
     const result = await withScopeWriteLock(toScope.scopeKey, async () => {
       const targetManifest = await loadScopeManifest(toScope);
       assertCompleteScopeLoad({ manifest: targetManifest, records: [] }, 'scope clone target');
-      if (Number(targetManifest.count || 0) > 0 || Number(targetManifest.shardCount || 0) > 0 || targetManifest.copyAdoptedComplete) {
+      if (Number(targetManifest.count || 0) > 0 || Number(targetManifest.shardCount || 0) > 0 || normalizeFlashbackArchiveRef(targetManifest.archiveRef) || targetManifest.copyAdoptedComplete) {
         return { ok: false, skipped: true, reason: 'target_not_empty' };
       }
       await cleanupListedScopeShardOrphans(toScope.scopeKey, '').catch(error => warn('listed shard cleanup failed', error));
       let copiedRecords = 0;
+      let clonedVectorSidecarCount = 0;
+      let clonedVectorSidecarBytes = 0;
+      let clonedVectorInlineFallbacks = 0;
+      let clonedVectorStorageBackend = '';
       const copiedRecordList = [];
       const clonedShardSummaries = [];
       try {
@@ -7483,9 +8167,15 @@
           copiedRecords += records.length;
           copiedRecordList.push(...records);
           clonedShardSummaries.push(buildRecallShardSummary(records, i, settings));
+          const vectorTier = await persistFlashbackVectorShard(toScope.scopeKey, targetCommitId, i, records);
+          const persistedRecords = vectorTier.ok ? vectorTier.records : records;
+          clonedVectorSidecarCount += Number(vectorTier.sidecarCount || 0) || 0;
+          clonedVectorSidecarBytes += Number(vectorTier.sidecarBytes || 0) || 0;
+          if (vectorTier.backend) clonedVectorStorageBackend ||= vectorTier.backend;
+          if (!vectorTier.ok && vectorTier.reason !== 'no_vectors') clonedVectorInlineFallbacks += 1;
           await requireStorageWrite(
             scopeKeys.commitShard(toScope.scopeKey, targetCommitId, i),
-            safeStringify({ version: 2, shard: i, scopeKey: toScope.scopeKey, commitId: targetCommitId, checksum: storageShardChecksum(records), records }),
+            safeStringify({ version: 2, shard: i, scopeKey: toScope.scopeKey, commitId: targetCommitId, checksum: storageShardChecksum(persistedRecords), vectorStorageMode: vectorTier.ok ? FLASHBACK_VECTOR_STORAGE_MODE : 'inline', vectorStorageKey: vectorTier.storageKey || '', records: persistedRecords }),
             'scope shard clone save'
           );
         }
@@ -7493,7 +8183,7 @@
         await removeCommitShardSet(toScope.scopeKey, targetCommitId, sourceShardCount).catch(cleanupError => warn('failed clone shard cleanup failed', cleanupError));
         throw error;
       }
-      if (copiedRecords <= 0) {
+      if (copiedRecords <= 0 && !sourceArchiveRef) {
         await removeCommitShardSet(toScope.scopeKey, targetCommitId, sourceShardCount).catch(cleanupError => warn('empty clone shard cleanup failed', cleanupError));
         return { ok: false, skipped: true, reason: 'source_empty' };
       }
@@ -7525,12 +8215,20 @@
         chatFingerprint: text(toScope.chatFingerprint || sourceManifest.chatFingerprint || ''),
         chatTailHash: text(toScope.chatTailHash || sourceManifest.chatTailHash || ''),
         count: copiedRecords,
+        archiveRef: sourceArchiveRef,
+        archiveLinkedAt: sourceArchiveRef ? clonedAt : '',
         permanentSessionHistoryCount: copiedRecordList.filter(isPermanentSessionHistoryRecord).length,
         shardCount: sourceShardCount,
         shardSize: sourceManifest.shardSize || DEFAULTS.shardSize,
         shardIndexVersion: FLASHBACK_SHARD_INDEX_VERSION,
         shardSummaries: clonedShardSummaries,
         commitId: targetCommitId,
+        vectorStorageMode: clonedVectorSidecarCount > 0 ? FLASHBACK_VECTOR_STORAGE_MODE : 'inline',
+        vectorStorageBackend: clonedVectorStorageBackend,
+        vectorSidecarCount: clonedVectorSidecarCount,
+        vectorSidecarBytes: clonedVectorSidecarBytes,
+        vectorSidecarMissing: 0,
+        vectorInlineFallbacks: clonedVectorInlineFallbacks,
         stats: statsForRecords(copiedRecordList),
         responseTurnMax: copiedLiveTurnMax,
         responseTurnCount: copiedLiveTurnKeys.size,
@@ -7567,11 +8265,18 @@
       // rebuild their target-scope lineage on the next synchronization.
       await saveTurnWorldline(toScope.scopeKey, emptyTurnWorldline(toScope.scopeKey));
       await cleanupListedScopeShardOrphans(toScope.scopeKey, targetCommitId).catch(error => warn('listed shard cleanup failed', error));
-      return { ok: true, skipped: false, records: copiedRecords };
+      return {
+        ok: true,
+        skipped: false,
+        records: copiedRecords + Math.max(0, Number(sourceArchiveRef?.recordCount || 0) || 0),
+        physicalRecords: copiedRecords,
+        archiveRecords: Math.max(0, Number(sourceArchiveRef?.recordCount || 0) || 0),
+        archiveId: text(sourceArchiveRef?.archiveId || '')
+      };
     });
     if (result.ok) {
-      Runtime.lastClone = { at: Date.now(), fromScopeKey: fromScopeMeta.scopeKey, toScopeKey: toScope.scopeKey, records: result.records || 0, reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
-      return { ok: true, skipped: false, records: result.records || 0, reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
+      Runtime.lastClone = { at: Date.now(), fromScopeKey: fromScopeMeta.scopeKey, toScopeKey: toScope.scopeKey, records: result.records || 0, physicalRecords: result.physicalRecords || 0, archiveRecords: result.archiveRecords || 0, archiveId: result.archiveId || '', reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
+      return { ok: true, skipped: false, records: result.records || 0, physicalRecords: result.physicalRecords || 0, archiveRecords: result.archiveRecords || 0, archiveId: result.archiveId || '', reason: cloneMeta.reason || '', mode: cloneMode, weight: cloneMeta.weight || 0, directStorageClone: true };
     }
     return result;
   };
@@ -7760,6 +8465,305 @@
     };
   };
 
+  const ensureFlashbackArchiveForHandoff = async (sourceScope, sourceLoaded, settings) => {
+    const sourceManifest = sourceLoaded?.manifest || await loadScopeManifest(sourceScope);
+    const existingRef = normalizeFlashbackArchiveRef(sourceManifest.archiveRef);
+    const parentSummary = existingRef ? await loadFlashbackArchiveManifestSummary(existingRef) : null;
+    if (existingRef && parentSummary?.verified !== true) throw new Error('flashback_parent_archive_manifest_verification_failed');
+    const parentMemberIds = normalizeFlashbackArchiveMemberIds(parentSummary?.memberIds || []);
+    const parentIds = new Set(parentMemberIds);
+    const sourceLocal = sourceLoaded?.manifest && Array.isArray(sourceLoaded?.records)
+      ? sourceLoaded
+      : await loadScopeRecordsRaw(sourceManifest.scopeKey || sourceScope);
+    assertCompleteScopeLoad(sourceLocal, 'archive local source verification');
+    const localRecords = sourceLocal.records.filter(isRetainedMemoryRecord);
+    const deltaSource = localRecords.filter(record => !parentIds.has(flashbackArchiveRecordIdentity(record)));
+    if (!deltaSource.length && existingRef) {
+      return {
+        archiveRef: existingRef,
+        archiveManifest: parentSummary.layers?.[0]?.manifest || null,
+        records: [],
+        recordCount: parentSummary.records,
+        memberIds: parentMemberIds,
+        changed: false,
+        deltaRecords: 0
+      };
+    }
+
+    const preparedAt = nowIso();
+    const prepared = deltaSource.map(record => {
+      const identity = flashbackArchiveRecordIdentity(record);
+      return normalizeInheritedScopeRecordForActiveHistory({
+        ...record,
+        id: `fb_archive_${identity}`,
+        permanentHistoryId: identity,
+        archiveCanonicalId: identity,
+        inheritedFromScopeKey: text(record.inheritedFromScopeKey || record.clonedFromScopeKey || sourceManifest.scopeKey || sourceScope),
+        inheritedViaScopeKey: text(sourceManifest.scopeKey || sourceScope),
+        archiveReferenceOnly: false,
+        archivedAt: preparedAt,
+        updatedAt: record.updatedAt || preparedAt
+      });
+    });
+    const preparedMemberIds = normalizeFlashbackArchiveMemberIds(prepared.map(flashbackArchiveRecordIdentity));
+    const fullMemberIds = normalizeFlashbackArchiveMemberIds([...parentMemberIds, ...preparedMemberIds]);
+    const digestValue = flashbackArchiveMemberDigest(fullMemberIds);
+    const deltaDigest = flashbackArchiveMemberDigest(preparedMemberIds);
+    const generation = Math.max(1, Number(existingRef?.generation || 0) + 1);
+    const archiveId = `fb_${stableHash([
+      existingRef?.archiveId || '',
+      sourceManifest.scopeKey || sourceScope,
+      generation,
+      deltaDigest,
+      digestValue
+    ].join('|')).slice(0, 28)}`;
+    const archiveScopeKey = flashbackArchiveScopeKey(archiveId);
+    const archiveScope = {
+      scopeKey: archiveScopeKey,
+      characterId: text(sourceManifest.characterId || ''),
+      chatId: `archive:${archiveId}`,
+      personaId: text(sourceManifest.personaId || ''),
+      characterName: text(sourceManifest.characterName || ''),
+      chatTitle: `FLASHBACK Archive Layer ${generation}`,
+      personaName: text(sourceManifest.personaName || '')
+    };
+    return await withScopeWriteLock(archiveScopeKey, async () => {
+      const existingLayer = await loadScopeManifest(archiveScopeKey);
+      let saved;
+      if (existingLayer.manifestRawPresent === true) {
+        saved = await loadScopeRecordsRaw(archiveScopeKey);
+        assertCompleteScopeLoad(saved, 'archive layer readback');
+        const storedIds = normalizeFlashbackArchiveMemberIds(saved.records.filter(isRetainedMemoryRecord).map(flashbackArchiveRecordIdentity));
+        if (storedIds.length !== preparedMemberIds.length || storedIds.some((value, index) => value !== preparedMemberIds[index])) {
+          throw new Error('flashback_archive_layer_content_mismatch');
+        }
+      } else {
+        saved = await saveScopeRecords(archiveScope, prepared, settings, archiveScope);
+      }
+      const archiveManifest = await saveScopeManifest({
+        ...(saved.manifest || existingLayer),
+        archiveOwner: true,
+        archiveId,
+        archiveGeneration: generation,
+        archiveDigest: digestValue,
+        archiveDeltaDigest: deltaDigest,
+        archiveRecordCount: fullMemberIds.length,
+        archiveDeltaCount: preparedMemberIds.length,
+        archiveMemberCatalogVersion: 1,
+        archiveDeltaMemberIds: preparedMemberIds,
+        parentArchiveRef: existingRef ? flashbackArchiveRefPointer(existingRef) : null,
+        archiveRef: null,
+        copyAdoptionMode: 'shared_archive_layer',
+        copyAdoptedComplete: true,
+        copyAdoptedCompleteAt: preparedAt
+      }, archiveScope);
+      const archiveRef = {
+        schema: FLASHBACK_ARCHIVE_REF_SCHEMA,
+        archiveId,
+        archiveScopeKey,
+        generation,
+        depth: Math.max(1, Number(existingRef?.depth || 0) + 1),
+        deltaCount: preparedMemberIds.length,
+        recordCount: fullMemberIds.length,
+        digest: digestValue,
+        responseTurnMax: Math.max(Number(existingRef?.responseTurnMax || 0), Number(archiveManifest.responseTurnMax || 0)),
+        createdAt: existingRef?.createdAt || archiveManifest.createdAt || preparedAt,
+        updatedAt: preparedAt,
+        parentRef: existingRef ? flashbackArchiveRefPointer(existingRef) : null
+      };
+      return {
+        archiveRef,
+        archiveManifest,
+        records: prepared,
+        recordCount: fullMemberIds.length,
+        memberIds: fullMemberIds,
+        changed: true,
+        deltaRecords: preparedMemberIds.length
+      };
+    });
+  };
+
+  const archiveAndCompactFlashbackSourceScope = async (sourceScopeKey, expectedRecords, settings) => {
+    return await withScopeWriteLock(sourceScopeKey, async () => {
+      const local = await loadScopeRecordsRaw(sourceScopeKey);
+      assertCompleteScopeLoad(local, 'session handoff source archive lock verification');
+      const sourceManifest = local.manifest || {};
+      const existingRef = normalizeFlashbackArchiveRef(sourceManifest.archiveRef);
+      const parentSummary = existingRef ? await loadFlashbackArchiveManifestSummary(existingRef) : null;
+      if (existingRef && parentSummary?.verified !== true) {
+        const error = new Error('flashback_archive_parent_manifest_invalid');
+        error.code = 'FLASHBACK_ARCHIVE_PARENT_MANIFEST_INVALID';
+        throw error;
+      }
+      const logicalMemberIds = normalizeFlashbackArchiveMemberIds([
+        ...(parentSummary?.memberIds || []),
+        ...local.records.filter(isRetainedMemoryRecord).map(flashbackArchiveRecordIdentity)
+      ]);
+      const logicalRecordCount = logicalMemberIds.length;
+      if (logicalRecordCount !== Number(expectedRecords || 0)) {
+        const error = new Error('flashback_archive_source_changed');
+        error.code = 'FLASHBACK_ARCHIVE_SOURCE_CHANGED';
+        error.records = logicalRecordCount;
+        error.expectedRecords = Number(expectedRecords || 0);
+        throw error;
+      }
+      const archive = await ensureFlashbackArchiveForHandoff(sourceScopeKey, local, settings);
+      if (archive.recordCount !== logicalRecordCount) {
+        const error = new Error('flashback_archive_record_count_mismatch');
+        error.code = 'FLASHBACK_ARCHIVE_RECORD_COUNT_MISMATCH';
+        error.records = archive.recordCount;
+        error.expectedRecords = logicalRecordCount;
+        throw error;
+      }
+      const sourceMeta = { ...sourceManifest, scopeKey: sourceScopeKey };
+      await saveScopeManifest({
+        ...sourceManifest,
+        archiveRef: archive.archiveRef,
+        archiveLinkedAt: nowIso(),
+        archiveCompactedAt: nowIso(),
+        archiveCompactedRecords: local.records.length
+      }, sourceMeta);
+      if (local.records.length > 0 || Number(local.manifest.shardCount || 0) > 0) {
+        await saveScopeRecords(sourceMeta, [], settings, sourceMeta);
+      }
+      const compactedLocal = await loadScopeRecordsRaw(sourceScopeKey);
+      assertCompleteScopeLoad(compactedLocal, 'session handoff source compacted local verification');
+      const compactedSummary = await loadFlashbackArchiveManifestSummary(compactedLocal.manifest.archiveRef);
+      const compactedMemberIds = normalizeFlashbackArchiveMemberIds([
+        ...(compactedSummary?.memberIds || []),
+        ...compactedLocal.records.filter(isRetainedMemoryRecord).map(flashbackArchiveRecordIdentity)
+      ]);
+      if (compactedSummary.verified !== true || compactedMemberIds.length !== logicalRecordCount) {
+        const error = new Error('flashback_archive_compaction_verification_failed');
+        error.code = 'FLASHBACK_ARCHIVE_COMPACTION_VERIFICATION_FAILED';
+        error.records = compactedMemberIds.length;
+        error.expectedRecords = logicalRecordCount;
+        throw error;
+      }
+      return { ...archive, recordCount: logicalRecordCount, compactedLocalRecords: local.records.length };
+    });
+  };
+
+  const loadFlashbackArchiveChain = async archiveRefValue => {
+    const head = normalizeFlashbackArchiveRef(archiveRefValue);
+    if (!head) return { verified: false, reason: 'archive_ref_invalid', records: 0, recordsList: [], layers: [], missingShards: 0, corruptShards: 0, archiveRef: null };
+    const seen = new Set();
+    const layers = [];
+    let cursor = head;
+    let missingShards = 0;
+    let corruptShards = 0;
+    while (cursor && layers.length < FLASHBACK_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.archiveScopeKey)) return { verified: false, reason: 'archive_cycle', records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
+      seen.add(cursor.archiveScopeKey);
+      const loaded = await loadScopeRecordsRaw(cursor.archiveScopeKey);
+      assertCompleteScopeLoad(loaded, 'archive durable verification');
+      const records = loaded.records.filter(isRetainedMemoryRecord);
+      missingShards += Math.max(0, Number(loaded.manifest?.missingShards || 0) || 0);
+      corruptShards += Math.max(0, Number(loaded.manifest?.corruptShards || 0) || 0);
+      if (loaded.manifest.archiveOwner !== true || text(loaded.manifest.archiveId || '') !== cursor.archiveId) {
+        return { verified: false, reason: 'archive_layer_identity_mismatch', records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
+      }
+      layers.push({ ref: cursor, manifest: loaded.manifest, records });
+      cursor = normalizeFlashbackArchiveRef(cursor.parentRef || loaded.manifest.parentArchiveRef);
+    }
+    if (cursor) return { verified: false, reason: 'archive_depth_exceeded', records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
+    const recordsList = mergeFlashbackArchiveRecords(...layers.slice().reverse().map(layer => layer.records));
+    const digestValue = stableHash(recordsList.map(flashbackArchiveRecordIdentity).sort().join('\u0001'));
+    const verified = recordsList.length === Number(head.recordCount || 0)
+      && digestValue === text(head.digest || '')
+      && missingShards === 0
+      && corruptShards === 0;
+    return { verified, reason: verified ? 'archive_ref_verified' : 'archive_ref_mismatch', records: recordsList.length, recordsList, digest: digestValue, layers, missingShards, corruptShards, archiveRef: head };
+  };
+
+  const verifyFlashbackArchiveRef = async (archiveRefValue, expectedRecords = null) => {
+    const state = await loadFlashbackArchiveChain(archiveRefValue);
+    const countMatches = expectedRecords == null || state.records === Number(expectedRecords);
+    return { ...state, verified: state.verified === true && countMatches, reason: state.verified === true && countMatches ? 'archive_ref_verified' : state.reason === 'archive_ref_verified' ? 'archive_record_count_mismatch' : state.reason };
+  };
+
+
+  const mergeFlashbackArchiveStats = (...values) => {
+    const out = { byType: {}, recordTotal: 0, charTotal: 0, tokenTotal: 0, embeddingCost: null };
+    let costUsd = 0;
+    let costTokens = 0;
+    let costKnown = false;
+    for (const raw of values) {
+      const stats = normalizeStatsForDisplay(raw || {});
+      out.recordTotal += Math.max(0, Number(stats.recordTotal || 0) || 0);
+      out.charTotal += Math.max(0, Number(stats.charTotal || 0) || 0);
+      out.tokenTotal += Math.max(0, Number(stats.tokenTotal || 0) || 0);
+      for (const [type, value] of Object.entries(stats.byType || {})) {
+        if (!out.byType[type]) out.byType[type] = { records: 0, chars: 0, tokens: 0 };
+        out.byType[type].records += Math.max(0, Number(value?.records || 0) || 0);
+        out.byType[type].chars += Math.max(0, Number(value?.chars || 0) || 0);
+        out.byType[type].tokens += Math.max(0, Number(value?.tokens || 0) || 0);
+      }
+      const cost = stats.embeddingCost;
+      if (cost && typeof cost === 'object') {
+        const usd = Number(cost.estimatedUsd ?? cost.usd ?? cost.costUsd);
+        const tokens = Number(cost.tokens ?? cost.inputTokens);
+        if (Number.isFinite(usd)) { costUsd += usd; costKnown = true; }
+        if (Number.isFinite(tokens)) costTokens += Math.max(0, tokens);
+      }
+    }
+    if (costKnown) out.embeddingCost = { estimatedUsd: costUsd, tokens: costTokens };
+    return out;
+  };
+
+  // Lightweight inspection must never hydrate archive shards or dense vectors.  Walk
+  // only immutable layer manifests and aggregate their already-persisted statistics.
+  const loadFlashbackArchiveManifestSummary = async archiveRefValue => {
+    const head = normalizeFlashbackArchiveRef(archiveRefValue);
+    if (!head) return { verified: false, reason: 'archive_ref_invalid', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers: [], archiveRef: null };
+    const seen = new Set();
+    const memberSet = new Set();
+    const layers = [];
+    let cursor = head;
+    while (cursor && layers.length < FLASHBACK_ARCHIVE_MAX_DEPTH) {
+      if (seen.has(cursor.archiveScopeKey)) return { verified: false, reason: 'archive_cycle', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+      seen.add(cursor.archiveScopeKey);
+      const manifest = await loadScopeManifest(cursor.archiveScopeKey);
+      if (manifest.archiveOwner !== true
+        || text(manifest.archiveId || '') !== cursor.archiveId
+        || Number(manifest.archiveGeneration || cursor.generation || 0) !== Number(cursor.generation || 0)
+        || text(manifest.archiveDigest || cursor.digest || '') !== text(cursor.digest || '')) {
+        return { verified: false, reason: 'archive_layer_identity_mismatch', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+      }
+      const deltaCount = Math.max(0, Number(manifest.archiveDeltaCount ?? manifest.count ?? cursor.deltaCount ?? 0) || 0);
+      const deltaMemberIds = normalizeFlashbackArchiveMemberIds(manifest.archiveDeltaMemberIds || []);
+      const deltaDigest = flashbackArchiveMemberDigest(deltaMemberIds);
+      if (deltaCount !== Math.max(0, Number(cursor.deltaCount || 0) || 0)
+        || Math.max(0, Number(manifest.count || 0) || 0) !== deltaCount
+        || Number(manifest.archiveMemberCatalogVersion || 0) < 1
+        || deltaMemberIds.length !== deltaCount
+        || deltaDigest !== text(manifest.archiveDeltaDigest || '')
+        || Number(manifest.missingShards || 0) > 0
+        || Number(manifest.corruptShards || 0) > 0
+        || manifest.manifestCorrupt === true) {
+        return { verified: false, reason: 'archive_layer_manifest_mismatch', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+      }
+      let duplicate = false;
+      for (const memberId of deltaMemberIds) {
+        if (memberSet.has(memberId)) duplicate = true;
+        memberSet.add(memberId);
+      }
+      if (duplicate) return { verified: false, reason: 'archive_member_duplicate', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+      layers.push({ ref: cursor, manifest, deltaCount, memberIds: deltaMemberIds, stats: manifest.stats || {} });
+      cursor = normalizeFlashbackArchiveRef(cursor.parentRef || manifest.parentArchiveRef);
+    }
+    if (cursor) return { verified: false, reason: 'archive_depth_exceeded', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+    const memberIds = normalizeFlashbackArchiveMemberIds(Array.from(memberSet));
+    const records = memberIds.length;
+    const digest = flashbackArchiveMemberDigest(memberIds);
+    const stats = mergeFlashbackArchiveStats(...layers.map(layer => layer.stats));
+    stats.recordTotal = records;
+    const verified = records === Math.max(0, Number(head.recordCount || 0) || 0)
+      && layers.length === Math.max(1, Number(head.depth || layers.length) || layers.length)
+      && digest === text(head.digest || '');
+    return { verified, reason: verified ? 'archive_manifest_chain_verified' : 'archive_manifest_chain_mismatch', records, stats, memberIds, digest, layers, archiveRef: head };
+  };
+
   const handoffRecordIdentity = (record = {}) => stableHash(safeStringify([
     text(record.id || ''),
     text(record.hash || ''),
@@ -7808,8 +8812,9 @@
       ? Math.max(0, Number(options.expectedRecords || 0) || 0)
       : null;
     const base = {
-      schema: 'flashback_memory.session_handoff_adoption.v2',
+      schema: 'flashback_memory.session_handoff_adoption.v3',
       version: PLUGIN_VERSION,
+      archiveContract: FLASHBACK_ARCHIVE_REF_SCHEMA,
       available: true,
       ok: false,
       adopted: false,
@@ -7820,12 +8825,10 @@
       sourceScopeKey: requestedSourceScopeKey,
       targetScopeKey: '',
       records: 0,
-      expectedRecords: requestedExpectedRecords ?? 0
+      expectedRecords: requestedExpectedRecords ?? 0,
+      physicalCopies: 0
     };
-    if (!expectedTargetChatId || !expectedTransferId) {
-      return { ...base, reason: 'handoff_identity_incomplete' };
-    }
-
+    if (!expectedTargetChatId || !expectedTransferId) return { ...base, reason: 'handoff_identity_incomplete' };
     try {
       const settings = await loadSettings();
       const currentSnapshot = await loadRisuSnapshot(options.requestPermission === true);
@@ -7843,229 +8846,132 @@
         transferId: text(markerState.transferId || expectedTransferId)
       };
       if (!markerState.valid) return { ...targetBase, reason: markerState.reason };
-      if (markerState.targetChatId !== expectedTargetChatId) {
-        return { ...targetBase, reason: 'expected_target_mismatch' };
-      }
-      if (markerState.transferId !== expectedTransferId) {
-        return { ...targetBase, reason: 'expected_transfer_mismatch' };
-      }
-
+      if (markerState.targetChatId !== expectedTargetChatId) return { ...targetBase, reason: 'expected_target_mismatch' };
+      if (markerState.transferId !== expectedTransferId) return { ...targetBase, reason: 'expected_transfer_mismatch' };
       const markerSourceScopeKey = text(marker.sourceFlashbackScopeKey || targetScope.copiedFromScopeKey || '').trim();
       if (requestedSourceScopeKey && markerSourceScopeKey && requestedSourceScopeKey !== markerSourceScopeKey) {
         return { ...targetBase, sourceScopeKey: markerSourceScopeKey, reason: 'expected_source_scope_mismatch' };
       }
       const sourceScopeKey = requestedSourceScopeKey || markerSourceScopeKey;
-      if (!sourceScopeKey || sourceScopeKey === targetScope.scopeKey) {
-        return { ...targetBase, sourceScopeKey, reason: 'source_scope_invalid' };
+      if (!sourceScopeKey || sourceScopeKey === targetScope.scopeKey) return { ...targetBase, sourceScopeKey, reason: 'source_scope_invalid' };
+      const sourceLocal = await loadScopeRecordsRaw(sourceScopeKey);
+      assertCompleteScopeLoad(sourceLocal, 'session handoff source verification');
+      const sourceManifest = sourceLocal.manifest || {};
+      const sourceArchiveRef = normalizeFlashbackArchiveRef(sourceManifest.archiveRef);
+      const sourceArchiveSummary = sourceArchiveRef ? await loadFlashbackArchiveManifestSummary(sourceArchiveRef) : null;
+      if (sourceArchiveRef && sourceArchiveSummary?.verified !== true) {
+        return { ...targetBase, sourceScopeKey, records: 0, expectedRecords: requestedExpectedRecords ?? 0, reason: sourceArchiveSummary?.reason || 'source_archive_manifest_invalid' };
       }
-
+      const sourceMemberIds = normalizeFlashbackArchiveMemberIds([
+        ...(sourceArchiveSummary?.memberIds || []),
+        ...sourceLocal.records.filter(isRetainedMemoryRecord).map(flashbackArchiveRecordIdentity)
+      ]);
+      const sourceRecordCount = sourceMemberIds.length;
       const markerExpectedRecords = Math.max(0, Number(marker.flashbackRecordCount || 0) || 0);
-      if (requestedExpectedRecords != null
-        && markerExpectedRecords > 0
-        && requestedExpectedRecords !== markerExpectedRecords) {
-        return {
-          ...targetBase,
-          sourceScopeKey,
-          records: 0,
-          expectedRecords: markerExpectedRecords,
-          reason: 'expected_record_count_mismatch'
-        };
+      const expectedRecords = requestedExpectedRecords != null ? requestedExpectedRecords : (markerExpectedRecords || sourceRecordCount);
+      if (sourceRecordCount !== expectedRecords) {
+        return { ...targetBase, sourceScopeKey, records: sourceRecordCount, expectedRecords, reason: 'source_record_count_mismatch' };
       }
-
-      const sourceLoaded = await loadScopeRecords(sourceScopeKey);
-      assertCompleteScopeLoad(sourceLoaded, 'session handoff source verification');
-      const sourceManifest = sourceLoaded.manifest || {};
-      const sourceRecords = Array.isArray(sourceLoaded.records) ? sourceLoaded.records : [];
-      const expectedRecords = requestedExpectedRecords != null
-        ? requestedExpectedRecords
-        : (markerExpectedRecords || sourceRecords.length);
-      const sourceCountMatches = sourceRecords.length === expectedRecords;
-      const sourceChatMatches = !sourceManifest.chatId
-        || !markerState.sourceChatId
-        || text(sourceManifest.chatId) === text(markerState.sourceChatId);
-      const actorMatches = (
-        (!sourceManifest.characterId || !targetScope.characterId
-          || text(sourceManifest.characterId) === text(targetScope.characterId))
-        && (!sourceManifest.personaId || !targetScope.personaId
-          || text(sourceManifest.personaId) === text(targetScope.personaId))
-      );
-      if (!sourceCountMatches) {
-        return {
-          ...targetBase,
-          sourceScopeKey,
-          records: sourceRecords.length,
-          expectedRecords,
-          reason: 'source_record_count_mismatch'
-        };
-      }
+      const sourceChatMatches = !sourceManifest.chatId || !markerState.sourceChatId || text(sourceManifest.chatId) === text(markerState.sourceChatId);
+      const actorMatches = (!sourceManifest.characterId || !targetScope.characterId || text(sourceManifest.characterId) === text(targetScope.characterId))
+        && (!sourceManifest.personaId || !targetScope.personaId || text(sourceManifest.personaId) === text(targetScope.personaId));
       if (!sourceChatMatches || !actorMatches) {
-        return {
-          ...targetBase,
-          sourceScopeKey,
-          records: sourceRecords.length,
-          expectedRecords,
-          reason: !sourceChatMatches ? 'source_chat_mismatch' : 'source_actor_mismatch'
-        };
+        return { ...targetBase, sourceScopeKey, records: sourceRecordCount, expectedRecords, reason: !sourceChatMatches ? 'source_chat_mismatch' : 'source_actor_mismatch' };
       }
       if (expectedRecords <= 0) {
-        return {
-          ...targetBase,
-          ok: true,
-          verified: true,
-          durable: true,
-          sourceScopeKey,
-          records: 0,
-          expectedRecords: 0,
-          reason: 'session_handoff_empty'
-        };
-      }
-
-      let targetLoaded = await loadScopeRecords(targetScope.scopeKey);
-      assertCompleteScopeLoad(targetLoaded, 'session handoff target verification');
-      const targetManifestBefore = targetLoaded.manifest || {};
-      const targetHasRecords = targetLoaded.records.length > 0
-        || Number(targetManifestBefore.shardCount || 0) > 0
-        || targetManifestBefore.copyAdoptedComplete === true;
-      let cloned = null;
-      if (!targetHasRecords) {
-        cloned = await cloneScopeStorage(sourceManifest, targetScope, settings, {
-          mode: 'session_handoff',
-          reason: 'memory_bridge_explicit_adoption',
-          transferId: expectedTransferId,
-          sourceChatId: markerState.sourceChatId,
-          targetChatId: expectedTargetChatId,
-          expectedRecordCount: expectedRecords
-        });
-        if (cloned?.ok !== true) {
-          return {
-            ...targetBase,
-            sourceScopeKey,
-            records: 0,
-            expectedRecords,
-            reason: text(cloned?.reason || 'session_handoff_clone_failed')
-          };
-        }
-        targetLoaded = await loadScopeRecords(targetScope.scopeKey);
-        assertCompleteScopeLoad(targetLoaded, 'session handoff committed readback');
-      }
-
-      let targetManifest = targetLoaded.manifest || {};
-      const existingTransferId = text(targetManifest.copyTransferId || '').trim();
-      if (existingTransferId && existingTransferId !== expectedTransferId) {
-        return {
-          ...targetBase,
-          sourceScopeKey,
-          records: targetLoaded.records.length,
-          expectedRecords,
-          reason: 'target_transfer_conflict'
-        };
-      }
-      const recordVerification = verifySessionHandoffRecords(
-        sourceRecords,
-        targetLoaded.records,
-        sourceScopeKey
-      );
-      const manifestMatches = targetManifest.copyAdoptedComplete === true
-        && targetManifest.copyAdoptionMode === 'session_handoff'
-        && text(targetManifest.copiedFromScopeKey || '') === sourceScopeKey;
-      if (!manifestMatches || !recordVerification.verified) {
-        return {
-          ...targetBase,
-          sourceScopeKey,
-          records: recordVerification.inheritedRecords,
-          expectedRecords,
-          reason: !manifestMatches
-            ? 'target_manifest_not_handoff'
-            : !recordVerification.identityMatches
-              ? 'target_record_identity_mismatch'
-              : 'target_history_protection_mismatch',
-          diagnostics: recordVerification
-        };
-      }
-
-      const receiptMatches = existingTransferId === expectedTransferId
-        && text(targetManifest.copySourceChatId || '') === text(markerState.sourceChatId)
-        && text(targetManifest.copyTargetChatId || '') === expectedTargetChatId
-        && Number(targetManifest.copyExpectedRecordCount || 0) === expectedRecords;
-      if (!receiptMatches) {
-        targetManifest = await withScopeWriteLock(targetScope.scopeKey, async () => {
-          const latestTarget = await loadScopeRecords(targetScope.scopeKey);
-          assertCompleteScopeLoad(latestTarget, 'session handoff receipt commit');
-          const latestManifest = latestTarget.manifest || {};
-          const latestTransferId = text(latestManifest.copyTransferId || '').trim();
-          if (latestTransferId && latestTransferId !== expectedTransferId) {
-            const error = new Error('session handoff receipt commit aborted: target transfer changed concurrently');
-            error.code = 'FLASHBACK_HANDOFF_TRANSFER_CONFLICT';
-            throw error;
-          }
-          const latestVerification = verifySessionHandoffRecords(sourceRecords, latestTarget.records, sourceScopeKey);
-          const latestManifestMatches = latestManifest.copyAdoptedComplete === true
-            && latestManifest.copyAdoptionMode === 'session_handoff'
-            && text(latestManifest.copiedFromScopeKey || '') === sourceScopeKey;
-          if (!latestManifestMatches || !latestVerification.verified) {
-            const error = new Error('session handoff receipt commit aborted: target lineage changed concurrently');
-            error.code = 'FLASHBACK_HANDOFF_TARGET_CHANGED';
-            throw error;
-          }
-          return await saveScopeManifest({
-            ...latestManifest,
+        const targetManifest = await loadScopeManifest(targetScope);
+        if (Number(targetManifest.count || 0) <= 0 && Number(targetManifest.shardCount || 0) <= 0) {
+          await saveScopeManifest({
+            ...targetManifest,
+            copyAdoptedComplete: true,
+            copyAdoptedCompleteAt: nowIso(),
+            copyAdoptionMode: 'shared_archive',
             copyTransferId: expectedTransferId,
             copyTransferSchema: MEMORY_SESSION_BRIDGE_SCHEMA,
             copySourceChatId: markerState.sourceChatId,
             copyTargetChatId: expectedTargetChatId,
-            copyExpectedRecordCount: expectedRecords
+            copyExpectedRecordCount: 0
           }, targetScope);
-        });
+        }
+        return { ...targetBase, ok: true, verified: true, durable: true, sourceScopeKey, records: 0, expectedRecords: 0, reason: 'session_handoff_empty' };
       }
-
-      const durableLoaded = await loadScopeRecords(targetScope.scopeKey);
-      assertCompleteScopeLoad(durableLoaded, 'session handoff durable receipt verification');
-      const durableManifest = durableLoaded.manifest || {};
-      const durableRecords = verifySessionHandoffRecords(
-        sourceRecords,
-        durableLoaded.records,
-        sourceScopeKey
-      );
-      const durable = durableRecords.verified
+      const archive = await archiveAndCompactFlashbackSourceScope(sourceScopeKey, expectedRecords, settings);
+      if (archive.recordCount !== expectedRecords) {
+        return { ...targetBase, sourceScopeKey, records: archive.recordCount, expectedRecords, reason: 'archive_record_count_mismatch' };
+      }
+      const targetLocal = await loadScopeRecordsRaw(targetScope.scopeKey);
+      assertCompleteScopeLoad(targetLocal, 'session handoff target verification');
+      const before = targetLocal.manifest || {};
+      const existingTransferId = text(before.copyTransferId || '').trim();
+      if (existingTransferId && existingTransferId !== expectedTransferId) {
+        return { ...targetBase, sourceScopeKey, records: 0, expectedRecords, reason: 'target_transfer_conflict' };
+      }
+      const targetHasLocalRecords = targetLocal.records.length > 0 || Number(before.shardCount || 0) > 0;
+      if (targetHasLocalRecords && before.copyAdoptionMode !== 'shared_archive') {
+        return { ...targetBase, sourceScopeKey, records: targetLocal.records.length, expectedRecords, reason: 'target_not_empty' };
+      }
+      const sameArchive = normalizeFlashbackArchiveRef(before.archiveRef)?.archiveId === archive.archiveRef.archiveId;
+      let adopted = false;
+      if (!sameArchive || before.copyAdoptedComplete !== true || existingTransferId !== expectedTransferId) {
+        await saveScopeManifest({
+          ...before,
+          archiveRef: archive.archiveRef,
+          copyAdoptedComplete: true,
+          copyAdoptedCompleteAt: nowIso(),
+          copyAdoptionMode: 'shared_archive',
+          copiedFromScopeKey: sourceScopeKey,
+          copiedFromChatId: markerState.sourceChatId,
+          copiedAt: nowIso(),
+          copyTransferId: expectedTransferId,
+          copyTransferSchema: MEMORY_SESSION_BRIDGE_SCHEMA,
+          copySourceChatId: markerState.sourceChatId,
+          copyTargetChatId: expectedTargetChatId,
+          copyExpectedRecordCount: expectedRecords
+        }, targetScope);
+        adopted = true;
+      }
+      const durableManifest = await loadScopeManifest(targetScope);
+      const archiveVerification = await loadFlashbackArchiveManifestSummary(durableManifest.archiveRef);
+      const durable = archiveVerification.verified
+        && archiveVerification.records === expectedRecords
         && durableManifest.copyAdoptedComplete === true
-        && durableManifest.copyAdoptionMode === 'session_handoff'
+        && durableManifest.copyAdoptionMode === 'shared_archive'
         && text(durableManifest.copiedFromScopeKey || '') === sourceScopeKey
         && text(durableManifest.copyTransferId || '') === expectedTransferId
-        && text(durableManifest.copySourceChatId || '') === text(markerState.sourceChatId)
-        && text(durableManifest.copyTargetChatId || '') === expectedTargetChatId
         && Number(durableManifest.copyExpectedRecordCount || 0) === expectedRecords;
       const result = {
         ...targetBase,
         ok: durable,
-        adopted: cloned?.ok === true,
+        adopted: adopted && durable,
         verified: durable,
         durable,
         sourceScopeKey,
         sourceChatId: markerState.sourceChatId,
-        records: durableRecords.inheritedRecords,
+        records: archiveVerification.records,
         expectedRecords,
+        archiveId: archive.archiveRef.archiveId,
+        archiveScopeKey: archive.archiveRef.archiveScopeKey,
+        archiveGeneration: archive.archiveRef.generation,
+        archiveDigest: archive.archiveRef.digest,
+        archiveRecordCount: archive.archiveRef.recordCount,
+        physicalCopies: 0,
+        compactedSourceRecords: Math.max(0, Number(archive.compactedLocalRecords || 0) || 0),
         copyAdoptionMode: text(durableManifest.copyAdoptionMode || ''),
         copyAdoptedComplete: durableManifest.copyAdoptedComplete === true,
-        reason: durable
-          ? (cloned?.ok === true ? 'session_handoff_adopted' : 'session_handoff_already_adopted')
-          : 'session_handoff_durable_readback_failed',
-        diagnostics: durableRecords
+        reason: durable ? (adopted ? 'session_archive_link_adopted' : 'session_archive_link_already_adopted') : 'session_archive_link_verification_failed'
       };
-      if (result.adopted) {
-        pushActivityLog('session_handoff_adopted', 'Bridge session history was adopted.', {
-          scopeKey: result.targetScopeKey,
-          sourceScopeKey: result.sourceScopeKey,
-          records: result.records,
-          transferId: result.transferId
-        }, 'success');
-      }
+      if (result.adopted) pushActivityLog('session_handoff_adopted', 'Bridge session history was linked through the shared archive.', {
+        scopeKey: result.targetScopeKey,
+        sourceScopeKey: result.sourceScopeKey,
+        records: result.records,
+        archiveId: result.archiveId,
+        transferId: result.transferId,
+        physicalCopies: 0,
+        compactedSourceRecords: result.compactedSourceRecords
+      }, 'success');
       return result;
     } catch (error) {
-      return {
-        ...base,
-        reason: text(error?.code || 'session_handoff_adoption_failed'),
-        error: formatErrorMessage(error, 700)
-      };
+      return { ...base, reason: text(error?.code || 'session_handoff_adoption_failed'), error: formatErrorMessage(error, 700) };
     }
   };
 
@@ -11514,7 +12420,10 @@
       lengths[field] = Math.max(1, Array.from(tf.values()).reduce((sum, value) => sum + value, 0));
       fieldTf[field] = tf;
     }
-    const value = { key, fields, anchors, tokens, lengths, fieldTf };
+    // The full visible U+A body already exists on the record. Keep its BM25F tokens/TF
+    // but do not retain a second copy inside the long-lived sparse projection cache.
+    const cachedFields = { ...fields, summary: '' };
+    const value = { key, fields: cachedFields, anchors, tokens, lengths, fieldTf };
     while (Runtime.sparseProjectionCache.size >= FLASHBACK_SPARSE_CACHE_MAX) {
       const oldest = Runtime.sparseProjectionCache.keys().next().value;
       if (!oldest) break;
@@ -11534,11 +12443,14 @@
 
   const sparseScoringProjectionForRecord = (record = {}, settings = Runtime.settings || DEFAULTS) => {
     const projection = sparseProjectionForRecord(record, settings);
-    if (!projection.bodyForLexical) {
-      projection.bodyForLexical = `${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${Object.values(projection.fields).join('\n')}`;
-      projection.scoringAnchors = extractRecallAnchors(projection.bodyForLexical);
-    }
-    return projection;
+    const visibleBody = sanitizeAssistantForMemory(record?.text || '', { stripRolePrefix: false });
+    const compactFields = Object.entries(projection.fields || {})
+      .filter(([field]) => field !== 'summary')
+      .map(([, value]) => value)
+      .join('\n');
+    // Request-local lexical body: never attach this large string to the cached projection.
+    const bodyForLexical = `${record.title || ''}\n${Array.isArray(record.tags) ? record.tags.join(' ') : ''}\n${compactFields}\n${visibleBody}`;
+    return { ...projection, bodyForLexical, scoringAnchors: extractRecallAnchors(bodyForLexical) };
   };
 
   const scoreBm25fCandidates = (records = [], queryText = '', settings = Runtime.settings || DEFAULTS, options = {}) => {
@@ -11628,7 +12540,10 @@
     }
     const semanticNumberSupport = matched.length > 0 && meaningful.size > 0;
     const numberSupport = semanticNumberSupport && numbers.size > 0
-      ? Array.from(numbers).some(number => Object.values(sparse.fields).some(value => normalizeForLexical(value).includes(number)))
+      ? Array.from(numbers).some(number => (
+          Object.values(sparse.fields).some(value => normalizeForLexical(value).includes(number))
+          || normalizeForLexical(sanitizeAssistantForMemory(record.text || '', { stripRolePrefix: false })).includes(number)
+        ))
       : false;
     if (!matched.length) return null;
     const score = clampNumber(Math.max(...matched.map(item => item.weight)) * 0.72 + Math.min(0.24, matched.length * 0.08) + (numberSupport ? 0.04 : 0), 0, 1, 0);
@@ -12652,7 +13567,7 @@
   const recordEntityAnchorSet = (record) => {
     const sparse = sparseProjectionForRecord(record, Runtime.settings || DEFAULTS).fields;
     const out = new Set();
-    for (const anchor of extractEntityAnchors(`${sparse.canonical}\n${sparse.identity}\n${sparse.summary}`, 120)) out.add(anchor);
+    for (const anchor of extractEntityAnchors(`${sparse.canonical}\n${sparse.identity}\n${sanitizeAssistantForMemory(record?.text || '', { stripRolePrefix: false })}`, 120)) out.add(anchor);
     return out;
   };
 
@@ -13459,7 +14374,7 @@
     stageElapsed.queryEmbedding = embeddingState.elapsed;
     if (!queryText) {
       stageElapsed.total = Date.now() - recallStartedAt;
-      return { records: [], total: 0, storedTotal: manifest.count || 0, externalSuppressed: 0, queryDim: 0, queryText: '', scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, storageManifestCorrupt: manifest.manifestCorrupt === true, storageForeignScopeKey: text(manifest.foreignScopeKey || ''), stageElapsed };
+      return { records: [], total: 0, storedTotal: Math.max(0, Number(manifest.count || 0) || 0) + Math.max(0, Number(manifest.archiveRef?.recordCount || 0) || 0), externalSuppressed: 0, queryDim: 0, queryText: '', scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, storageManifestCorrupt: manifest.manifestCorrupt === true, storageForeignScopeKey: text(manifest.foreignScopeKey || ''), stageElapsed };
     }
     const queryEmbeddingResult = embeddingState.result;
     const remoteEmbeddingError = embeddingState.error;
@@ -13490,7 +14405,10 @@
       reason: currentSceneShardIndexes.length ? 'current_scene_sources' : ''
     });
     const recordLoadStartedAt = Date.now();
-    const loaded = await loadScopeRecordsForRecall(scope.scopeKey, shardSelection, { manifest });
+    const loaded = await loadScopeRecordsForRecall(scope.scopeKey, shardSelection, {
+      manifest,
+      archiveQuery: { queryText: primaryQueryText, queryVector, queryProvider, queryType, settings: cfg, queryModel }
+    });
     stageElapsed.primaryRecallLoad = Date.now() - recordLoadStartedAt;
     stageElapsed.scopeStorageLoad += stageElapsed.primaryRecallLoad;
     stageElapsed.shardStorageReadWork += Number(loaded.performance?.storageReadMs || 0);
@@ -13529,7 +14447,10 @@
       const additionalIndexes = (previousSelection.indexes || []).filter(index => !loadedIndexes.has(index));
       if (additionalIndexes.length) {
         const additionalLoadStartedAt = Date.now();
-        const additional = await loadScopeRecordsForRecall(scope.scopeKey, { indexes: additionalIndexes, reason: 'previous_turn_context', shardCount: manifest.shardCount }, { manifest });
+        const additional = await loadScopeRecordsForRecall(scope.scopeKey, { indexes: additionalIndexes, reason: 'previous_turn_context', shardCount: manifest.shardCount }, {
+          manifest,
+          archiveQuery: { queryText: previousTurn.text || primaryQueryText, queryVector: previousTurn.vector || queryVector, queryProvider, queryType, settings: cfg, queryModel }
+        });
         const additionalElapsed = Date.now() - additionalLoadStartedAt;
         stageElapsed.additionalRecallLoad += additionalElapsed;
         stageElapsed.scopeStorageLoad += additionalElapsed;
@@ -13599,7 +14520,7 @@
     };
     if (!records.length) {
       stageElapsed.total = Date.now() - recallStartedAt;
-      return { records: [], currentStateFacts, total: 0, storedTotal: manifest.count || 0, loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
+      return { records: [], currentStateFacts, total: 0, storedTotal: Math.max(0, Number(manifest.count || 0) || 0) + Math.max(0, Number(manifest.archiveRef?.recordCount || 0) || 0), loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
     }
     const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
     const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, queryProfileId, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
@@ -13829,7 +14750,11 @@
         misses: Runtime.recallShardCacheStats.misses,
         evictions: Runtime.recallShardCacheStats.evictions,
         invalidations: Runtime.recallShardCacheStats.invalidations,
+        oversizedSkips: Runtime.recallShardCacheStats.oversizedSkips,
         size: Runtime.recallShardCache.size,
+        bytes: Runtime.recallShardCacheStats.bytes,
+        peakBytes: Runtime.recallShardCacheStats.peakBytes,
+        maxBytes: RECALL_SHARD_CACHE_MAX_BYTES,
         primary: loaded.performance || null
       },
       stageElapsed,
@@ -13849,7 +14774,11 @@
           misses: Runtime.recallShardCacheStats.misses,
           evictions: Runtime.recallShardCacheStats.evictions,
           invalidations: Runtime.recallShardCacheStats.invalidations,
+          oversizedSkips: Runtime.recallShardCacheStats.oversizedSkips,
           size: Runtime.recallShardCache.size,
+          bytes: Runtime.recallShardCacheStats.bytes,
+          peakBytes: Runtime.recallShardCacheStats.peakBytes,
+          maxBytes: RECALL_SHARD_CACHE_MAX_BYTES,
           primary: loaded.performance || null
         },
         stageElapsed,
@@ -16796,6 +17725,38 @@
       : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScopeForGui());
     const limit = clampInt(options.limit, 0, 1000000, 0);
     const includeRecords = options.includeRecords !== false;
+    if (!includeRecords && !Array.isArray(options?.sourceTypes)) {
+      const manifest = await loadScopeManifest(scope.scopeKey);
+      const archiveRef = normalizeFlashbackArchiveRef(manifest.archiveRef);
+      const archiveSummary = archiveRef ? await loadFlashbackArchiveManifestSummary(archiveRef) : null;
+      const localCount = Math.max(0, Number(manifest.count || 0) || 0);
+      const archiveCount = Math.max(0, Number(archiveSummary?.records || 0) || 0);
+      const localStats = normalizeStatsForDisplay(manifest.stats || {});
+      localStats.recordTotal = localCount;
+      const stats = mergeFlashbackArchiveStats(localStats, archiveSummary?.stats || {});
+      stats.recordTotal = localCount + archiveCount;
+      const archiveIntegrityOk = !archiveRef || archiveSummary?.verified === true;
+      const { shardSummaries: _localShardSummaries, ...compactManifest } = manifest || {};
+      return {
+        scope,
+        manifest: {
+          ...compactManifest,
+          count: localCount + archiveCount,
+          localCount,
+          archiveCount,
+          archiveRef,
+          archiveVerified: archiveIntegrityOk,
+          archiveReason: archiveRef ? (archiveSummary?.reason || 'archive_manifest_chain_mismatch') : 'archive_absent',
+          archiveLayers: archiveSummary?.layers?.length || 0,
+          stats,
+          selectedFromCount: localCount + archiveCount,
+          limited: false,
+          summaryOnly: true
+        },
+        stats,
+        records: []
+      };
+    }
     const loaded = await loadScopeRecords(scope.scopeKey);
     const { manifest, records } = loaded;
     const selectedRecords = filterRecordsBySourceTypes(records, options);
@@ -16826,6 +17787,7 @@
       readOnly: true,
       recordsIncluded: options?.includeRecords !== false,
       version: PLUGIN_VERSION,
+      capabilities: { archiveHandoffV1: true, summaryInspect: true, physicalRecordCopyOnHandoff: false },
       ...snapshot
     };
   };
@@ -20458,6 +21420,8 @@ ${cleanedText}`, 80),
       performance: {
         storage: { ...Runtime.storagePerfStats },
         shardCache: { ...Runtime.recallShardCacheStats, size: Runtime.recallShardCache.size },
+        localVectorShards: { ...Runtime.localVectorShardStats, cacheSize: Runtime.localVectorShardCache.size },
+        archiveCompression: { ...Runtime.archiveCompressionStats, supported: flashbackArchiveGzipSupported() },
         sparseCache: { ...Runtime.sparseCacheStats, size: Runtime.sparseProjectionCache.size },
         queryEmbeddingCache: { ...Runtime.queryEmbeddingCacheStats, size: Runtime.queryEmbeddingCache.size },
         documentEmbeddingCache: { size: Runtime.documentEmbeddingCache.size },
@@ -20605,7 +21569,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, loadScopeManifest, saveScopeManifest, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, findCloneSource, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.opLog = opLog;
   publicApi._test.flushOperationLogs = flushOperationLogs;
@@ -20760,6 +21724,8 @@ ${cleanedText}`, 80),
         Runtime.activityLogSeq = 0;
         Runtime.sessionEmbeddingKey = '';
         Runtime.recallShardCache.clear();
+        Runtime.recallShardCacheStats.bytes = 0;
+        Runtime.localVectorShardCache.clear();
         Runtime.sparseProjectionCache.clear();
         Runtime.sparseProjectionRecordKeys.clear();
         Runtime.queryEmbeddingCache.clear();
