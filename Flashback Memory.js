@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.12
+//@display-name ⚡ FLASHBACK Memory v0.10.13
 //@api 3.0
-//@version 0.10.12
+//@version 0.10.13
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,7 +78,7 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
- * ⚡ FLASHBACK Memory v0.10.12
+ * ⚡ FLASHBACK Memory v0.10.13
  *
  * A no-generative-LLM long-term memory plugin for RisuAI API v3.
  *
@@ -393,7 +393,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.12';
+  const PLUGIN_VERSION = '0.10.13';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const MEMORY_SESSION_BRIDGE_IPC_SCHEMA = 'flashback-memory-bridge-ipc-v1';
@@ -8999,18 +8999,25 @@
       // An incomplete U or A is not a turn. This also safely drops a leading
       // assistant fragment when a cold-start history limit begins mid-pair.
       if (!current.user?.content || !(current.assistants || []).some(item => item?.content)) { current = null; return; }
-      const parts = [];
-      if (current.user?.content) parts.push(`User:\n${current.user.content}`);
+      const userText = text(current.user?.content || '').trim();
+      const assistantParts = [];
       const metadataList = [];
       for (const assistant of current.assistants || []) {
         if (!assistant?.content) continue;
         metadataList.push(extractMemoryMetadata(assistant.rawContent || assistant.content));
         const cleanAssistant = sanitizeAssistantForMemory(assistant.content);
-        if (cleanAssistant) parts.push(`Assistant:\n${cleanAssistant}`);
+        if (cleanAssistant) assistantParts.push(cleanAssistant);
       }
-      if (!parts.length) { current = null; return; }
+      // One Flashback turn has exactly one canonical Assistant region even when
+      // RisuAI stores a single model turn as multiple consecutive assistant
+      // messages (continuation/prefill fragments).  Joining assistant fragments
+      // here must mirror liveChatPairsFromNormalized(), otherwise the post-ingest
+      // worldline exact-match pass sees an artificial `---` delimiter and retires
+      // the freshly committed turn as an orphan.
+      if (!userText || !assistantParts.length) { current = null; return; }
       turnNo += 1;
-      const body = parts.join('\n\n---\n\n');
+      const assistantText = assistantParts.join('\n\n');
+      const body = [`User:\n${userText}`, `Assistant:\n${assistantText}`].join('\n\n---\n\n');
       const endIndex = current.assistants?.length ? current.assistants[current.assistants.length - 1].index : current.user?.index;
       const sourceMessageIds = uniqueTextList([
         current.user?.sourceMessageIds || [],
@@ -9433,6 +9440,28 @@
         newlyRetired.push(...annotateWorldlineRecords(group.records, node, status));
       }
       const restoredRecordKeys = new Set(nextResponses.map(record => text(record.id || record.hash || '')));
+      // Catastrophic zero-match guard. If a non-empty live conversation and a
+      // non-empty active ledger suddenly produce zero matched response groups,
+      // never commit an empty active ledger from reconciliation alone. This can
+      // happen when two equivalent turn serializers disagree (the v0.10.12
+      // consecutive-assistant delimiter bug was one example). Keep the durable
+      // records and force the caller/maintenance pass to repair from live chat.
+      const liveDescriptorCount = reconciled.descriptors.length;
+      const catastrophicZeroMatch = activeGroups.length > 0
+        && liveDescriptorCount > 0
+        && usedActive.size === 0
+        && restoredKeys.size === 0
+        && nextResponses.length === 0
+        && newlyRetired.length > 0;
+      if (catastrophicZeroMatch) {
+        const error = new Error(`turn worldline synchronization refused to retire all active response groups (${activeGroups.length}) after zero live matches (${liveDescriptorCount})`);
+        error.code = 'FLASHBACK_WORLDLINE_ZERO_MATCH_GUARD';
+        error.scopeKey = scope.scopeKey;
+        error.activeGroups = activeGroups.length;
+        error.liveDescriptors = liveDescriptorCount;
+        error.newlyRetiredRecords = newlyRetired.length;
+        throw error;
+      }
       const retiredPool = [
         ...timelineRetiredRecords.filter(record => !restoredRecordKeys.has(text(record.id || record.hash || ''))),
         ...newlyRetired
@@ -9709,7 +9738,16 @@
       const marker = markers[index];
       if (marker.role !== 'assistant') continue;
       const end = index + 1 < markers.length ? markers[index + 1].start : source.length;
-      const fragment = canonicalChatResponseText(source.slice(marker.end, end));
+      let rawFragment = source.slice(marker.end, end);
+      // v0.10.12 and older cold-start records could encode consecutive assistant
+      // fragments as `Assistant A -> --- -> Assistant B`.  The live turn model
+      // canonically represents the same assistant fragments with a blank line.
+      // Remove only the synthetic trailing separator immediately before the next
+      // role marker so legitimate horizontal rules inside assistant prose remain.
+      if (index + 1 < markers.length) {
+        rawFragment = rawFragment.replace(/(?:^|\n)[ \t]*---[ \t]*(?:\n[ \t]*)*$/u, '');
+      }
+      const fragment = canonicalChatResponseText(rawFragment);
       if (fragment) fragments.push(fragment);
     }
     return fragments.join('\n\n');
@@ -10243,8 +10281,12 @@
       // The pre-ingest pass retires rollback/reroll branches. A second pass is
       // required after new records exist so they receive their active lineage.
       if (selectedSources.length) {
-        await synchronizeFlashbackTurnWorldline(itemScope, liveState, coldStartSettings)
-          .catch(error => warn('maintenance post-ingest worldline annotation failed', error));
+        // After authoritative live U+A records have been committed, lineage
+        // annotation is part of the same integrity transaction. Do not swallow
+        // a failure here and report a false-success cold start: the durable
+        // records remain committed, while the caller receives a repairable
+        // error instead of proceeding with an inconsistent worldline.
+        await synchronizeFlashbackTurnWorldline(itemScope, liveState, coldStartSettings);
       }
       result.sources += Number(sources.length || 0);
       result.chunks += Number(batch.chunks || 0);
@@ -16138,8 +16180,12 @@
         : null);
       const pairIndex = Number(pair?.pairIndex || pending.pairIndex || 0) || inferPairIndexFromAssistantPosition(candidate.position);
       const assistantPosition = Number(pair?.assistantPosition || candidate.position || 0) || candidate.position;
-      const assistantRaw = candidate.raw || pair?.assistantText || candidate.body || '';
-      const assistant = sanitizeAssistantForMemory(assistantRaw).trim();
+      // `candidate.raw` is one physical assistant message. A finalized RisuAI
+      // turn may consist of multiple consecutive assistant messages, so the
+      // authoritative pair must win for the canonical visible response body.
+      const assistantRaw = candidate.raw || candidate.body || pair?.assistantText || '';
+      const assistantCanonicalSource = pair?.assistantText || candidate.body || assistantRaw;
+      const assistant = sanitizeAssistantForMemory(assistantCanonicalSource).trim();
       if (!assistant) return false;
       const userMessagePosition = Number(pair?.userPosition || pending.userMessagePosition || 0) || Math.max(0, candidate.position - 1);
       const latestUser = pair?.userText || candidate?.authoritativeUserText || pending.latestUser;
@@ -17905,13 +17951,15 @@ ${cleanedText}`, 80),
       error: '',
       result: { healthy: result.healthy, strategy: result.operation?.strategy || normalizedMode, stages: result.operation?.stages || [] }
     });
-    pushActivityLog('memory_maintenance_completed', '기억 유지보수를 완료했습니다.', {
+    pushActivityLog('memory_maintenance_completed', result.healthy
+      ? '기억 유지보수를 완료했습니다.'
+      : '기억 유지보수는 완료됐지만 검증 결과 문제가 남아 있습니다.', {
       scopeKey: result.scopeKey,
       maintenanceMode: normalizedMode,
       operationId,
       healthy: result.healthy,
       strategy: result.operation?.strategy || normalizedMode
-    }, 'success');
+    }, result.healthy ? 'success' : 'warn');
     return result;
     } catch (error) {
       const failedAt = Date.now();
