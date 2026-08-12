@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.18
+//@display-name ⚡ FLASHBACK Memory v0.10.19
 //@api 3.0
-//@version 0.10.18
+//@version 0.10.19
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,11 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.10.19
+ *
+ * v0.10.19 is a version-only release bump. Runtime behavior is unchanged from
+ * v0.10.18.
+ *
  * ⚡ FLASHBACK Memory v0.10.18
  *
  * v0.10.18 repairs persona-sensitive scope identity. When the same RisuAI chat
@@ -424,7 +429,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.18';
+  const PLUGIN_VERSION = '0.10.19';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -17918,85 +17923,138 @@
   };
 
   let memoryBridgeIpcRegistered = false;
+  let memoryBridgeIpcHandler = null;
+  let memoryBridgeIpcRegistration = null;
+  let memoryBridgeIpcApi = null;
   const registerMemoryBridgeIpc = async () => {
+    if (Runtime.unloaded) return false;
     if (memoryBridgeIpcRegistered) return true;
     const api = getLiveApi(['addPluginChannelListener', 'postPluginChannelMessage']);
     if (typeof api?.addPluginChannelListener !== 'function'
       || typeof api?.postPluginChannelMessage !== 'function') return false;
-    const registrationResult = await api.addPluginChannelListener(
-      MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL,
-      async (message, metadata = {}) => {
-        const request = message && typeof message === 'object' && !Array.isArray(message)
-          ? message
-          : {};
-        const requestId = text(request.requestId || '').trim();
-        const action = text(request.action || '').trim();
-        if (request.schema !== MEMORY_SESSION_BRIDGE_IPC_SCHEMA
-          || request.kind !== 'request'
-          || !requestId
-          || !action) return;
-        const sender = text(metadata?.sender || '').trim();
-        if (sender !== MEMORY_SESSION_BRIDGE_PLUGIN_ID) return;
-        let result = null;
-        let errorText = '';
-        try {
-          if (action === 'inspect') {
-            const includeRecords = request.payload?.includeRecords === true;
-            const inspected = await inspectMemoryLedger(null, {
-              includeRecords,
-              limit: request.payload?.limit
-            });
-            if (includeRecords) {
-              result = {
-                ...inspected,
-                ownerPluginId: PLUGIN_SLUG,
-                authorizedRequester: sender
-              };
-            } else {
-              const { shardSummaries: _omittedShardSummaries, ...compactManifest } = inspected.manifest || {};
-              result = {
-                ...inspected,
-                manifest: compactManifest,
-                records: [],
-                ownerPluginId: PLUGIN_SLUG,
-                authorizedRequester: sender
-              };
-            }
-          } else if (action === 'adopt_session_handoff') {
+    const handler = async (message, metadata = {}) => {
+      if (Runtime.unloaded) return;
+      const request = message && typeof message === 'object' && !Array.isArray(message)
+        ? message
+        : {};
+      const requestId = text(request.requestId || '').trim();
+      const action = text(request.action || '').trim();
+      if (request.schema !== MEMORY_SESSION_BRIDGE_IPC_SCHEMA
+        || request.kind !== 'request'
+        || !requestId
+        || !action) return;
+      const sender = text(metadata?.sender || '').trim();
+      if (sender !== MEMORY_SESSION_BRIDGE_PLUGIN_ID) return;
+      let result = null;
+      let errorText = '';
+      try {
+        if (action === 'inspect') {
+          const includeRecords = request.payload?.includeRecords === true;
+          const inspected = await inspectMemoryLedger(null, {
+            includeRecords,
+            limit: request.payload?.limit
+          });
+          if (includeRecords) {
             result = {
-              ...await adoptSessionHandoff(request.payload || {}),
-              mutation: 'adopt_session_handoff',
+              ...inspected,
               ownerPluginId: PLUGIN_SLUG,
               authorizedRequester: sender
             };
           } else {
-            throw new Error(`Unsupported Flashback bridge IPC action: ${action}`);
+            const { shardSummaries: _omittedShardSummaries, ...compactManifest } = inspected.manifest || {};
+            result = {
+              ...inspected,
+              manifest: compactManifest,
+              records: [],
+              ownerPluginId: PLUGIN_SLUG,
+              authorizedRequester: sender
+            };
           }
-        } catch (error) {
-          errorText = formatErrorMessage(error, 900);
+        } else if (action === 'adopt_session_handoff') {
+          result = {
+            ...await adoptSessionHandoff(request.payload || {}),
+            mutation: 'adopt_session_handoff',
+            ownerPluginId: PLUGIN_SLUG,
+            authorizedRequester: sender
+          };
+        } else {
+          throw new Error(`Unsupported Flashback bridge IPC action: ${action}`);
         }
-        try {
-          await api.postPluginChannelMessage(
-            MEMORY_SESSION_BRIDGE_PLUGIN_ID,
-            MEMORY_SESSION_BRIDGE_RESPONSE_CHANNEL,
-            {
-              schema: MEMORY_SESSION_BRIDGE_IPC_SCHEMA,
-              kind: 'response',
-              requestId,
-              action,
-              ok: !errorText,
-              result: errorText ? null : result,
-              error: errorText
-            }
-          );
-        } catch (error) {
-          warn('Memory Bridge IPC response failed', error);
-        }
+      } catch (error) {
+        errorText = formatErrorMessage(error, 900);
       }
+      if (Runtime.unloaded) return;
+      try {
+        await api.postPluginChannelMessage(
+          MEMORY_SESSION_BRIDGE_PLUGIN_ID,
+          MEMORY_SESSION_BRIDGE_RESPONSE_CHANNEL,
+          {
+            schema: MEMORY_SESSION_BRIDGE_IPC_SCHEMA,
+            kind: 'response',
+            requestId,
+            action,
+            ok: !errorText,
+            result: errorText ? null : result,
+            error: errorText
+          }
+        );
+      } catch (error) {
+        warn('Memory Bridge IPC response failed', error);
+      }
+    };
+    const registrationResult = await api.addPluginChannelListener(
+      MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL,
+      handler
     );
     if (registrationResult === false) return false;
+    memoryBridgeIpcHandler = handler;
+    memoryBridgeIpcRegistration = registrationResult;
+    memoryBridgeIpcApi = api;
     memoryBridgeIpcRegistered = true;
+    if (Runtime.unloaded) {
+      await unregisterMemoryBridgeIpc();
+      return false;
+    }
     return true;
+  };
+
+  const unregisterMemoryBridgeIpc = async () => {
+    const handler = memoryBridgeIpcHandler;
+    const registration = memoryBridgeIpcRegistration;
+    const registeredApi = memoryBridgeIpcApi;
+    memoryBridgeIpcRegistered = false;
+    memoryBridgeIpcHandler = null;
+    memoryBridgeIpcRegistration = null;
+    memoryBridgeIpcApi = null;
+    if (!handler && !registration) return false;
+    try {
+      if (typeof registration === 'function') {
+        await registration();
+        return true;
+      }
+      for (const method of ['dispose', 'unsubscribe', 'remove', 'unregister']) {
+        if (typeof registration?.[method] === 'function') {
+          await registration[method]();
+          return true;
+        }
+      }
+      const removalCandidates = [
+        getLiveApi(['removePluginChannelListener']),
+        getLiveApi(['unregisterPluginChannelListener']),
+        registeredApi
+      ];
+      for (const api of removalCandidates) {
+        for (const method of ['removePluginChannelListener', 'unregisterPluginChannelListener']) {
+          if (handler && typeof api?.[method] === 'function') {
+            await api[method](MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL, handler);
+            return true;
+          }
+        }
+      }
+    } catch (error) {
+      warn('Memory Bridge IPC unregistration failed; retired handler remains inert.', error);
+    }
+    return false;
   };
 
   const scheduleMemoryBridgeIpcRetry = (attempt = 0) => {
@@ -18023,6 +18081,31 @@
   ).trim();
 
   const recordCommitRevision = (record = {}) => stableHash(safeStringify(record));
+
+  // A re-embedding result may merge across a concurrent persistence pass only
+  // when the complete non-vector record is unchanged. Ignore representation-only
+  // vector sidecar fields and embedding output metadata; every ownership,
+  // provenance, content, scope, and worldline field remains part of the revision.
+  const recordEmbeddingInputRevision = (record = {}) => {
+    const {
+      vector: _vector,
+      vectorRef: _vectorRef,
+      vectorStorageMode: _vectorStorageMode,
+      vectorPayloadLocal: _vectorPayloadLocal,
+      vectorPayloadMissing: _vectorPayloadMissing,
+      dim: _dim,
+      provider: _provider,
+      model: _model,
+      embeddingProvider: _embeddingProvider,
+      embeddingModel: _embeddingModel,
+      embeddingDimensions: _embeddingDimensions,
+      embeddingProfileId: _embeddingProfileId,
+      tokenEstimate: _tokenEstimate,
+      updatedAt: _updatedAt,
+      ...identityRecord
+    } = record && typeof record === 'object' ? record : {};
+    return stableHash(safeStringify(identityRecord));
+  };
 
   const embeddingRecordPatch = (record = {}) => ({
     vector: Array.isArray(record.vector) ? record.vector : [],
@@ -18083,7 +18166,7 @@
       const identity = recordCommitIdentity(baseRecords[index]);
       if (!identity) continue;
       updates.set(identity, {
-        revision: recordCommitRevision(baseRecords[index]),
+        revision: recordEmbeddingInputRevision(baseRecords[index]),
         patch: embeddingRecordPatch(next[index])
       });
     }
@@ -18102,7 +18185,7 @@
           continue;
         }
         const update = updates.get(recordCommitIdentity(record));
-        if (update && update.revision === recordCommitRevision(record)) {
+        if (update && update.revision === recordEmbeddingInputRevision(record)) {
           latestBase.push({ ...record, ...update.patch });
           changed += 1;
         } else {
@@ -21820,10 +21903,16 @@ ${cleanedText}`, 80),
     const unloadApi = unloadApiRef.api;
     if (unloadApi && typeof unloadApi.onUnload === 'function') {
       await unloadApi.onUnload(async () => {
+        Runtime.unloaded = true;
+        try { await unregisterMemoryBridgeIpc(); } catch (_) {
+          memoryBridgeIpcRegistered = false;
+          memoryBridgeIpcHandler = null;
+          memoryBridgeIpcRegistration = null;
+          memoryBridgeIpcApi = null;
+        }
         if (Runtime.operationLogQueue.length || Runtime.operationLogWrite) {
           await withDeadline(flushOperationLogs(), 1500, 'operation log unload flush').catch(() => {});
         }
-        Runtime.unloaded = true;
         abortEmbeddingJobs('plugin_unloaded');
         clearScheduledTimers();
         Runtime.driftChecksInFlight.clear();
