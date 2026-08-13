@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.19
+//@display-name ⚡ FLASHBACK Memory v0.10.20
 //@api 3.0
-//@version 0.10.19
+//@version 0.10.20
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,10 +78,16 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.10.20
+ *
+ * v0.10.20 is a version-only release bump. Runtime behavior is unchanged from
+ * v0.10.19.
+ *
  * ⚡ FLASHBACK Memory v0.10.19
  *
- * v0.10.19 is a version-only release bump. Runtime behavior is unchanged from
- * v0.10.18.
+ * v0.10.19 gives long-running generations a fresh finalized-capture window
+ * after afterRequest and prevents single-turn chats with multiple chunks from
+ * reporting a permanently stale episode index after maintenance.
  *
  * ⚡ FLASHBACK Memory v0.10.18
  *
@@ -429,7 +435,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.19';
+  const PLUGIN_VERSION = '0.10.20';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -718,6 +724,37 @@
   const FINALIZED_CAPTURE_IDLE_POLL_MS = 2200;
   const FINALIZED_CAPTURE_STABLE_MS = 4000;
   const FINALIZED_CAPTURE_MAX_AGE_MS = 4 * 60 * 1000;
+
+  const finalizedCaptureMonitorExpiry = (state = {}, pending = {}, now = Date.now()) => {
+    const checkedAt = Number(now || Date.now()) || Date.now();
+    const finalizationStartedAt = Math.max(0, Number(state.finalizationStartedAt || 0) || 0);
+    const requestStartedAt = Math.max(0, Number(pending.lastRequestAt || pending.at || state.startedAt || checkedAt) || checkedAt);
+    const phase = finalizationStartedAt ? 'finalizing_response' : 'awaiting_response';
+    const startedAt = finalizationStartedAt || requestStartedAt;
+    const maxAgeMs = finalizationStartedAt ? FINALIZED_CAPTURE_MAX_AGE_MS : PENDING_TURN_MAX_AGE_MS;
+    const ageMs = Math.max(0, checkedAt - startedAt);
+    return {
+      expired: ageMs > maxAgeMs,
+      phase,
+      startedAt,
+      ageMs,
+      maxAgeMs,
+      reason: finalizationStartedAt ? 'finalized_capture_max_age' : 'pending_request_max_age'
+    };
+  };
+
+  const markFinalizedCaptureResponseComplete = (state = {}, pending = {}, now = Date.now()) => {
+    if (!state || typeof state !== 'object') return false;
+    const requestAt = Math.max(0, Number(pending.lastRequestAt || pending.at || 0) || 0);
+    if (requestAt && Number(state.finalizationRequestAt || 0) === requestAt && Number(state.finalizationStartedAt || 0) > 0) return false;
+    state.finalizationRequestAt = requestAt;
+    state.finalizationStartedAt = Number(now || Date.now()) || Date.now();
+    state.lastText = '';
+    state.stableSince = 0;
+    state.attempts = 0;
+    state.pollDelayMs = FINALIZED_CAPTURE_POLL_MS;
+    return true;
+  };
   const SCOPE_REGISTRY_REMEMBER_TTL_MS = 30000;
 
   // 캐시 안전화(v0.8.8) — 응답 모델 프롬프트 prefix 캐시 보호 + 임베딩 로컬 캐시.
@@ -11535,6 +11572,12 @@
     .filter(record => record.vector.length && record.text)
     .sort(responseRecordSort);
 
+  const missingEpisodeIndexForEligibleTurns = (responseRecords = [], episodeRecords = [], settings = Runtime.settings || DEFAULTS) => {
+    if (Array.isArray(episodeRecords) && episodeRecords.length) return false;
+    const minTurns = clampInt(settings.episodeMinRecords, 1, 40, DEFAULTS.episodeMinRecords);
+    return responseRecordsForEpisodeIndex(responseRecords, settings).length >= minTurns;
+  };
+
   const EPISODE_BOUNDARY_SCHEMA_VERSION = 2;
 
   const episodeSourceDigestForRecords = (records = [], settings = Runtime.settings || DEFAULTS) => stableHash(responseRecordsForEpisodeIndex(records, settings)
@@ -17309,27 +17352,32 @@
     }
   };
 
-  const scheduleFinalizedCaptureMonitor = (pending, settings = Runtime.settings || DEFAULTS) => {
+  const scheduleFinalizedCaptureMonitor = (pending, settings = Runtime.settings || DEFAULTS, options = {}) => {
     const pendingId = text(pending?.pendingId || '');
     if (!pendingId || Runtime.unloaded || settings.mode === 'off' || !settings.captureAfterRequest) return false;
     let state = Runtime.finalizedCaptureMonitors.get(pendingId);
     if (!state) {
-      state = { pendingId, startedAt: Date.now(), lastText: '', stableSince: 0, seenRequestAt: 0, attempts: 0, timer: null, pollDelayMs: FINALIZED_CAPTURE_POLL_MS };
+      state = { pendingId, startedAt: Date.now(), finalizationStartedAt: 0, finalizationRequestAt: 0, lastText: '', stableSince: 0, seenRequestAt: 0, attempts: 0, timer: null, pollDelayMs: FINALIZED_CAPTURE_POLL_MS };
       Runtime.finalizedCaptureMonitors.set(pendingId, state);
     }
+    if (options.responseCompleted === true) markFinalizedCaptureResponseComplete(state, pending);
     const schedulePoll = (delay = state.pollDelayMs || FINALIZED_CAPTURE_POLL_MS) => {
       state.timer = scheduleTimer(() => poll().catch(error => warn('finalized capture poll failed', error)), delay);
     };
     const poll = async () => {
       if (Runtime.unloaded || Runtime.finalizedCaptureMonitors.get(pendingId) !== state) return;
       const current = (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns : []).find(item => item?.pendingId === pendingId);
-      if (!current || Date.now() - Number(state.startedAt || 0) > FINALIZED_CAPTURE_MAX_AGE_MS) {
+      const expiry = current ? finalizedCaptureMonitorExpiry(state, current) : null;
+      if (!current || expiry?.expired) {
         if (current) {
           removePendingTurnById(pendingId);
           pushActivityLog('capture_expired', '최종 응답을 확인하지 못해 캡처 대기가 만료됐습니다.', {
             scopeKey: current.scope?.scopeKey || '',
             pairIndex: Number(current.pairIndex || 0) || 0,
-            reason: 'finalized_capture_max_age'
+            reason: expiry.reason,
+            phase: expiry.phase,
+            ageMs: expiry.ageMs,
+            maxAgeMs: expiry.maxAgeMs
           }, 'warn');
         }
         stopFinalizedCaptureMonitor(pendingId);
@@ -17831,7 +17879,7 @@
       return content;
     }
     const pending = Runtime.pendingTurn || (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns[Runtime.pendingTurns.length - 1] : null);
-    if (pending) scheduleFinalizedCaptureMonitor(pending, settings);
+    if (pending) scheduleFinalizedCaptureMonitor(pending, settings, { responseCompleted: true });
     opLog('after_deferred_to_finalized_chat', { hook: 'afterRequest', type, pending }, 'debug');
     return content;
   };
@@ -18832,7 +18880,7 @@ ${cleanedText}`, 80),
     const syncEstimate = maintenanceSourceEmbeddingEstimate(requiresFullRebuild ? sources : diff.selected, settings);
     const baseDigest = episodeSourceDigestForRecords(responseRecords, settings);
     const episodeStale = settings.episodeIndexEnabled
-      && (text(rawLoaded.manifest.episodeSourceDigest || '') !== text(baseDigest || '') || (!episodeRecords.length && responseRecords.length >= settings.episodeMinRecords));
+      && (text(rawLoaded.manifest.episodeSourceDigest || '') !== text(baseDigest || '') || missingEpisodeIndexForEligibleTurns(responseRecords, episodeRecords, settings));
     const externalRecords = rawLoaded.records.filter(record => !isRetainedMemoryRecord(record)).length;
     const estimatedTokens = requiresFullRebuild ? syncEstimate.tokens : syncEstimate.tokens + repairTokens;
     const plan = {
@@ -21779,6 +21827,17 @@ ${cleanedText}`, 80),
     clearActivityLog,
     _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
+  publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
+  publicApi._test.markFinalizedCaptureResponseComplete = markFinalizedCaptureResponseComplete;
+  publicApi._test.finalizedCaptureMonitorStates = () => Array.from(Runtime.finalizedCaptureMonitors.values()).map(state => ({
+    pendingId: state.pendingId,
+    startedAt: Number(state.startedAt || 0) || 0,
+    finalizationStartedAt: Number(state.finalizationStartedAt || 0) || 0,
+    finalizationRequestAt: Number(state.finalizationRequestAt || 0) || 0,
+    attempts: Number(state.attempts || 0) || 0,
+    pollDelayMs: Number(state.pollDelayMs || 0) || 0
+  }));
+  publicApi._test.missingEpisodeIndexForEligibleTurns = missingEpisodeIndexForEligibleTurns;
   publicApi._test.opLog = opLog;
   publicApi._test.flushOperationLogs = flushOperationLogs;
   publicApi._test.currentSceneSourceShardIndexes = currentSceneSourceShardIndexes;
