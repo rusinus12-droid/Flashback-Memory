@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.20
+//@display-name ⚡ FLASHBACK Memory v0.10.21
 //@api 3.0
-//@version 0.10.20
+//@version 0.10.21
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,14 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.10.21
+ *
+ * v0.10.21 preserves the completed afterRequest body as a RAM-only capture
+ * candidate, reconciles it against the authoritative visible chat, and prefers
+ * the direct current-chat API over possibly stale character.chats snapshots.
+ * Incremental maintenance is now reported as live-chat synchronization instead
+ * of a cold start.
+ *
  * ⚡ FLASHBACK Memory v0.10.20
  *
  * v0.10.20 is a version-only release bump. Runtime behavior is unchanged from
@@ -435,7 +443,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.20';
+  const PLUGIN_VERSION = '0.10.21';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -861,6 +869,7 @@
     chatMonitorByScope: new Map(),
     finalizedCaptureMonitors: new Map(),
     finalizedCaptureInFlight: new Set(),
+    afterRequestCaptureCandidates: new Map(),
     scopeRegistryRememberCache: new Map(),
     scopeRegistryRetryTasks: new Set(),
     scopeRegistryRetryGeneration: sharedScopeRegistryRetryGeneration,
@@ -1035,6 +1044,7 @@
       Runtime.lastCapture = null;
       Runtime.pendingTurn = null;
       Runtime.pendingTurns = [];
+      Runtime.afterRequestCaptureCandidates.clear();
       Runtime.pendingCaptureBarrier = null;
       Runtime.requestDecisionQueue = [];
       Runtime.lastRequestDecision = null;
@@ -1053,6 +1063,7 @@
     Runtime.pendingCaptureBarrier = null;
     const pendingIds = pendingList.map(item => text(item?.pendingId || '')).filter(Boolean);
     if (pendingIds.length) {
+      for (const pendingId of pendingIds) Runtime.afterRequestCaptureCandidates.delete(pendingId);
       void removePendingCaptureJournalEntries(pendingIds).catch(error => warn('pending capture journal clear failed', error));
     }
     if (!previous) return null;
@@ -1069,6 +1080,7 @@
     const retainedIds = new Set(Runtime.pendingTurns.map(item => text(item?.pendingId || '')).filter(Boolean));
     const removedIds = list.map(item => text(item?.pendingId || '')).filter(id => id && !retainedIds.has(id));
     if (removedIds.length) {
+      for (const pendingId of removedIds) Runtime.afterRequestCaptureCandidates.delete(pendingId);
       void removePendingCaptureJournalEntries(removedIds).catch(error => warn('pending capture journal prune failed', error));
     }
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
@@ -1145,10 +1157,14 @@
     if (!id) return null;
     const list = Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns : [];
     const idx = list.findIndex(item => item?.pendingId === id);
-    if (idx < 0) return null;
+    if (idx < 0) {
+      Runtime.afterRequestCaptureCandidates.delete(id);
+      return null;
+    }
     const [item] = list.splice(idx, 1);
     Runtime.pendingTurns = list;
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
+    Runtime.afterRequestCaptureCandidates.delete(id);
     void removePendingCaptureJournalEntries([id]).catch(error => warn('pending capture journal removal failed', error));
     return item || null;
   };
@@ -1166,6 +1182,7 @@
     Runtime.pendingTurns = kept;
     Runtime.pendingTurn = Runtime.pendingTurns[Runtime.pendingTurns.length - 1] || null;
     if (removed.length) {
+      for (const item of removed) Runtime.afterRequestCaptureCandidates.delete(text(item?.pendingId || ''));
       void removePendingCaptureJournalEntries(removed.map(item => item?.pendingId).filter(Boolean))
         .catch(error => warn('pending capture journal removal failed', error));
     }
@@ -5311,19 +5328,20 @@
     return chats[page] || chats[0] || null;
   };
 
-  const loadCurrentChat = async (character) => {
+  const loadCurrentChat = async (character, options = {}) => {
     const api = getLiveApi(['getChatFromIndex']) || getLiveApi(['getCurrentChatIndex']) || getLiveApi();
     const fallback = currentChatFromCharacter(character);
     const fallbackChatIndex = Number.isInteger(character?.chatPage) ? character.chatPage : 0;
-    if (fallback) return { chat: fallback, source: 'character.chats', charIndex: -1, chatIndex: fallbackChatIndex };
+    const preferDirect = options.preferDirect === true;
+    if (fallback && !preferDirect) return { chat: fallback, source: 'character.chats', charIndex: -1, chatIndex: fallbackChatIndex };
     if (typeof api?.getCurrentCharacterIndex === 'function' && typeof api?.getChatFromIndex === 'function') {
-      const charIndex = await safeApi('getCurrentCharacterIndex', () => api.getCurrentCharacterIndex(), { silent: !!fallback });
+      const charIndex = await safeApi('getCurrentCharacterIndex', () => api.getCurrentCharacterIndex(), { silent: true });
       const apiChatIndex = typeof api?.getCurrentChatIndex === 'function'
         ? await safeApi('getCurrentChatIndex', () => api.getCurrentChatIndex(), { silent: true })
         : null;
       const chatIndex = Number.isFinite(Number(apiChatIndex)) ? Number(apiChatIndex) : fallbackChatIndex;
       if (Number.isFinite(Number(charIndex)) && Number.isFinite(Number(chatIndex))) {
-        const chat = await safeApi('getChatFromIndex', () => api.getChatFromIndex(Number(charIndex), Number(chatIndex)), { silent: !!fallback });
+        const chat = await safeApi('getChatFromIndex', () => api.getChatFromIndex(Number(charIndex), Number(chatIndex)), { silent: true });
         if (chat) return { chat, source: 'getChatFromIndex', charIndex: Number(charIndex), chatIndex: Number(chatIndex) };
       }
     }
@@ -5345,7 +5363,7 @@
     const dbPromise = loadDatabaseFlexible();
     const characterInfo = await characterInfoPromise;
     const character = characterInfo.character;
-    const chatInfo = await loadCurrentChat(character);
+    const chatInfo = await loadCurrentChat(character, { preferDirect: true });
     const db = await dbPromise;
     return { characterInfo, character, db, chatInfo, chat: chatInfo.chat };
   };
@@ -5355,7 +5373,7 @@
   const loadRisuCaptureSnapshot = async () => {
     const characterInfo = await loadCurrentCharacter();
     const character = characterInfo.character;
-    const chatInfo = await loadCurrentChat(character);
+    const chatInfo = await loadCurrentChat(character, { preferDirect: true });
     return { characterInfo, character, db: null, chatInfo, chat: chatInfo.chat };
   };
 
@@ -11287,7 +11305,11 @@
   };
 
   const ingestLiveChatColdStart = async (options = {}) => {
-    pushActivityLog('cold_start_started', '콜드스타트가 시작되었습니다.', {
+    const maintenanceSync = options.activityKind === 'maintenance_sync';
+    const activityNames = maintenanceSync
+      ? { started: 'live_chat_sync_started', completed: 'live_chat_sync_completed', failed: 'live_chat_sync_failed' }
+      : { started: 'cold_start_started', completed: 'cold_start_completed', failed: 'cold_start_failed' };
+    pushActivityLog(activityNames.started, maintenanceSync ? '현재 채팅 기억 동기화를 시작했습니다.' : '콜드스타트가 시작되었습니다.', {
       requestedScope: text(options.scope || options.coldStartScope || 'current'),
       incremental: options.incremental !== false,
       operationId: text(options.maintenanceOperationId || '')
@@ -11401,7 +11423,7 @@
       liveChatChats: chatSnapshots.length
     };
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
-    pushActivityLog('cold_start_completed', '콜드스타트가 완료되었습니다.', {
+    pushActivityLog(activityNames.completed, maintenanceSync ? '현재 채팅 기억 동기화가 완료되었습니다.' : '콜드스타트가 완료되었습니다.', {
       scopeKey: currentScope.scopeKey,
       operationId: text(options.maintenanceOperationId || ''),
       scopes: Runtime.lastImport.scopes,
@@ -11417,7 +11439,7 @@
     }, 'success');
     return Runtime.lastImport;
     } catch (error) {
-      pushActivityLog('cold_start_failed', '콜드스타트에 실패했습니다.', {
+      pushActivityLog(activityNames.failed, maintenanceSync ? '현재 채팅 기억 동기화에 실패했습니다.' : '콜드스타트에 실패했습니다.', {
         requestedScope: text(options.scope || options.coldStartScope || 'current'),
         operationId: text(options.maintenanceOperationId || ''),
         error: formatErrorMessage(error, 500)
@@ -16866,6 +16888,110 @@
     };
   };
 
+  const afterRequestCaptureBody = (content) => {
+    const extract = (value, depth = 0) => {
+      if (value == null || depth > 4) return '';
+      if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return text(value);
+      if (Array.isArray(value)) return value.map(item => extract(item, depth + 1)).filter(Boolean).join('');
+      if (typeof value !== 'object') return '';
+      const preferred = [
+        value.content,
+        value.text,
+        value.message?.content,
+        value.message?.text,
+        value.data?.content,
+        value.data?.text,
+        value.delta?.content,
+        value.delta?.text
+      ];
+      for (const candidate of preferred) {
+        const body = extract(candidate, depth + 1);
+        if (body) return body;
+      }
+      return '';
+    };
+    return canonicalChatResponseText(extract(content));
+  };
+
+  const retainAfterRequestCaptureCandidate = (pending = {}, content = '', requestClass = {}) => {
+    const pendingId = text(pending?.pendingId || '');
+    const body = afterRequestCaptureBody(content);
+    if (!pendingId || !body) return null;
+    const receivedAt = Date.now();
+    const candidate = {
+      pendingId,
+      scopeKey: text(pending.scope?.scopeKey || ''),
+      userTextHash: text(pending.userTextHash || stableHash(canonicalChatUserText(pending.latestUser || ''))),
+      requestMessageCount: Math.max(0, Number(pending.requestMessageCount || 0) || 0),
+      body,
+      bodyHash: stableHash(body),
+      receivedAt,
+      requestType: text(requestClass.normalizedType || requestClass.requestType || pending.requestType || 'model')
+    };
+    Runtime.afterRequestCaptureCandidates.set(pendingId, candidate);
+    opLog('capture_candidate_received', {
+      hook: 'afterRequest',
+      pendingId,
+      scopeKey: candidate.scopeKey,
+      userTextHash: candidate.userTextHash,
+      bodyHash: candidate.bodyHash,
+      bodyChars: body.length,
+      requestMessageCount: candidate.requestMessageCount,
+      requestType: candidate.requestType
+    }, 'info');
+    pushActivityLog('capture_candidate_received', '완료된 응답 후보를 받았으며 현재 채팅의 확정 응답과 대조합니다.', {
+      scopeKey: candidate.scopeKey,
+      pairIndex: Number(pending.pairIndex || 0) || 0,
+      bodyChars: body.length
+    }, 'info');
+    return candidate;
+  };
+
+  const authoritativeFinalizedCandidate = (liveMessages = [], pending = {}) => {
+    const messages = Array.isArray(liveMessages) ? liveMessages : [];
+    const wantedUserHash = text(pending.userTextHash || '').trim()
+      || stableHash(canonicalChatUserText(pending.latestUser || ''));
+    const direct = finalizedAssistantCandidate(messages, pending);
+    const directUserHash = direct?.authoritativeUserText
+      ? stableHash(canonicalChatUserText(direct.authoritativeUserText))
+      : '';
+    if (direct && (!wantedUserHash || directUserHash === wantedUserHash)) return direct;
+
+    const state = liveChatStateFromNormalized(messages);
+    const matches = (state.pairs || [])
+      .filter(pair => pair?.userText && pair?.assistantText)
+      .filter(pair => !wantedUserHash || stableHash(canonicalChatUserText(pair.userText)) === wantedUserHash);
+    if (!matches.length) return null;
+    const expectedPairIndex = Number(pending.pairIndex || 0) || 0;
+    const expectedUserPosition = Number(pending.userMessagePosition || 0) || 0;
+    const pair = matches.slice().sort((left, right) => {
+      const leftPairDistance = expectedPairIndex ? Math.abs(Number(left.pairIndex || 0) - expectedPairIndex) : 0;
+      const rightPairDistance = expectedPairIndex ? Math.abs(Number(right.pairIndex || 0) - expectedPairIndex) : 0;
+      const leftUserDistance = expectedUserPosition ? Math.abs(Number(left.userPosition || 0) - expectedUserPosition) : 0;
+      const rightUserDistance = expectedUserPosition ? Math.abs(Number(right.userPosition || 0) - expectedUserPosition) : 0;
+      return leftPairDistance - rightPairDistance || leftUserDistance - rightUserDistance || Number(right.assistantPosition || 0) - Number(left.assistantPosition || 0);
+    })[0];
+    const finalizedPairText = canonicalChatResponseText(pair.assistantText || '');
+    const baselinePosition = Number(pending.baselineAssistantPosition || 0) || 0;
+    const baselineText = canonicalChatResponseText(pending.baselineAssistantText || '');
+    const baselineHash = text(pending.baselineAssistantHash || '').trim();
+    if (baselinePosition && (pair.assistantPositions || []).includes(baselinePosition)) {
+      if (baselineHash && stableHash(finalizedPairText) === baselineHash) return null;
+      if (baselineText && sameMaintenanceTurnText(finalizedPairText, baselineText)) return null;
+    }
+    const assistantPosition = Number(pair.assistantPosition || 0) || 0;
+    const message = messages.find(item => item?.role === 'assistant' && Number(item.index || 0) + 1 === assistantPosition) || null;
+    return {
+      message,
+      position: assistantPosition,
+      raw: text(message?.rawContentText || message?.rawContent || message?.contentText || message?.content || pair.assistantText || ''),
+      body: canonicalChatResponseText(message?.contentText || message?.content || pair.assistantText || ''),
+      authoritativePair: pair,
+      resolverMismatch: !!(pending.latestUser && !sameTurnText(pair.userText, pending.latestUser)),
+      authoritativeUserText: pair.userText
+    };
+  };
+
   const captureSnapshotMatchesScope = (scope = {}, snapshot = {}) => {
     if (!scope?.scopeKey || !snapshot?.chat) return false;
     const character = snapshot.character || {};
@@ -17352,12 +17478,124 @@
     }
   };
 
+  const recordCaptureReconciliationStage = (pending = {}, snapshot = {}, stage = '', details = {}) => {
+    const pendingId = text(pending.pendingId || '');
+    const state = Runtime.finalizedCaptureMonitors.get(pendingId) || null;
+    const live = snapshot?.chat ? liveChatReadState(snapshot.chat || {}) : { normalized: [], rawCount: 0 };
+    const observedMessageCount = Math.max(Number(live.rawCount || 0) || 0, Array.isArray(live.normalized) ? live.normalized.length : 0);
+    if (state) {
+      state.lastFailureStage = stage;
+      state.observedMessageCount = observedMessageCount;
+      state.chatSource = text(snapshot?.chatInfo?.source || '');
+    }
+    if (!stage || state?.lastLoggedStage === stage) return;
+    if (state) state.lastLoggedStage = stage;
+    opLog('capture_waiting_for_live_chat', {
+      hook: details.hook || 'captureReconcile',
+      pendingId,
+      scopeKey: pending.scope?.scopeKey || '',
+      pairIndex: Number(pending.pairIndex || 0) || 0,
+      reason: stage,
+      observedMessageCount,
+      chatSource: snapshot?.chatInfo?.source || '',
+      responseCandidateReceived: Runtime.afterRequestCaptureCandidates.has(pendingId),
+      ...details
+    }, stage === 'scope_mismatch' || stage === 'chat_unavailable' ? 'warn' : 'debug');
+  };
+
+  const finalizedCaptureReconciliation = (pending = {}, snapshot = {}) => {
+    if (!snapshot?.chat) return { ready: false, reason: 'chat_unavailable', live: { known: false, normalized: [], rawCount: 0 } };
+    if (!captureSnapshotMatchesScope(pending.scope, snapshot)) {
+      return { ready: false, reason: 'scope_mismatch', live: liveChatReadState(snapshot.chat || {}) };
+    }
+    const live = liveChatReadState(snapshot.chat || {});
+    if (!live.known) return { ready: false, reason: 'chat_unavailable', live };
+    const wantedUserHash = text(pending.userTextHash || '').trim()
+      || stableHash(canonicalChatUserText(pending.latestUser || ''));
+    const userFound = live.normalized.some(message => message?.role === 'user'
+      && stableHash(canonicalChatUserText(message.contentText || message.content || '')) === wantedUserHash);
+    if (!userFound) return { ready: false, reason: 'user_not_found', live };
+    const candidate = authoritativeFinalizedCandidate(live.normalized, pending);
+    if (!candidate) return { ready: false, reason: 'assistant_not_found', live };
+    const authoritativeBody = canonicalChatResponseText(candidate.authoritativePair?.assistantText || candidate.body || '');
+    if (!authoritativeBody) return { ready: false, reason: 'assistant_not_found', live };
+    const responseCandidate = Runtime.afterRequestCaptureCandidates.get(text(pending.pendingId || '')) || null;
+    const contentMatches = responseCandidate
+      ? sameMaintenanceTurnText(authoritativeBody, responseCandidate.body)
+      : null;
+    return { ready: true, reason: contentMatches === false ? 'content_mismatch' : 'ready', live, candidate, authoritativeBody, responseCandidate, contentMatches };
+  };
+
+  const reconcileFinalizedCaptureCandidates = async (snapshot, settings = Runtime.settings || DEFAULTS, options = {}) => {
+    const scope = options.scope?.scopeKey ? options.scope : resolveScopeFromSnapshot(snapshot || {});
+    const pendingList = (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns : [])
+      .filter(pending => pending?.pendingId && Runtime.afterRequestCaptureCandidates.has(pending.pendingId))
+      .filter(pending => !scope?.scopeKey || pending.scope?.scopeKey === scope.scopeKey)
+      .sort((left, right) => Number(left.at || 0) - Number(right.at || 0));
+    const result = { checked: pendingList.length, saved: 0, waiting: 0, mismatches: 0, failures: [] };
+    for (const pending of pendingList) {
+      const evidence = finalizedCaptureReconciliation(pending, snapshot || {});
+      if (!evidence.ready) {
+        result.waiting += 1;
+        result.failures.push({ pendingId: pending.pendingId, reason: evidence.reason });
+        recordCaptureReconciliationStage(pending, snapshot, evidence.reason, { hook: options.hook || 'captureReconcile' });
+        continue;
+      }
+      if (evidence.contentMatches === false && options.allowContentMismatchSave !== true) {
+        result.waiting += 1;
+        result.mismatches += 1;
+        result.failures.push({ pendingId: pending.pendingId, reason: 'content_mismatch' });
+        recordCaptureReconciliationStage(pending, snapshot, 'content_mismatch', { hook: options.hook || 'captureReconcile' });
+        continue;
+      }
+      if (evidence.contentMatches === false) {
+        result.mismatches += 1;
+        opLog('capture_content_mismatch_live_wins', {
+          hook: options.hook || 'captureReconcile',
+          pendingId: pending.pendingId,
+          scopeKey: pending.scope?.scopeKey || '',
+          responseBodyHash: evidence.responseCandidate?.bodyHash || '',
+          liveBodyHash: stableHash(evidence.authoritativeBody),
+          liveBodyChars: evidence.authoritativeBody.length
+        }, 'warn');
+      } else {
+        opLog('capture_live_match_confirmed', {
+          hook: options.hook || 'captureReconcile',
+          pendingId: pending.pendingId,
+          scopeKey: pending.scope?.scopeKey || '',
+          bodyHash: stableHash(evidence.authoritativeBody),
+          bodyChars: evidence.authoritativeBody.length,
+          chatSource: snapshot?.chatInfo?.source || ''
+        }, 'info');
+      }
+      let saved = false;
+      try {
+        saved = await saveFinalizedChatCapture(pending, evidence.candidate, snapshot, settings);
+      } catch (error) {
+        result.waiting += 1;
+        result.failures.push({ pendingId: pending.pendingId, reason: 'save_failed', error: formatErrorMessage(error, 400) });
+        recordCaptureReconciliationStage(pending, snapshot, 'save_failed', { hook: options.hook || 'captureReconcile', error: formatErrorMessage(error, 400) });
+        warn('finalized capture reconciliation save failed', error);
+        continue;
+      }
+      if (saved) {
+        result.saved += 1;
+        stopFinalizedCaptureMonitor(pending.pendingId);
+      } else {
+        result.waiting += 1;
+        result.failures.push({ pendingId: pending.pendingId, reason: 'save_rejected' });
+        recordCaptureReconciliationStage(pending, snapshot, 'save_rejected', { hook: options.hook || 'captureReconcile' });
+      }
+    }
+    return result;
+  };
+
   const scheduleFinalizedCaptureMonitor = (pending, settings = Runtime.settings || DEFAULTS, options = {}) => {
     const pendingId = text(pending?.pendingId || '');
     if (!pendingId || Runtime.unloaded || settings.mode === 'off' || !settings.captureAfterRequest) return false;
     let state = Runtime.finalizedCaptureMonitors.get(pendingId);
     if (!state) {
-      state = { pendingId, startedAt: Date.now(), finalizationStartedAt: 0, finalizationRequestAt: 0, lastText: '', stableSince: 0, seenRequestAt: 0, attempts: 0, timer: null, pollDelayMs: FINALIZED_CAPTURE_POLL_MS };
+      state = { pendingId, startedAt: Date.now(), finalizationStartedAt: 0, finalizationRequestAt: 0, lastText: '', stableSince: 0, seenRequestAt: 0, attempts: 0, timer: null, pollDelayMs: FINALIZED_CAPTURE_POLL_MS, lastFailureStage: 'awaiting_response', lastLoggedStage: '', observedMessageCount: 0, chatSource: '' };
       Runtime.finalizedCaptureMonitors.set(pendingId, state);
     }
     if (options.responseCompleted === true) markFinalizedCaptureResponseComplete(state, pending);
@@ -17370,6 +17608,21 @@
       const expiry = current ? finalizedCaptureMonitorExpiry(state, current) : null;
       if (!current || expiry?.expired) {
         if (current) {
+          Runtime.lastCapture = {
+            at: Date.now(),
+            skipped: true,
+            reason: expiry.reason,
+            phase: expiry.phase,
+            scopeKey: current.scope?.scopeKey || '',
+            pendingId,
+            pairIndex: Number(current.pairIndex || 0) || 0,
+            lastFailureStage: state.lastFailureStage || 'assistant_not_found',
+            observedMessageCount: Number(state.observedMessageCount || 0) || 0,
+            chatSource: state.chatSource || '',
+            responseCandidateReceived: Runtime.afterRequestCaptureCandidates.has(pendingId),
+            ageMs: expiry.ageMs,
+            maxAgeMs: expiry.maxAgeMs
+          };
           removePendingTurnById(pendingId);
           pushActivityLog('capture_expired', '최종 응답을 확인하지 못해 캡처 대기가 만료됐습니다.', {
             scopeKey: current.scope?.scopeKey || '',
@@ -17377,8 +17630,13 @@
             reason: expiry.reason,
             phase: expiry.phase,
             ageMs: expiry.ageMs,
-            maxAgeMs: expiry.maxAgeMs
+            maxAgeMs: expiry.maxAgeMs,
+            lastFailureStage: Runtime.lastCapture.lastFailureStage,
+            observedMessageCount: Runtime.lastCapture.observedMessageCount,
+            chatSource: Runtime.lastCapture.chatSource,
+            responseCandidateReceived: Runtime.lastCapture.responseCandidateReceived
           }, 'warn');
+          opLog('finalized_capture_expired', { hook: 'liveChatMonitor', pending: current, result: Runtime.lastCapture }, 'warn');
         }
         stopFinalizedCaptureMonitor(pendingId);
         return;
@@ -17392,6 +17650,7 @@
       try {
         const snapshot = await loadRisuCaptureSnapshot();
         if (!captureSnapshotMatchesScope(current.scope, snapshot)) {
+          recordCaptureReconciliationStage(current, snapshot, snapshot?.chat ? 'scope_mismatch' : 'chat_unavailable', { hook: 'liveChatMonitor' });
           state.pollDelayMs = FINALIZED_CAPTURE_IDLE_POLL_MS;
           schedulePoll();
           return;
@@ -17404,10 +17663,34 @@
           state.stableSince = 0;
           state.pollDelayMs = FINALIZED_CAPTURE_POLL_MS;
         }
-        const candidate = live.known ? finalizedAssistantCandidate(live.normalized, current) : null;
+        state.observedMessageCount = Math.max(Number(live.rawCount || 0) || 0, live.normalized.length);
+        state.chatSource = text(snapshot?.chatInfo?.source || '');
+        const candidate = live.known ? authoritativeFinalizedCandidate(live.normalized, current) : null;
         if (candidate) {
-          if (candidate.body !== state.lastText) {
-            state.lastText = candidate.body;
+          const authoritativeBody = canonicalChatResponseText(candidate.authoritativePair?.assistantText || candidate.body || '');
+          const responseCandidate = Runtime.afterRequestCaptureCandidates.get(pendingId) || null;
+          const contentMatches = responseCandidate ? sameMaintenanceTurnText(authoritativeBody, responseCandidate.body) : null;
+          state.lastFailureStage = contentMatches === false ? 'content_mismatch' : 'live_candidate_found';
+          if (responseCandidate && contentMatches === true) {
+            opLog('capture_live_match_confirmed', {
+              hook: 'liveChatMonitor',
+              pendingId,
+              scopeKey: current.scope?.scopeKey || '',
+              bodyHash: stableHash(authoritativeBody),
+              bodyChars: authoritativeBody.length,
+              chatSource: snapshot?.chatInfo?.source || ''
+            }, 'info');
+            const liveSettings = await loadSettings(true).catch(() => settings);
+            const saved = await saveFinalizedChatCapture(current, candidate, snapshot, liveSettings);
+            if (saved) {
+              stopFinalizedCaptureMonitor(pendingId);
+              return;
+            }
+            state.attempts += 1;
+            state.lastFailureStage = 'save_rejected';
+          }
+          if (authoritativeBody !== state.lastText) {
+            state.lastText = authoritativeBody;
             state.stableSince = Date.now();
             state.pollDelayMs = FINALIZED_CAPTURE_POLL_MS;
           } else {
@@ -17415,6 +17698,17 @@
             const stableFor = Date.now() - Number(state.stableSince || Date.now());
             const requestQuietFor = Date.now() - requestAt;
             if (stableFor >= FINALIZED_CAPTURE_STABLE_MS && requestQuietFor >= FINALIZED_CAPTURE_STABLE_MS) {
+              if (contentMatches === false) {
+                opLog('capture_content_mismatch_live_wins', {
+                  hook: 'liveChatMonitor',
+                  pendingId,
+                  scopeKey: current.scope?.scopeKey || '',
+                  responseBodyHash: responseCandidate?.bodyHash || '',
+                  liveBodyHash: stableHash(authoritativeBody),
+                  liveBodyChars: authoritativeBody.length,
+                  stableFor
+                }, 'warn');
+              }
               const liveSettings = await loadSettings(true).catch(() => settings);
               const saved = await saveFinalizedChatCapture(current, candidate, snapshot, liveSettings);
               if (saved) {
@@ -17446,6 +17740,8 @@
             }
           }
         } else {
+          const evidence = finalizedCaptureReconciliation(current, snapshot);
+          recordCaptureReconciliationStage(current, snapshot, live.known ? evidence.reason : 'chat_unavailable', { hook: 'liveChatMonitor' });
           state.pollDelayMs = FINALIZED_CAPTURE_IDLE_POLL_MS;
         }
       } catch (error) {
@@ -17548,7 +17844,8 @@
       try {
         const scopeBundle = await withinHookDeadline(resolveCurrentScopeBundle(false), 'beforeRequest reentrant scope');
         const liveChat = liveChatReadState(scopeBundle.snapshot?.chat || {});
-        await withinHookDeadline(capturePendingTurnForMessages(messages, requestClass, settings, { scope: scopeBundle.scope, snapshot: scopeBundle.snapshot, liveChat, reason: 'before_reentrant' }), 'beforeRequest reentrant capture');
+        const reentrantCapture = await withinHookDeadline(capturePendingTurnForMessages(messages, requestClass, settings, { scope: scopeBundle.scope, snapshot: scopeBundle.snapshot, liveChat, reason: 'before_reentrant' }), 'beforeRequest reentrant capture');
+        if (reentrantCapture?.pending?.pendingId) requestDecision.pendingId = reentrantCapture.pending.pendingId;
       } catch (error) {
         await withinHookDeadline(capturePendingTurnForMessages(messages, requestClass, settings, { reason: 'before_reentrant_fallback' }), 'beforeRequest reentrant fallback capture').catch(captureError => warn('reentrant pending capture failed', captureError));
         warn('reentrant scope bundle failed', error);
@@ -17561,6 +17858,17 @@
       const scope = scopeBundle.scope;
       syncFlashbackRuntimeState(settings, scope);
       const liveChat = liveChatReadState(scopeBundle.snapshot?.chat || {});
+      const reconciled = await withinHookDeadline(
+        reconcileFinalizedCaptureCandidates(scopeBundle.snapshot, settings, {
+          scope,
+          hook: 'beforeRequest',
+          allowContentMismatchSave: true
+        }),
+        'beforeRequest finalized capture reconciliation'
+      );
+      if (reconciled.saved > 0) {
+        opLog('before_finalized_capture_reconciled', { hook: 'beforeRequest', scopeKey: scope.scopeKey, result: reconciled }, 'info');
+      }
       if (liveChat.known) {
         await withinHookDeadline(
           synchronizeFlashbackTurnWorldline(scope, liveChatStateFromNormalized(liveChat.normalized), settings),
@@ -17576,6 +17884,7 @@
         'beforeRequest pending capture'
       );
       if (pendingCapture.queued) {
+        requestDecision.pendingId = pendingCapture.pending.pendingId;
         scheduleFinalizedCaptureMonitor(pendingCapture.pending, settings);
         opLog('pending_queued', { hook: 'beforeRequest', type: requestClass.requestType || '', pending: pendingCapture.pending, latestUser: pendingCapture.latestUser, retrievalQuery: pendingCapture.retrievalQuery });
         pushActivityLog('capture_waiting', '이번 턴의 최종 응답 캡처를 기다립니다.', {
@@ -17878,9 +18187,31 @@
       }, 'warn');
       return content;
     }
-    const pending = Runtime.pendingTurn || (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns[Runtime.pendingTurns.length - 1] : null);
+    const pending = queuedDecision?.pendingId
+      ? (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns.find(item => item?.pendingId === queuedDecision.pendingId) : null)
+      : (Runtime.pendingTurn || (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns[Runtime.pendingTurns.length - 1] : null));
+    const responseCandidate = pending ? retainAfterRequestCaptureCandidate(pending, content, requestClass) : null;
     if (pending) scheduleFinalizedCaptureMonitor(pending, settings, { responseCompleted: true });
-    opLog('after_deferred_to_finalized_chat', { hook: 'afterRequest', type, pending }, 'debug');
+    let reconciliation = null;
+    if (pending && responseCandidate) {
+      try {
+        const snapshot = await loadRisuCaptureSnapshot();
+        reconciliation = await reconcileFinalizedCaptureCandidates(snapshot, settings, {
+          scope: pending.scope,
+          hook: 'afterRequest',
+          allowContentMismatchSave: false
+        });
+      } catch (error) {
+        recordCaptureReconciliationStage(pending, {}, 'chat_unavailable', { hook: 'afterRequest', error: formatErrorMessage(error, 400) });
+      }
+    }
+    opLog('after_deferred_to_finalized_chat', {
+      hook: 'afterRequest',
+      type,
+      pending,
+      responseCandidate: responseCandidate ? { bodyHash: responseCandidate.bodyHash, bodyChars: responseCandidate.body.length } : null,
+      reconciliation
+    }, 'debug');
     return content;
   };
 
@@ -19021,7 +19352,7 @@ ${cleanedText}`, 80),
     const settings = planContext.settings || sharedSettings || undefined;
     const snapshot = planContext.snapshot || sharedSnapshot || undefined;
     const scope = planContext.scope?.scopeKey ? planContext.scope : sharedScope;
-    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId };
+    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync' };
     await persistMaintenanceJournal({
       operationId,
       status: 'running',
@@ -21646,6 +21977,16 @@ ${cleanedText}`, 80),
       pendingCapture: {
         runtimeCount: Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns.length : 0,
         monitorCount: Runtime.finalizedCaptureMonitors.size,
+        responseCandidateCount: Runtime.afterRequestCaptureCandidates.size,
+        responseCandidates: Array.from(Runtime.afterRequestCaptureCandidates.values()).map(candidate => ({
+          pendingId: candidate.pendingId,
+          scopeKey: candidate.scopeKey,
+          userTextHash: candidate.userTextHash,
+          bodyHash: candidate.bodyHash,
+          bodyChars: candidate.body.length,
+          receivedAt: candidate.receivedAt,
+          requestType: candidate.requestType
+        })),
         journalWritePending: !!Runtime.pendingCaptureJournalWrite,
         lastRecovery: Runtime.lastPendingCaptureRecovery
       },
@@ -21829,13 +22170,21 @@ ${cleanedText}`, 80),
   });
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
   publicApi._test.markFinalizedCaptureResponseComplete = markFinalizedCaptureResponseComplete;
+  publicApi._test.afterRequestCaptureBody = afterRequestCaptureBody;
+  publicApi._test.authoritativeFinalizedCandidate = authoritativeFinalizedCandidate;
+  publicApi._test.finalizedCaptureReconciliation = finalizedCaptureReconciliation;
+  publicApi._test.reconcileFinalizedCaptureCandidates = reconcileFinalizedCaptureCandidates;
+  publicApi._test.loadRisuCaptureSnapshot = loadRisuCaptureSnapshot;
   publicApi._test.finalizedCaptureMonitorStates = () => Array.from(Runtime.finalizedCaptureMonitors.values()).map(state => ({
     pendingId: state.pendingId,
     startedAt: Number(state.startedAt || 0) || 0,
     finalizationStartedAt: Number(state.finalizationStartedAt || 0) || 0,
     finalizationRequestAt: Number(state.finalizationRequestAt || 0) || 0,
     attempts: Number(state.attempts || 0) || 0,
-    pollDelayMs: Number(state.pollDelayMs || 0) || 0
+    pollDelayMs: Number(state.pollDelayMs || 0) || 0,
+    lastFailureStage: state.lastFailureStage || '',
+    observedMessageCount: Number(state.observedMessageCount || 0) || 0,
+    chatSource: state.chatSource || ''
   }));
   publicApi._test.missingEpisodeIndexForEligibleTurns = missingEpisodeIndexForEligibleTurns;
   publicApi._test.opLog = opLog;
@@ -21979,6 +22328,7 @@ ${cleanedText}`, 80),
         Runtime.chatMonitorByScope.clear();
         Runtime.finalizedCaptureMonitors.clear();
         Runtime.finalizedCaptureInFlight.clear();
+        Runtime.afterRequestCaptureCandidates.clear();
         Runtime.capturedTurnReembedQueues.clear();
         Runtime.embeddingActiveRequests.clear();
         Runtime.requestDecisionQueue = [];
