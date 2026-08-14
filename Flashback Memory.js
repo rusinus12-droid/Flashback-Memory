@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.30
+//@display-name ⚡ FLASHBACK Memory v0.10.31
 //@api 3.0
-//@version 0.10.30
+//@version 0.10.31
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,17 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.10.31
+ *
+ * v0.10.31 makes finalized capture independent of pre-generation worldline
+ * synchronization. The pending U turn and its durable recovery journal are now
+ * committed before branch reconciliation, so a slow worldline read can skip
+ * recall without losing the completed response. When RisuAI temporarily removes
+ * the old assistant during reroll, an exact stored logical-turn match protects
+ * that baseline from rollback retirement until the new visible A is finalized.
+ * Genuine rollback still reconciles normally because a different U identity does
+ * not satisfy the protection proof.
+ *
  * ⚡ FLASHBACK Memory v0.10.30
  *
  * v0.10.30 restores provider-neutral prompt-prefix cache stability. The factual
@@ -518,7 +529,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.30';
+  const PLUGIN_VERSION = '0.10.31';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -797,7 +808,7 @@
   const CONVERSATION_DRIFT_DISMISS_MS = 10 * 60 * 1000;
   const PENDING_TURN_MAX_AGE_MS = 30 * 60 * 1000;
   const MAX_PENDING_TURNS = 8;
-  const PENDING_CAPTURE_JOURNAL_VERSION = 2;
+  const PENDING_CAPTURE_JOURNAL_VERSION = 3;
   const PENDING_CAPTURE_JOURNAL_TTL_MS = 10 * 60 * 1000;
   const PENDING_CAPTURE_JOURNAL_MAX_ENTRIES = MAX_PENDING_TURNS;
   const PENDING_FALLBACK_MIN_OVERLAP = 0.08;
@@ -3008,6 +3019,8 @@
       terminalPrefillIndex: Number(value.terminalPrefillIndex ?? -1),
       baselineAssistantPosition: Math.max(0, Number(value.baselineAssistantPosition || 0) || 0),
       baselineAssistantHash: text(value.baselineAssistantHash || '').trim().slice(0, 160),
+      baselineVariantId: text(value.baselineVariantId || '').trim().slice(0, 160),
+      baselineTurnNodeId: text(value.baselineTurnNodeId || '').trim().slice(0, 160),
       messageHash: text(value.messageHash || '').trim().slice(0, 160),
       userTextHash,
       requestType: text(value.requestType || 'model').trim().slice(0, 80),
@@ -3050,6 +3063,7 @@
     const serializedMode = explicitMode || (
       Number(pending.baselineAssistantPosition || 0) > 0
       || !!text(pending.baselineAssistantHash || '').trim()
+      || !!text(pending.baselineVariantId || '').trim()
       || !!baselineText
         ? 'reroll'
         : 'append'
@@ -3070,6 +3084,8 @@
       baselineAssistantPosition: pending.baselineAssistantPosition,
       baselineAssistantHash: pending.baselineAssistantHash
         || (baselineText ? stableHash(baselineText) : ''),
+      baselineVariantId: pending.baselineVariantId,
+      baselineTurnNodeId: pending.baselineTurnNodeId,
       messageHash: pending.messageHash,
       userTextHash: pending.userTextHash || stableHash(canonicalChatUserText(pending.latestUser || '')),
       requestType: pending.requestType,
@@ -10639,27 +10655,117 @@
   );
   const isProvisionalCompletedCaptureRecord = (record = {}) => record?.metadata?.captureAuthority?.provisional === true
     || record?.captureAuthority?.provisional === true;
-  const synchronizeFlashbackTurnWorldline = async (scope, liveState = {}, settings = null) => {
-    if (!scope?.scopeKey) return { changed: false, reason: 'no_scope' };
+  const protectPendingGenerationWorldlineTarget = (scope, liveState = {}, records = [], storedWorldline = {}, pending = null) => {
+    if (!scope?.scopeKey || !pending?.pendingId || pending.scope?.scopeKey !== scope.scopeKey) return null;
+    const stableUserIdHash = text(pending.requestUserMessageIdHash || '').trim();
+    if (!stableUserIdHash) return null;
+    const pairIndex = Math.max(1, Number(pending.pairIndex || 1) || 1);
     const normalizedLive = conversationStateWithIndexes(liveState);
-    const liveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedLive);
+    if (normalizedLive.pairByIndex instanceof Map && normalizedLive.pairByIndex.get(pairIndex)?.assistantText) return null;
+    if (Number(normalizedLive.pairCount || 0) + 1 !== pairIndex) return null;
+    const userText = canonicalChatUserText(pending.latestUser || '');
+    if (!userText) return null;
+    const expectedIdentity = flashbackPairIdentity(scope.scopeKey, { pairIndex, userText, assistantText: '' });
+    const activeNodes = (Array.isArray(storedWorldline?.nodes) ? storedWorldline.nodes : [])
+      .filter(node => node?.status === 'active' && node.logicalTurnId === expectedIdentity.logicalTurnId);
+    if (activeNodes.length !== 1) return null;
+    const activeNode = activeNodes[0];
+    const group = responseGroupsForWorldline((Array.isArray(records) ? records : [])
+      .filter(record => !isInheritedScopeMemoryRecord(record, scope.scopeKey))
+      .filter(record => !isProvisionalCompletedCaptureRecord(record)))
+      .filter(candidate => Number(candidate.turnIndex || candidate.pairIndex || 0) === pairIndex)
+      .find(candidate => {
+        if (!sameFlashbackWorldlineUserText(candidate.userText || '', userText) || !candidate.assistantText) return false;
+        const identity = flashbackPairIdentity(scope.scopeKey, {
+          pairIndex,
+          userText: candidate.userText,
+          assistantText: candidate.assistantText
+        });
+        return identity.logicalTurnId === activeNode.logicalTurnId && identity.variantId === activeNode.variantId;
+      }) || null;
+    if (!group) return null;
+    const firstRecord = group.records?.[0] || {};
+    const userPosition = Math.max(1,
+      Number(pending.userMessagePosition || 0)
+      || Number(firstRecord.userMessagePosition || 0)
+      || Math.max(1, Number(pending.expectedAssistantPosition || 0) - 1)
+    );
+    const assistantPosition = Math.max(userPosition + 1,
+      Number(pending.expectedAssistantPosition || 0)
+      || Number(firstRecord.assistantMessagePosition || 0)
+      || userPosition + 1
+    );
+    const protectedPair = {
+      pairIndex,
+      userPosition,
+      assistantPosition,
+      assistantPositions: [assistantPosition],
+      userMessageIdHash: stableUserIdHash,
+      assistantMessageIdHash: '',
+      userText,
+      assistantText: group.assistantText,
+      groupKey: group.key || ''
+    };
+    const state = conversationStateWithIndexes({
+      ...normalizedLive,
+      pairs: [...normalizedLive.pairs, protectedPair]
+        .sort((left, right) => Number(left.pairIndex || 0) - Number(right.pairIndex || 0)),
+      pairCount: Math.max(Number(normalizedLive.pairCount || 0), pairIndex)
+    });
+    return {
+      state,
+      pairIndex,
+      userPosition,
+      assistantPosition,
+      baselineAssistantText: group.assistantText,
+      baselineAssistantHash: stableHash(group.assistantText),
+      baselineVariantId: activeNode.variantId,
+      baselineTurnNodeId: activeNode.turnNodeId,
+      logicalTurnId: activeNode.logicalTurnId
+    };
+  };
+  const synchronizeFlashbackTurnWorldline = async (scope, liveState = {}, settings = null, options = {}) => {
+    if (!scope?.scopeKey) return { changed: false, reason: 'no_scope' };
+    const normalizedObservedLive = conversationStateWithIndexes(liveState);
+    const observedLiveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedObservedLive);
     const manifest = await loadScopeManifest(scope.scopeKey);
-    if (manifest.turnWorldlineLiveHash === liveHash
+    if (manifest.turnWorldlineLiveHash === observedLiveHash
       && manifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION
       && manifest.turnWorldlinePendingRetirement !== true) {
-      return { changed: false, reason: 'worldline_current', liveHash };
+      return { changed: false, reason: 'worldline_current', liveHash: observedLiveHash };
     }
-    if (manifest.turnWorldlineLiveHash && manifest.turnWorldlineLiveHash !== liveHash) abortEmbeddingJobs('worldline_changed');
     const cfg = settings || await loadSettings();
     const result = await withScopeWriteLock(scope.scopeKey, async () => {
       const currentManifest = await loadScopeManifest(scope.scopeKey);
+      const [loaded, storedWorldline] = await Promise.all([loadScopeRecords(scope.scopeKey), loadTurnWorldline(scope.scopeKey)]);
+      assertCompleteScopeLoad(loaded, 'turn worldline synchronization');
+      const protectedTarget = protectPendingGenerationWorldlineTarget(
+        scope,
+        normalizedObservedLive,
+        loaded.records,
+        storedWorldline,
+        options.protectedPending || null
+      );
+      if (protectedTarget && typeof options.onProtectedGenerationTarget === 'function') {
+        await options.onProtectedGenerationTarget(protectedTarget);
+      }
+      const normalizedLive = protectedTarget?.state || normalizedObservedLive;
+      const liveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedLive);
       if (currentManifest.turnWorldlineLiveHash === liveHash
         && currentManifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION
         && currentManifest.turnWorldlinePendingRetirement !== true) {
-        return { changed: false, reason: 'worldline_current', liveHash };
+        return {
+          changed: false,
+          reason: protectedTarget ? 'worldline_current_generation_target_protected' : 'worldline_current',
+          liveHash,
+          observedLiveHash,
+          generationTargetProtected: !!protectedTarget,
+          protectedPairIndex: Number(protectedTarget?.pairIndex || 0) || 0
+        };
       }
-      const [loaded, storedWorldline] = await Promise.all([loadScopeRecords(scope.scopeKey), loadTurnWorldline(scope.scopeKey)]);
-      assertCompleteScopeLoad(loaded, 'turn worldline synchronization');
+      if (currentManifest.turnWorldlineLiveHash && currentManifest.turnWorldlineLiveHash !== liveHash) {
+        abortEmbeddingJobs('worldline_changed');
+      }
       const reconciled = reconcileFlashbackTurnWorldline(storedWorldline, scope.scopeKey, normalizedLive);
       const inheritedResponseMap = new Map();
       const inheritedLineageNodeIds = new Set();
@@ -10782,6 +10888,9 @@
         changed: true,
         reason: responseChanged ? 'worldline_records_reconciled' : 'worldline_metadata_reconciled',
         liveHash,
+        observedLiveHash,
+        generationTargetProtected: !!protectedTarget,
+        protectedPairIndex: Number(protectedTarget?.pairIndex || 0) || 0,
         activeNodes: worldline.nodes.filter(node => node.status === 'active').length,
         quarantinedNodes: worldline.nodes.filter(node => node.status === 'quarantined').length,
         inactiveVariants: worldline.nodes.filter(node => node.status === 'inactive_variant').length,
@@ -17360,6 +17469,20 @@
       baselineAssistantHash: baselineAssistantText ? stableHash(baselineAssistantText) : '',
       at: Date.now()
     });
+    if (pending && typeof options.onPendingEnqueued === 'function') {
+      try {
+        options.onPendingEnqueued(pending, {
+          latestUser,
+          retrievalQuery,
+          normalizedMessages,
+          currentUserResolution,
+          scope,
+          liveChat
+        });
+      } catch (error) {
+        warn('pending capture arming callback failed', error);
+      }
+    }
     let journal = { saved: false, reason: pending ? 'not_attempted' : 'not_queued' };
     if (pending) {
       try {
@@ -17392,6 +17515,16 @@
     }
     Runtime.finalizedCaptureMonitors.delete(id);
     return true;
+  };
+
+  const finalizedAssistantMatchesPendingBaselineVariant = (pending = {}, pair = {}, assistantText = '') => {
+    const baselineVariantId = text(pending.baselineVariantId || '').trim();
+    const scopeKey = text(pending.scope?.scopeKey || '').trim();
+    const pairIndex = Math.max(0, Number(pair?.pairIndex || pending.pairIndex || 0) || 0);
+    const userText = canonicalChatUserText(pair?.userText || pending.latestUser || '');
+    const assistant = canonicalChatResponseText(assistantText || pair?.assistantText || '');
+    if (!baselineVariantId || !scopeKey || !pairIndex || !userText || !assistant) return false;
+    return flashbackPairIdentity(scopeKey, { pairIndex, userText, assistantText: assistant }).variantId === baselineVariantId;
   };
 
   const finalizedAssistantCandidate = (liveMessages = [], pending = {}) => {
@@ -17436,6 +17569,7 @@
     if (baselinePosition === candidate.position) {
       if (baselineHash && stableHash(finalizedPairText) === baselineHash) return null;
       if (baselineText && sameTurnText(finalizedPairText, baselineText)) return null;
+      if (finalizedAssistantMatchesPendingBaselineVariant(pending, pair || {}, finalizedPairText)) return null;
     }
     return {
       ...candidate,
@@ -17568,8 +17702,9 @@
     if (!pendingScopeKey || text(responseCandidate.scopeKey || '') !== pendingScopeKey) return null;
     const baselinePosition = Number(pending.baselineAssistantPosition || 0) || 0;
     const baselineHash = text(pending.baselineAssistantHash || '').trim();
+    const baselineVariantId = text(pending.baselineVariantId || '').trim();
     const baselineText = canonicalChatResponseText(pending.baselineAssistantText || '');
-    if (!baselinePosition || (!baselineHash && !baselineText)) return null;
+    if (!baselinePosition || (!baselineHash && !baselineVariantId && !baselineText)) return null;
 
     const receivedAt = Number(responseCandidate.receivedAt || 0) || 0;
     const requestAt = Number(pending.lastRequestAt || pending.at || 0) || 0;
@@ -17592,6 +17727,7 @@
     if (!finalizedPairText || !sameMaintenanceTurnText(finalizedPairText, responseCandidate.body || '')) return null;
     if (baselineHash && stableHash(finalizedPairText) === baselineHash) return null;
     if (baselineText && sameMaintenanceTurnText(finalizedPairText, baselineText)) return null;
+    if (finalizedAssistantMatchesPendingBaselineVariant(pending, pair, finalizedPairText)) return null;
     const assistantPosition = Number(pair.assistantPosition || 0) || 0;
     const message = (Array.isArray(messages) ? messages : []).find(item => item?.role === 'assistant'
       && Number(item.index || 0) + 1 === assistantPosition) || null;
@@ -17625,6 +17761,7 @@
     // request binding above. This fallback is deliberately append-only.
     if (Number(pending.baselineAssistantPosition || 0) > 0
       || text(pending.baselineAssistantHash || '').trim()
+      || text(pending.baselineVariantId || '').trim()
       || canonicalChatResponseText(pending.baselineAssistantText || '')) return null;
 
     const receivedAt = Number(responseCandidate.receivedAt || 0) || 0;
@@ -17718,6 +17855,7 @@
     if (baselinePosition && (pair.assistantPositions || []).includes(baselinePosition)) {
       if (baselineHash && stableHash(finalizedPairText) === baselineHash) return null;
       if (baselineText && sameMaintenanceTurnText(finalizedPairText, baselineText)) return null;
+      if (finalizedAssistantMatchesPendingBaselineVariant(pending, pair, finalizedPairText)) return null;
     }
     const assistantPosition = Number(pair.assistantPosition || 0) || 0;
     const message = messages.find(item => item?.role === 'assistant' && Number(item.index || 0) + 1 === assistantPosition) || null;
@@ -17913,6 +18051,8 @@
         baselineAssistantPosition: entry.baselineAssistantPosition,
         baselineAssistantText: '',
         baselineAssistantHash: entry.baselineAssistantHash,
+        baselineVariantId: entry.baselineVariantId,
+        baselineTurnNodeId: entry.baselineTurnNodeId,
         recoveredFromJournal: true,
         at: entry.at
       });
@@ -18867,47 +19007,39 @@
       if (captureLineage?.pairIndex) {
         retireObsoletePendingCapturesForTarget(scope.scopeKey, captureLineage.pairIndex);
       }
-      const reconciled = await withinHookDeadline(
-        reconcileFinalizedCaptureCandidates(scopeBundle.snapshot, settings, {
-          scope,
+      const armedPendingIds = new Set();
+      const armPendingCapture = (pending, context = {}) => {
+        const pendingId = text(pending?.pendingId || '');
+        if (!pendingId || armedPendingIds.has(pendingId)) return false;
+        armedPendingIds.add(pendingId);
+        requestDecision.pendingId = pendingId;
+        scheduleFinalizedCaptureMonitor(pending, settings);
+        opLog('pending_queued', {
           hook: 'beforeRequest',
-          allowContentMismatchSave: true
-        }),
-        'beforeRequest finalized capture reconciliation'
-      );
-      if (reconciled.saved > 0) {
-        opLog('before_finalized_capture_reconciled', { hook: 'beforeRequest', scopeKey: scope.scopeKey, result: reconciled }, 'info');
-      }
-      if (liveChat.known) {
-        await withinHookDeadline(
-          synchronizeFlashbackTurnWorldline(scope, observedLiveState, settings),
-          'beforeRequest worldline'
-        )
-          .catch(error => {
-            warn('turn worldline synchronization failed; recall skipped for branch safety', error);
-            throw error;
-          });
-      }
+          type: requestClass.requestType || '',
+          pending,
+          latestUser: context.latestUser || pending.latestUser || '',
+          retrievalQuery: context.retrievalQuery || pending.retrievalQuery || ''
+        });
+        pushActivityLog('capture_waiting', '이번 턴의 최종 응답 캡처를 기다립니다.', {
+          scopeKey: scope.scopeKey,
+          pairIndex: Number(pending.pairIndex || 0) || 0,
+          turnIndex: Number(pending.turnIndex || 0) || 0,
+          pendingQueued: true
+        });
+        return true;
+      };
       const pendingCapture = await withinHookDeadline(
         capturePendingTurnForMessages(messages, requestClass, settings, {
           scope,
           snapshot: scopeBundle.snapshot,
           liveChat,
-          captureLineage
+          captureLineage,
+          onPendingEnqueued: armPendingCapture
         }),
         'beforeRequest pending capture'
       );
-      if (pendingCapture.queued) {
-        requestDecision.pendingId = pendingCapture.pending.pendingId;
-        scheduleFinalizedCaptureMonitor(pendingCapture.pending, settings);
-        opLog('pending_queued', { hook: 'beforeRequest', type: requestClass.requestType || '', pending: pendingCapture.pending, latestUser: pendingCapture.latestUser, retrievalQuery: pendingCapture.retrievalQuery });
-        pushActivityLog('capture_waiting', '이번 턴의 최종 응답 캡처를 기다립니다.', {
-          scopeKey: scope.scopeKey,
-          pairIndex: Number(pendingCapture.pending?.pairIndex || 0) || 0,
-          turnIndex: Number(pendingCapture.pending?.turnIndex || 0) || 0,
-          pendingQueued: true
-        });
-      }
+      if (pendingCapture.queued) armPendingCapture(pendingCapture.pending, pendingCapture);
       if (!pendingCapture.queued) {
         markPendingCaptureBarrier('before_no_user_input', requestClass);
         prunePendingTurns('before_no_user_input');
@@ -18929,6 +19061,56 @@
           liveMessages: liveChat.normalized || [],
           currentUserResolution: pendingCapture.currentUserResolution
         });
+      }
+      const promoteProtectedGenerationTarget = async (protectedTarget = {}) => {
+        const pending = pendingCapture.pending;
+        const stillActive = (Array.isArray(Runtime.pendingTurns) ? Runtime.pendingTurns : [])
+          .some(item => item?.pendingId === pending?.pendingId);
+        if (!pending?.pendingId || !stillActive || Number(protectedTarget.pairIndex || 0) !== Number(pending.pairIndex || 0)) return false;
+        Object.assign(pending, {
+          mode: 'reroll',
+          baselineAssistantPosition: Number(protectedTarget.assistantPosition || pending.expectedAssistantPosition || 0) || 0,
+          baselineAssistantText: canonicalChatResponseText(protectedTarget.baselineAssistantText || ''),
+          baselineAssistantHash: text(protectedTarget.baselineAssistantHash || '').trim(),
+          baselineVariantId: text(protectedTarget.baselineVariantId || '').trim(),
+          baselineTurnNodeId: text(protectedTarget.baselineTurnNodeId || '').trim(),
+          lineageRecoverySource: 'stored_worldline_generation_target'
+        });
+        const journal = await persistPendingCaptureJournalEntry(pending);
+        opLog('capture_pending_reroll_baseline_protected', {
+          hook: 'beforeRequest',
+          pendingId: pending.pendingId,
+          scopeKey: scope.scopeKey,
+          pairIndex: Number(pending.pairIndex || 0) || 0,
+          baselineAssistantPosition: Number(pending.baselineAssistantPosition || 0) || 0,
+          baselineVariantId: pending.baselineVariantId || '',
+          journalSaved: journal?.saved === true
+        }, 'info');
+        return true;
+      };
+      const reconciled = await withinHookDeadline(
+        reconcileFinalizedCaptureCandidates(scopeBundle.snapshot, settings, {
+          scope,
+          hook: 'beforeRequest',
+          allowContentMismatchSave: true
+        }),
+        'beforeRequest finalized capture reconciliation'
+      );
+      if (reconciled.saved > 0) {
+        opLog('before_finalized_capture_reconciled', { hook: 'beforeRequest', scopeKey: scope.scopeKey, result: reconciled }, 'info');
+      }
+      if (liveChat.known) {
+        await withinHookDeadline(
+          synchronizeFlashbackTurnWorldline(scope, observedLiveState, settings, {
+            protectedPending: pendingCapture.pending,
+            onProtectedGenerationTarget: promoteProtectedGenerationTarget
+          }),
+          'beforeRequest worldline'
+        )
+          .catch(error => {
+            warn('turn worldline synchronization failed; recall skipped for branch safety', error);
+            throw error;
+          });
       }
       const { normalizedMessages, latestUser, retrievalQuery } = pendingCapture;
       opLog('before_recall_start', {
@@ -23034,6 +23216,8 @@ ${cleanedText}`, 80),
           userMessagePosition: Number(item.userMessagePosition || 0) || 0,
           expectedAssistantPosition: Number(item.expectedAssistantPosition || 0) || 0,
           baselineAssistantPosition: Number(item.baselineAssistantPosition || 0) || 0,
+          hasBaselineVariantIdentity: !!item.baselineVariantId,
+          lineageRecoverySource: item.lineageRecoverySource || '',
           hasStableUserIdentity: !!item.requestUserMessageIdHash,
           requestSeenCount: Number(item.requestSeenCount || 0) || 0
         })),
@@ -23232,7 +23416,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.resolvePendingCaptureJournalMode = resolvePendingCaptureJournalMode;
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
