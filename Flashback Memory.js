@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.10.31
+//@display-name ⚡ FLASHBACK Memory v0.11.0
 //@api 3.0
-//@version 0.10.31
+//@version 0.11.0
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,18 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.0
+ *
+ * v0.11.0 ports the parts of HAYAKU 2.4 that strengthen independent episodic
+ * evidence without importing HAYAKU packet state. Old U+A evidence can now be
+ * reactivated by strong present-scene cues even without explicit “remember/past”
+ * wording; current-state facts age by property lifetime instead of persisting
+ * forever; model-facing evidence starts from a 3k probe and expands only when
+ * important selected evidence fails to fit; and recall deadline failures attempt
+ * one bounded sparse/exact emergency recall before falling back to the static
+ * factual contract. Canonical stored U+A text, embedding vectors, archive formats,
+ * and the provider-neutral prompt-cache contract remain unchanged.
+ *
  * ⚡ FLASHBACK Memory v0.10.31
  *
  * v0.10.31 makes finalized capture independent of pre-generation worldline
@@ -529,7 +541,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.10.31';
+  const PLUGIN_VERSION = '0.11.0';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -698,6 +710,43 @@
     balanced: Object.freeze({ short: 10, medium: 12, long: 16 }),
     heavy: Object.freeze({ short: 14, medium: 20, long: 28 })
   });
+  // Model-facing evidence uses a semantic ceiling independent of the user's hard
+  // max_injection_chars limit. Every request probes 3k first; larger tiers are
+  // opened only when selected high-value evidence demonstrably did not fit.
+  const FLASHBACK_EVIDENCE_BUDGETS = Object.freeze({
+    standard: 3000,
+    precision: 4500,
+    extended: 6000
+  });
+  const FLASHBACK_STATE_VALIDITY_VERSION = 'flashback_state_validity_v1';
+  const FLASHBACK_STATE_VALIDITY_PROFILES = Object.freeze({
+    posture: Object.freeze({ halfLife: 2, minRetention: 0.24, grace: 1 }),
+    expression: Object.freeze({ halfLife: 2, minRetention: 0.24, grace: 1 }),
+    emotion: Object.freeze({ halfLife: 4, minRetention: 0.22, grace: 2 }),
+    current_state: Object.freeze({ halfLife: 6, minRetention: 0.18, grace: 2 }),
+    location: Object.freeze({ halfLife: 12, minRetention: 0.18, grace: 3 }),
+    carrying: Object.freeze({ halfLife: 20, minRetention: 0.16, grace: 4 }),
+    attire: Object.freeze({ halfLife: 24, minRetention: 0.18, grace: 5 }),
+    condition: Object.freeze({ halfLife: 64, minRetention: 0.12, grace: 8 }),
+    object_state: Object.freeze({ halfLife: 48, minRetention: 0.12, grace: 6 }),
+    relationship: Object.freeze({ halfLife: 100, minRetention: 0.08, grace: 12 }),
+    open_thread: Object.freeze({ halfLife: 96, minRetention: 0.08, grace: 10 }),
+    constraint: Object.freeze({ halfLife: 128, minRetention: 0.06, grace: 12 }),
+    default: Object.freeze({ halfLife: 32, minRetention: 0.14, grace: 4 })
+  });
+  const FLASHBACK_LATENT_EPISODIC_VERSION = 'flashback_latent_episode_v1';
+  const FLASHBACK_LATENT_EPISODIC_TUNING = Object.freeze({
+    maxActivatedEpisodes: 1,
+    maxActivatedChildren: 4,
+    minAgeTurns: 6,
+    minCueSignal: 0.44,
+    strongCueSignal: 0.66,
+    cooldownTurns: 3,
+    decayFloor: 0.55
+  });
+  const FLASHBACK_EMERGENCY_RECALL_TIMEOUT_MS = 1200;
+  const FLASHBACK_EMERGENCY_RECALL_MAX_ITEMS = 2;
+  const FLASHBACK_EMERGENCY_RECALL_MAX_CHARS = 1500;
   const RECALL_QUALITY_PRESET_LABELS = Object.freeze({
     light: '가벼운',
     balanced: '적당한',
@@ -1043,6 +1092,7 @@
     queryEmbeddingCache: new Map(),
     queryEmbeddingInFlight: new Map(),
     documentEmbeddingCache: new Map(),
+    latentEpisodeCooldown: new Map(),
     embeddingGeneration: 1,
     embeddingControllers: new Set(),
     embeddingActiveRequests: new Map(),
@@ -1142,6 +1192,7 @@
       Runtime.pendingTurn = null;
       Runtime.pendingTurns = [];
       Runtime.afterRequestCaptureCandidates.clear();
+      Runtime.latentEpisodeCooldown.clear();
       Runtime.pendingCaptureBarrier = null;
       Runtime.requestDecisionQueue = [];
       Runtime.lastRequestDecision = null;
@@ -14158,6 +14209,49 @@
     return out;
   };
 
+  const currentStateValidityProfile = property => {
+    const normalized = normalizeStateProperty(property || '');
+    if (normalized.startsWith('relationship.')) return FLASHBACK_STATE_VALIDITY_PROFILES.relationship;
+    if (normalized.includes('open_thread')) return FLASHBACK_STATE_VALIDITY_PROFILES.open_thread;
+    if (normalized.includes('constraint') || normalized.includes('promise') || normalized.includes('invitation')) return FLASHBACK_STATE_VALIDITY_PROFILES.constraint;
+    return FLASHBACK_STATE_VALIDITY_PROFILES[normalized] || FLASHBACK_STATE_VALIDITY_PROFILES.default;
+  };
+
+  const applyCurrentStateValidityAging = (latestState = new Map(), latestTurn = 0) => {
+    const currentTurn = Math.max(0, Number(latestTurn || 0) || 0);
+    if (!(latestState instanceof Map) || currentTurn <= 0) return latestState;
+    for (const entry of latestState.values()) {
+      if (!entry || typeof entry !== 'object' || !entry.fact || entry.suppressed) continue;
+      if (entry.external === true || !entry.record || isInheritedScopeMemoryRecord(entry.record)) {
+        entry.stateValidity = { version: FLASHBACK_STATE_VALIDITY_VERSION, retention: 1, ageTurns: 0, expired: false, reason: entry.external ? 'request_local_or_external' : 'inherited_session_baseline' };
+        entry.validityExpired = false;
+        continue;
+      }
+      const observedTurn = finiteTurnIndex(entry.record) || Math.max(0, Number(entry.fact.turn || 0) || 0);
+      if (!observedTurn || observedTurn > currentTurn) {
+        entry.stateValidity = { version: FLASHBACK_STATE_VALIDITY_VERSION, retention: 1, ageTurns: 0, expired: false, reason: 'turn_unavailable_or_future' };
+        entry.validityExpired = false;
+        continue;
+      }
+      const ageTurns = Math.max(0, currentTurn - observedTurn);
+      const profile = currentStateValidityProfile(entry.fact.property);
+      const retention = Math.pow(0.5, ageTurns / Math.max(1, Number(profile.halfLife || 1)));
+      const expired = ageTurns > Number(profile.grace || 0) && retention < Number(profile.minRetention || 0);
+      entry.stateValidity = {
+        version: FLASHBACK_STATE_VALIDITY_VERSION,
+        property: normalizeStateProperty(entry.fact.property),
+        ageTurns,
+        halfLife: profile.halfLife,
+        minRetention: profile.minRetention,
+        retention: Number(retention.toFixed(4)),
+        expired,
+        reason: expired ? 'property_validity_decayed' : 'property_still_plausibly_current'
+      };
+      entry.validityExpired = expired;
+    }
+    return latestState;
+  };
+
   const applyCurrentUserOverlaySuppressions = (latestState = new Map(), suppressions = []) => {
     for (const suppression of Array.isArray(suppressions) ? suppressions : []) {
       if (!suppression?.hard) continue;
@@ -14193,7 +14287,7 @@
     const seen = new Set();
     for (const [key, entry] of latestState.entries()) {
       const fact = entry?.fact;
-      if (!entry?.structured || !fact) continue;
+      if (!entry?.structured || !fact || entry?.validityExpired === true) continue;
       const entityMatches = !queryEntities.size
         || queryEntities.has(fact.entity)
         || (fact.peer && queryEntities.has(fact.peer))
@@ -14211,7 +14305,8 @@
         external: !!entry.external,
         recordId: text(entry.record?.id || entry.record?.hash || ''),
         sourceHash: text(entry.record?.sourceHash || ''),
-        storyOrder: entry.time
+        storyOrder: entry.time,
+        stateValidity: entry.stateValidity || null
       });
     }
     return rows.sort((a, b) => b.time - a.time || Number(b.confidence || 0) - Number(a.confidence || 0)).slice(0, Math.max(1, Number(limit) || 14));
@@ -14348,7 +14443,10 @@
           if (!entityRelevant || !propertyRelevant) continue;
           relevant += 1;
           const latest = context.latestStateByEntity.get(stateFactMapKey(fact.entity, fact.property, fact.peer || ''));
-          if (latest && latest.id !== (record.id || record.hash || '') && latest.time > storyOrderValue(record)) superseded += 1;
+          if (latest?.validityExpired === true) {
+            // The fact remains valid historical evidence, but it no longer proves
+            // the present state merely because no later observation was recorded.
+          } else if (latest && latest.id !== (record.id || record.hash || '') && latest.time > storyOrderValue(record)) superseded += 1;
           else current += 1;
         }
         if (relevant > 0) {
@@ -14359,7 +14457,7 @@
         for (const entity of stateQueryAnchors.entities || []) {
           if (!recordEntities.has(entity)) continue;
           const latest = context.latestStateByEntity.get(stateFactMapKey(entity, '__generic__', ''));
-          if (latest && latest.id !== (record.id || record.hash || '') && latest.time > storyOrderValue(record)) staleStatePenalty = Math.max(staleStatePenalty, 0.18);
+          if (latest?.validityExpired !== true && latest && latest.id !== (record.id || record.hash || '') && latest.time > storyOrderValue(record)) staleStatePenalty = Math.max(staleStatePenalty, 0.18);
         }
       }
     }
@@ -14437,13 +14535,14 @@
     if (c.episodeTraversal > 0) reasons.push('episode_child');
     if (c.currentSceneTail > 0) reasons.push('current_scene_tail');
     if (c.entityFocused > 0) reasons.push('entity_focused_anchor');
+    if (c.latentEpisodic >= FLASHBACK_LATENT_EPISODIC_TUNING.minCueSignal) reasons.push('latent_episode_cue');
     if (queryAnchors.continuation && c.continuationRecent > 0) reasons.push('continuation_recent');
     const supportReasons = reasons.filter(reason => reason !== 'sanitized_source');
-    const indexEvidenceReasons = new Set(['exact_anchor', 'exact_public_anchor', 'bm25f_public', 'keyword_overlap', 'name_overlap', 'entity_anchor', 'quoted_phrase', 'number_context', 'current_scene_tail', 'entity_focused_anchor', 'episode_child', 'high_cosine', 'previous_turn_context']);
+    const indexEvidenceReasons = new Set(['exact_anchor', 'exact_public_anchor', 'bm25f_public', 'keyword_overlap', 'name_overlap', 'entity_anchor', 'quoted_phrase', 'number_context', 'current_scene_tail', 'entity_focused_anchor', 'episode_child', 'latent_episode_cue', 'high_cosine', 'previous_turn_context']);
     let passed = supportReasons.length > 0;
     const shortFactQuery = c.queryType === QUERY_TYPES.FACT && (queryAnchors.tokens?.size || 0) <= 8;
     if (passed && shortFactQuery) {
-      const strongReasons = new Set(['high_cosine', 'quoted_phrase', 'number_context', 'exact_public_anchor', 'bm25f_public', 'current_state_fact', 'current_scene_tail', 'entity_focused_anchor', 'episode_child']);
+      const strongReasons = new Set(['high_cosine', 'quoted_phrase', 'number_context', 'exact_public_anchor', 'bm25f_public', 'current_state_fact', 'current_scene_tail', 'entity_focused_anchor', 'episode_child', 'latent_episode_cue']);
       const strongKeyword = c.keywordOverlap >= Math.max(0.34, Number(settings.gateKeywordOverlap || 0) * 2);
       const corroboratedAnchor = c.keywordOverlap >= settings.gateKeywordOverlap
         && (c.nameOverlap >= settings.gateNameOverlap || c.entityAnchor >= settings.gateNameOverlap);
@@ -14608,6 +14707,153 @@
     return { episodeCount: episodes.length, childCount: childIds.size, boosted, forced };
   };
 
+  const latentEpisodeSpecificLocation = value => {
+    const normalized = normalizeForLexical(value || '').trim();
+    if (!normalized || normalized.length < 3) return '';
+    const generic = new Set(['집', '방', '거리', '공원', '카페', '학교', '회사', '병원', '가게', '식당', '차', '차량', 'room', 'home', 'street', 'park', 'cafe', 'school', 'office', 'hospital', 'store', 'restaurant', 'car']);
+    return generic.has(normalized) ? '' : normalized;
+  };
+
+  const buildLatentEpisodeCueContext = (query = '', queryAnchors = {}, currentStateFacts = [], records = [], settings = Runtime.settings || DEFAULTS) => {
+    const locations = new Set();
+    const objects = new Set();
+    const entities = new Set(queryAnchors?.entities || []);
+    for (const fact of Array.isArray(currentStateFacts) ? currentStateFacts : []) {
+      const property = normalizeStateProperty(fact?.property || '');
+      const value = normalizeForLexical(fact?.value || '');
+      if (fact?.entity && !text(fact.entity).startsWith('@')) entities.add(normalizeStateEntity(fact.entity));
+      if (fact?.peer && !text(fact.peer).startsWith('@')) entities.add(normalizeStateEntity(fact.peer));
+      if (property === 'location') {
+        const specific = latentEpisodeSpecificLocation(value);
+        if (specific) locations.add(specific);
+      }
+      if (property === 'carrying' || property === 'object_state') {
+        const specific = normalizeForLexical(value).trim();
+        if (specific && specific.length >= 2 && specific.length <= 40) objects.add(specific);
+      }
+    }
+    const sceneKeys = currentSceneTurnKeysForRecords(records, settings);
+    const sceneRecords = (records || []).filter(record => isResponseMemoryRecord(record) && sceneKeys.has(storyTurnKey(record)));
+    for (const record of sceneRecords.slice(-6)) {
+      for (const entity of recordEntityAnchorSet(record)) entities.add(entity);
+      const sceneFacts = recordStructuredStateFacts(record);
+      const inferredSceneFacts = sceneFacts.length ? [] : visibleContinuityFactsFromText(record.text || '', { turn: finiteTurnIndex(record) });
+      for (const fact of [...sceneFacts, ...inferredSceneFacts]) {
+        const property = normalizeStateProperty(fact.property || '');
+        if (property === 'location') {
+          const specific = latentEpisodeSpecificLocation(fact.value);
+          if (specific) locations.add(specific);
+        }
+        if (property === 'carrying' || property === 'object_state') {
+          const specific = normalizeForLexical(fact.value || '').trim();
+          if (specific && specific.length >= 2 && specific.length <= 40) objects.add(specific);
+        }
+      }
+    }
+    const entitySet = new Set(Array.from(entities).map(normalizeEntityAnchor).filter(Boolean));
+    const topics = new Set(Array.from(queryAnchors?.important || [])
+      .map(normalizeForLexical)
+      .filter(value => value && !entitySet.has(value) && value.length >= 2));
+    return { query: text(query || ''), locations, objects, entities: entitySet, topics, sceneTurnKeys: sceneKeys };
+  };
+
+  const latentEpisodeCueScore = (episode = {}, cue = {}, latestTurn = 0) => {
+    if (!episode?.autoEpisode || episode?.sourceType !== 'episode_index' || text(episode.episodeLevel || 'scene') !== 'scene') return null;
+    const endTurn = Math.max(0, Number(episode?.turnRange?.end || finiteTurnIndex(episode) || 0) || 0);
+    const ageTurns = latestTurn > 0 && endTurn > 0 ? Math.max(0, latestTurn - endTurn) : 0;
+    if (ageTurns < FLASHBACK_LATENT_EPISODIC_TUNING.minAgeTurns) return null;
+    const body = normalizeForLexical(`${episode.title || ''}\n${episode.text || ''}`);
+    if (!body) return null;
+    let placeSignal = 0;
+    for (const place of cue.locations || []) {
+      if (place && body.includes(place)) placeSignal = Math.max(placeSignal, 1);
+      else if (place) placeSignal = Math.max(placeSignal, lexicalOverlap(place, body) * 0.72);
+    }
+    let objectSignal = 0;
+    for (const object of cue.objects || []) {
+      if (object && body.includes(object)) objectSignal = Math.max(objectSignal, 1);
+      else if (object) objectSignal = Math.max(objectSignal, lexicalOverlap(object, body) * 0.7);
+    }
+    const episodeEntities = recordEntityAnchorSet(episode);
+    const entitySignal = overlapRatio(cue.entities || new Set(), episodeEntities);
+    const episodeAnchors = extractRecallAnchors(body);
+    const topicSignal = overlapRatio(cue.topics || new Set(), episodeAnchors.important || new Set());
+    const pairSignal = (cue.entities?.size || 0) >= 2 && entitySignal >= 0.45 ? Math.min(1, entitySignal + 0.2) : 0;
+    const cueStrength = Math.max(
+      placeSignal > 0 ? placeSignal * 0.62 + entitySignal * 0.24 + topicSignal * 0.14 : 0,
+      objectSignal > 0 ? objectSignal * 0.55 + entitySignal * 0.25 + topicSignal * 0.20 : 0,
+      pairSignal > 0 && topicSignal >= 0.22 ? pairSignal * 0.58 + topicSignal * 0.42 : 0
+    );
+    const decay = Math.max(FLASHBACK_LATENT_EPISODIC_TUNING.decayFloor, Math.exp(-ageTurns / 220));
+    const signal = clampNumber(cueStrength * decay, 0, 1, 0);
+    const hasPhysicalCue = (placeSignal >= 0.65 || objectSignal >= 0.7)
+      && (!(cue.entities?.size > 0) || entitySignal >= 0.18 || topicSignal >= 0.25);
+    const hasNarrativeCue = pairSignal >= 0.5 && topicSignal >= 0.22;
+    if (!(hasPhysicalCue || hasNarrativeCue) || signal < FLASHBACK_LATENT_EPISODIC_TUNING.minCueSignal) return null;
+    return { signal, cueStrength, placeSignal, objectSignal, entitySignal, pairSignal, topicSignal, ageTurns, endTurn };
+  };
+
+  const applyLatentEpisodicReactivation = (items = [], records = [], query = '', queryAnchors = {}, currentStateFacts = [], settings = Runtime.settings || DEFAULTS, context = {}) => {
+    if (!settings.episodeIndexEnabled) return { activatedEpisodes: 0, activatedChildren: 0, episodeIds: [], cue: null };
+    const latestTurn = Math.max(0, Number(context.latestResponseTurn || 0) || latestLiveResponseTurnIndex(records));
+    const cue = buildLatentEpisodeCueContext(query, queryAnchors, currentStateFacts, records, settings);
+    if (!(cue.locations.size || cue.objects.size || (cue.entities.size >= 2 && cue.topics.size))) return { activatedEpisodes: 0, activatedChildren: 0, episodeIds: [], cue };
+    const candidates = (records || [])
+      .filter(record => record?.autoEpisode && record?.sourceType === 'episode_index' && text(record.episodeLevel || 'scene') === 'scene')
+      .map(record => ({ record, detail: latentEpisodeCueScore(record, cue, latestTurn) }))
+      .filter(row => row.detail)
+      .filter(row => {
+        const id = text(row.record.id || row.record.hash || '');
+        const cooldownKey = `${text(context.scopeKey || '')}|${id}`;
+        const lastTurn = Number(Runtime.latentEpisodeCooldown.get(cooldownKey) || 0) || 0;
+        return !lastTurn || latestTurn - lastTurn > FLASHBACK_LATENT_EPISODIC_TUNING.cooldownTurns;
+      })
+      .sort((a, b) => b.detail.signal - a.detail.signal || b.detail.cueStrength - a.detail.cueStrength || Number(b.record?.importanceScore || 0) - Number(a.record?.importanceScore || 0))
+      .slice(0, FLASHBACK_LATENT_EPISODIC_TUNING.maxActivatedEpisodes);
+    if (!candidates.length) return { activatedEpisodes: 0, activatedChildren: 0, episodeIds: [], cue };
+    const recordById = new Map();
+    for (const record of records || []) {
+      const id = text(record?.id || record?.hash || '');
+      if (id) recordById.set(id, record);
+    }
+    const itemById = new Map(items.map(item => [text(item?.record?.id || item?.record?.hash || ''), item]));
+    let activatedChildren = 0;
+    const episodeIds = [];
+    for (const candidate of candidates) {
+      const episode = candidate.record;
+      const episodeId = text(episode.id || episode.hash || '');
+      if (!episodeId) continue;
+      episodeIds.push(episodeId);
+      const childRows = [];
+      for (const childId of Array.isArray(episode.childIds) ? episode.childIds : []) {
+        const record = recordById.get(text(childId));
+        if (!record || !isResponseMemoryRecord(record)) continue;
+        let item = itemById.get(text(record.id || record.hash || '')) || scoreRecordForRecall(record, query, context.queryVector || [], queryAnchors, settings, context);
+        if (!item) continue;
+        const detail = candidate.detail;
+        item.components = {
+          ...(item.components || {}),
+          latentEpisodic: detail.signal,
+          latentEpisodeCue: detail,
+          forcedReasons: Array.from(new Set([...(item.components?.forcedReasons || []), 'latent_episode_cue']))
+        };
+        item.forcedReasons = Array.from(new Set([...(item.forcedReasons || []), 'latent_episode_cue']));
+        item.score = clampNumber(Math.max(Number(item.score || 0) + 0.08 + detail.signal * 0.08, 0.20 + detail.signal * 0.14), 0, 1, 0.2);
+        item.mmrScore = item.score;
+        itemById.set(text(record.id || record.hash || ''), item);
+        childRows.push(item);
+      }
+      childRows.sort((a, b) => Number(b.score || 0) - Number(a.score || 0) || storyOrderValue(b.record) - storyOrderValue(a.record));
+      for (const item of childRows.slice(0, FLASHBACK_LATENT_EPISODIC_TUNING.maxActivatedChildren)) {
+        if (!items.includes(item)) items.push(item);
+        activatedChildren += 1;
+      }
+      Runtime.latentEpisodeCooldown.set(`${text(context.scopeKey || '')}|${episodeId}`, latestTurn || 1);
+    }
+    if (Runtime.latentEpisodeCooldown.size > 64) Runtime.latentEpisodeCooldown.delete(Runtime.latentEpisodeCooldown.keys().next().value);
+    return { activatedEpisodes: episodeIds.length, activatedChildren, episodeIds, cue, strongestSignal: candidates[0]?.detail?.signal || 0 };
+  };
+
   const markForcedRecallItem = (item, reason, boost = 0.06, floor = 0.18) => {
     if (!item?.record) return null;
     const next = item;
@@ -14679,9 +14925,11 @@
     const out = selected.slice();
     const ids = new Set(out.map(item => item.record?.id || item.record?.hash || '').filter(Boolean));
     const minTail = clampInt(settings.currentSceneTailMinKeep, 0, 6, DEFAULTS.currentSceneTailMinKeep);
+    const latentAvailable = forced.some(item => item?.forcedReasons?.includes('latent_episode_cue') || item?.components?.latentEpisodic > 0);
     const needs = {
       current_scene_tail: Math.max(0, minTail - out.filter(item => item.forcedReasons?.includes('current_scene_tail') || item.components?.currentSceneTail > 0).length),
-      entity_focused_anchor: Math.max(0, Math.min(1, clampInt(settings.entityFocusedMaxTotal, 0, 12, DEFAULTS.entityFocusedMaxTotal)) - out.filter(item => item.forcedReasons?.includes('entity_focused_anchor') || item.components?.entityFocused > 0).length)
+      entity_focused_anchor: Math.max(0, Math.min(1, clampInt(settings.entityFocusedMaxTotal, 0, 12, DEFAULTS.entityFocusedMaxTotal)) - out.filter(item => item.forcedReasons?.includes('entity_focused_anchor') || item.components?.entityFocused > 0).length),
+      latent_episode_cue: latentAvailable && !out.some(item => item.forcedReasons?.includes('latent_episode_cue') || item.components?.latentEpisodic > 0) ? 1 : 0
     };
     for (const item of forced) {
       const id = item.record?.id || item.record?.hash || '';
@@ -14702,7 +14950,7 @@
     const topK = Math.max(1, Number(settings.topK || DEFAULTS.topK));
     const byHash = new Map();
     const byTurn = new Map();
-    const forcedKept = { current_scene_tail: 0, entity_focused_anchor: 0 };
+    const forcedKept = { current_scene_tail: 0, entity_focused_anchor: 0, latent_episode_cue: 0 };
     const out = [];
     for (const item of items) {
       const r = item.record || item;
@@ -14711,7 +14959,8 @@
       const turnKey = turn ? `${r.sourceType || 'source'}:${storyTurnKey(r)}` : '';
       const reasons = item.forcedReasons || [];
       const bypass = (reasons.includes('current_scene_tail') && forcedKept.current_scene_tail < Math.max(1, settings.currentSceneTailMinKeep || 0))
-        || (reasons.includes('entity_focused_anchor') && forcedKept.entity_focused_anchor < 1);
+        || (reasons.includes('entity_focused_anchor') && forcedKept.entity_focused_anchor < 1)
+        || (reasons.includes('latent_episode_cue') && forcedKept.latent_episode_cue < 1);
       if (!bypass) {
         if (hashKey && (byHash.get(hashKey) || 0) >= maxPerSourceHash) continue;
         if (turnKey && (byTurn.get(turnKey) || 0) >= maxPerTurn) continue;
@@ -14989,6 +15238,7 @@
     const inactiveBranchFiltered = Number(branchGate.diagnostics?.inactiveBranchFiltered || 0) || 0;
     const worldlineMismatchFiltered = Number(branchGate.diagnostics?.worldlineMismatchFiltered || 0) || 0;
     const privacyFiltered = Number(branchGate.diagnostics?.privacyFiltered || 0) || 0;
+    const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
     const queryAnchors = buildDiscriminativeRecallAnchors(rawQueryAnchors, records);
     const strategy = recallStrategyForQueryType(queryType);
     const adaptiveRecall = adaptiveRecallProfile(primaryQueryText, queryAnchors, queryType, cfg);
@@ -15003,6 +15253,7 @@
     const queryStateProperties = extractQueryStateProperties(primaryQueryText);
     const latestStateByEntity = buildLatestStateByEntity(records, liveStateFacts);
     applyCurrentUserOverlaySuppressions(latestStateByEntity, overlay.suppressions);
+    applyCurrentStateValidityAging(latestStateByEntity, latestResponseTurn);
     const currentStateFacts = cfg.structuredStateEnabled ? collectCurrentStateFacts(latestStateByEntity, rawQueryAnchors, queryStateProperties, 14) : [];
     const previousTurnNumber = Number(previousTurn.targetTurn || previousTurn.turnIndex || 0) || 0;
     const excludedPreviousTurnNumber = previousTurn.requestMatched === true ? previousTurnNumber : 0;
@@ -15028,8 +15279,7 @@
       stageElapsed.total = Date.now() - recallStartedAt;
       return { records: [], currentStateFacts, total: 0, storedTotal: Math.max(0, Number(manifest.count || 0) || 0) + Math.max(0, Number(manifest.archiveRef?.recordCount || 0) || 0), loadedTotal: storedRecords.length, externalSuppressed, storageMissingShards, storageCorruptShards, storageManifestCorrupt, storageForeignScopeKey, storageRecordCountMismatch, queryDim: queryVector.length, queryText: primaryQueryText, requestedQueryText, scopeKey: scope.scopeKey, candidates: 0, gateRejected: 0, scoreRejected: 0, shardSelection, queryEmbeddingCost, queryType, temporalIntent, truthIntent, queryIntent, overlay, previousTurnRecall, inactiveBranchFiltered, worldlineMismatchFiltered, privacyFiltered, stageElapsed };
     }
-    const latestResponseTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
-    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, queryProfileId, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
+    const recallContext = { scopeKey: scope.scopeKey, currentUser: primaryQueryText, recentResponseRanks, latestStateByEntity, queryStateProperties, stateQueryAnchors: rawQueryAnchors, queryType, temporalIntent, truthIntent, queryIntent, overlay, strategy, records, latestResponseTurn, queryFallbackUsed, queryProvider, queryModel, queryProfileId, queryVector, allowLexicalFallback: true, previousTurn, previousTurnProfile, previousTurnNumber, excludedPreviousTurnNumber, excludedPreviousTurnSourceHash };
     const candidateLimit = Math.max(effectiveTopK, Math.min(records.length, Math.ceil(Number(cfg.candidateLimit || DEFAULTS.candidateLimit) * topKMultiplier)));
     const sparseStageStartedAt = Date.now();
     let arms = await generateRecallCandidateArms({
@@ -15052,7 +15302,7 @@
         queryProvider = 'hash';
         queryModel = `hash-${cfg.hashDimensions}`;
         queryProfileId = embeddingProfileId(cfg, queryVector.length, queryProvider, queryModel);
-        Object.assign(recallContext, { queryFallbackUsed, queryProvider, queryModel, queryProfileId });
+        Object.assign(recallContext, { queryFallbackUsed, queryProvider, queryModel, queryProfileId, queryVector });
         arms = await generateRecallCandidateArms({
           records,
           queryText: primaryQueryText,
@@ -15129,13 +15379,17 @@
     const temporalHardGate = applyRecallTemporalHardGate(scoredRaw, { temporalIntent, truthIntent });
     const temporallyEligible = temporalHardGate;
     const episodeTraversal = applyEpisodeTraversalBoost(temporallyEligible, records, primaryQueryText, queryVector, queryAnchors, queryType, cfg, recallContext);
+    const latentEpisodic = applyLatentEpisodicReactivation(temporallyEligible, records, primaryQueryText, rawQueryAnchors, currentStateFacts, cfg, recallContext);
     const currentSceneTail = cfg.heuristicRecall
       ? temporallyEligible.filter(item => item.components?.forcedReasons?.includes('current_scene_tail'))
       : [];
     const entityFocused = cfg.heuristicRecall
       ? temporallyEligible.filter(item => item.components?.forcedReasons?.includes('entity_focused'))
       : [];
-    const forcedCandidates = [...currentSceneTail, ...entityFocused];
+    const latentEpisodeCandidates = cfg.heuristicRecall
+      ? temporallyEligible.filter(item => item.forcedReasons?.includes('latent_episode_cue') || item.components?.latentEpisodic > 0)
+      : [];
+    const forcedCandidates = [...currentSceneTail, ...entityFocused, ...latentEpisodeCandidates];
     temporallyEligible.sort((a, b) => b.score - a.score);
     const responseScored = temporallyEligible.filter(item => isResponseMemoryRecord(item?.record));
     const recallCandidates = responseScored;
@@ -15294,6 +15548,8 @@
       previousTurnRecall,
       queryEmbeddingCost,
       episodeTraversal,
+      latentEpisodic,
+      stateValidity: { version: FLASHBACK_STATE_VALIDITY_VERSION, currentFacts: currentStateFacts.length },
       fallbackWarning: sparseFirstFallback
         ? `원격 임베딩 실패 후 sparse/exact 근거로 복구했습니다.${remoteEmbeddingError ? ` (${remoteEmbeddingError})` : ''}`
         : (queryFallbackUsed
@@ -15814,6 +16070,90 @@
     }
     if (!body) return '';
     return body.length <= max ? body : '';
+  };
+
+  const flashbackRenderedRecordPresent = (record = {}, rendered = '') => {
+    const body = text(rendered || '');
+    if (!body) return false;
+    const source = diegeticRecallSourceText(record);
+    if (!source) return false;
+    const units = recallNarrativeUnits(source, 2000, { preserveWholeUnits: true }).units;
+    for (const unit of units) {
+      const piece = text(unit?.text || '').trim();
+      if (piece.length >= 8 && body.includes(piece)) return true;
+      if (piece.length >= 48 && body.includes(piece.slice(0, 48))) return true;
+    }
+    return false;
+  };
+
+  const flashbackEvidencePressureForRenderedBlock = (recall = {}, rendered = '') => {
+    const body = text(rendered || '');
+    const hasOmissionMarker = /\[(?:STATE FACTS OMITTED|ORDERED SUPPLIED EVENTS OMITTED|ORDER-UNKNOWN SUPPLIED EVENTS OMITTED|GAP\s+—)/.test(body);
+    if (!hasOmissionMarker) {
+      return { hardMissingCount: 0, importantMissingCount: 0, hardMissing: [], importantMissing: [], hasOmissionMarker: false, needsPrecisionExpansion: false };
+    }
+    const hardMissing = [];
+    const importantMissing = [];
+    for (const fact of Array.isArray(recall?.currentStateFacts) ? recall.currentStateFacts : []) {
+      const sentence = structuredStateSentence(fact);
+      if (sentence && !body.includes(sentence)) hardMissing.push(`state:${fact.entity}:${fact.property}`);
+    }
+    for (const item of Array.isArray(recall?.records) ? recall.records : []) {
+      const c = item?.components || {};
+      const forced = new Set([...(item?.forcedReasons || []), ...(c.forcedReasons || [])]);
+      const hard = forced.has('current_scene_tail') || forced.has('previous_turn_bridge') || forced.has('latent_episode_cue')
+        || Number(c.exactArm || 0) >= 0.72 || Number(c.currentStateEvidence || 0) >= 0.80;
+      const important = hard || forced.has('entity_focused_anchor') || Number(c.episodeTraversal || 0) > 0
+        || Number(c.exactArm || 0) >= 0.42 || Number(item?.score || 0) >= 0.72;
+      if (!important || flashbackRenderedRecordPresent(item.record || {}, body)) continue;
+      const id = text(item?.record?.id || item?.record?.hash || item?.record?.sourceId || 'unknown');
+      if (hard) hardMissing.push(id);
+      else importantMissing.push(id);
+    }
+    return {
+      hardMissingCount: hardMissing.length,
+      importantMissingCount: importantMissing.length,
+      hardMissing,
+      importantMissing,
+      hasOmissionMarker,
+      needsPrecisionExpansion: hardMissing.length > 0 || importantMissing.length > 0
+    };
+  };
+
+  const planFlashbackEvidenceBudget = (recall = {}, settings = Runtime.settings || DEFAULTS, allowedChars = 0) => {
+    const userHardMax = Math.max(0, Number(settings.maxInjectionChars || DEFAULTS.maxInjectionChars) || 0);
+    const emergencyMax = Math.max(0, Number(recall?.emergencyMaxInjectionChars || 0) || 0);
+    const physicalMax = Math.max(0, Math.min(userHardMax, Math.max(0, Number(allowedChars || userHardMax) || 0), emergencyMax > 0 ? emergencyMax : Number.POSITIVE_INFINITY));
+    if (physicalMax < 800) return { text: '', tier: 'none', targetChars: 0, appliedChars: physicalMax, actualChars: 0, attempts: [], pressure: null, contextConstrained: true };
+    const semanticTiers = [
+      { tier: 'standard', targetChars: FLASHBACK_EVIDENCE_BUDGETS.standard },
+      { tier: 'precision', targetChars: FLASHBACK_EVIDENCE_BUDGETS.precision },
+      { tier: 'extended', targetChars: FLASHBACK_EVIDENCE_BUDGETS.extended }
+    ];
+    const attempts = [];
+    let chosen = null;
+    let previousApplied = -1;
+    for (let index = 0; index < semanticTiers.length; index += 1) {
+      const tier = semanticTiers[index];
+      const appliedChars = Math.max(800, Math.min(physicalMax, tier.targetChars));
+      if (appliedChars === previousApplied && chosen) break;
+      previousApplied = appliedChars;
+      const textBlock = formatFlashbackDynamicEvidenceBlock(recall, { ...settings, maxInjectionChars: appliedChars });
+      const pressure = flashbackEvidencePressureForRenderedBlock(recall, textBlock);
+      const attempt = { tier: tier.tier, targetChars: tier.targetChars, appliedChars, actualChars: textBlock.length, pressure, contextConstrained: appliedChars < tier.targetChars };
+      attempts.push(attempt);
+      chosen = { text: textBlock, tier: tier.tier, targetChars: tier.targetChars, appliedChars, actualChars: textBlock.length, attempts: attempts.slice(), pressure, contextConstrained: appliedChars < tier.targetChars };
+      if (index === 0) {
+        if (!pressure.needsPrecisionExpansion || appliedChars < tier.targetChars) break;
+        continue;
+      }
+      if (index === 1) {
+        if (pressure.hardMissingCount <= 0 || appliedChars < tier.targetChars) break;
+        continue;
+      }
+      break;
+    }
+    return chosen || { text: '', tier: 'none', targetChars: 0, appliedChars: physicalMax, actualChars: 0, attempts, pressure: null, contextConstrained: false };
   };
 
   // 레거시 호환: 기존 formatRecallBlock 호출자를 위해 동적 블록만 반환.
@@ -18884,6 +19224,86 @@
     return true;
   };
 
+  const emergencySparseRecall = async (query = '', settings = Runtime.settings || DEFAULTS, scope = {}, options = {}) => {
+    const startedAt = Date.now();
+    if (!scope?.scopeKey || !text(query || '').trim()) return null;
+    const [manifest, worldline] = await Promise.all([
+      loadScopeManifest(scope.scopeKey),
+      loadTurnWorldline(scope.scopeKey).catch(() => emptyTurnWorldline(scope.scopeKey))
+    ]);
+    const shardCount = Math.max(0, Number(manifest.shardCount || 0) || 0);
+    if (!shardCount) return null;
+    const sceneIndexes = currentSceneSourceShardIndexes(manifest, Number(options.currentPairIndex || 0) || 0, settings);
+    const latestIndexes = [];
+    for (let index = shardCount - 1; index >= 0 && latestIndexes.length < 2; index -= 1) latestIndexes.push(index);
+    const indexes = Array.from(new Set([...sceneIndexes, ...latestIndexes])).filter(index => index >= 0 && index < shardCount).slice(-4).sort((a, b) => a - b);
+    const loaded = await loadScopeRecordsForRecall(scope.scopeKey, { indexes, fullScan: indexes.length >= shardCount, reason: 'emergency_recent_sparse', shardCount }, { manifest });
+    let records = applyRecallHardGates(Array.isArray(loaded.records) ? loaded.records : [], {
+      temporalIntent: classifyTemporalIntent(query),
+      truthIntent: classifyTruthIntent(query),
+      scopeKey: scope.scopeKey,
+      worldline
+    });
+    records = records.filter(record => isResponseMemoryRecord(record));
+    if (!records.length) return null;
+    const anchors = extractRecallAnchors(query);
+    const queryType = classifyRecallQuery(query, anchors);
+    const temporalIntent = classifyTemporalIntent(query, anchors);
+    const truthIntent = classifyTruthIntent(query);
+    const latestTurn = Math.max(latestLiveResponseTurnIndex(records), Number(manifest.responseTurnMax || 0) || 0);
+    const latestStateByEntity = buildLatestStateByEntity(records, []);
+    applyCurrentStateValidityAging(latestStateByEntity, latestTurn);
+    const currentStateFacts = settings.structuredStateEnabled === false ? [] : collectCurrentStateFacts(latestStateByEntity, anchors, extractQueryStateProperties(query), 8);
+    const exactMap = new Map();
+    for (const record of records) {
+      const exact = exactRecallCandidateScore(record, query, anchors, settings);
+      if (exact) exactMap.set(text(record.id || record.hash || ''), exact);
+    }
+    const sparseRows = scoreBm25fCandidates(records, query, settings, { limit: 12 });
+    const sparseMap = new Map(sparseRows.map(row => [text(row.record?.id || row.record?.hash || ''), row]));
+    const sceneKeys = currentSceneTurnKeysForRecords(records, settings);
+    const scored = records.map(record => {
+      const id = text(record.id || record.hash || '');
+      const exact = exactMap.get(id);
+      const sparse = sparseMap.get(id);
+      const scene = sceneKeys.has(storyTurnKey(record));
+      const recency = computeStoryRecency(record, records, settings, latestTurn);
+      const score = Math.max(Number(exact?.score || 0), Number(sparse?.score || 0)) + (scene ? 0.18 : 0) + recency * 0.08;
+      return { record, score: clampNumber(score, 0, 1, 0), mmrScore: score, components: { emergencySparse: 1, exactArm: Number(exact?.score || 0), bm25f: Number(sparse?.score || 0), currentSceneTail: scene ? 1 : 0, forcedReasons: scene ? ['current_scene_tail'] : [] }, forcedReasons: scene ? ['current_scene_tail'] : [], gate: { passed: true, reasons: ['emergency_sparse'] } };
+    }).filter(item => item.score > 0 || item.components.currentSceneTail > 0)
+      .sort((a, b) => b.score - a.score || storyOrderValue(b.record) - storyOrderValue(a.record));
+    const selected = [];
+    const seenTurns = new Set();
+    for (const item of scored) {
+      const turnKey = storyTurnKey(item.record);
+      if (seenTurns.has(turnKey)) continue;
+      selected.push(item);
+      seenTurns.add(turnKey);
+      if (selected.length >= FLASHBACK_EMERGENCY_RECALL_MAX_ITEMS) break;
+    }
+    if (!selected.length && !currentStateFacts.length) return null;
+    return {
+      records: selected,
+      currentStateFacts,
+      total: records.length,
+      storedTotal: Number(manifest.count || 0) || records.length,
+      loadedTotal: records.length,
+      scopeKey: scope.scopeKey,
+      queryText: query,
+      requestedQueryText: query,
+      queryType,
+      temporalIntent,
+      truthIntent,
+      emergencySparse: true,
+      emergencyMaxInjectionChars: FLASHBACK_EMERGENCY_RECALL_MAX_CHARS,
+      candidates: scored.length,
+      gateRejected: 0,
+      scoreRejected: 0,
+      stageElapsed: { total: Date.now() - startedAt },
+      fallbackWarning: '정규 리콜 제한시간 초과 후 최근 shard의 sparse/exact 실제 U+A 증거만 제한적으로 복구했습니다.'
+    };
+  };
+
   const beforeRequest = async (messages, type = 'model') => {
     const hookStartedAt = Date.now();
     const requestClass = classifyRequestType(type, messages);
@@ -19145,29 +19565,60 @@
         );
       } catch (error) {
         if (error?.code !== 'FLASHBACK_DEADLINE') throw error;
-        Runtime.lastRecall = {
-          at: Date.now(),
+        let emergencyRecall = null;
+        try {
+          emergencyRecall = await withDeadline(
+            emergencySparseRecall(retrievalQuery, recallSettings, scope, {
+              currentPairIndex: Number(pendingCapture.pending?.pairIndex || 0) || 0
+            }),
+            FLASHBACK_EMERGENCY_RECALL_TIMEOUT_MS,
+            'beforeRequest emergency sparse recall'
+          );
+        } catch (emergencyError) {
+          warn('emergency sparse recall failed after regular recall deadline', emergencyError);
+        }
+        if (!emergencyRecall) {
+          Runtime.lastRecall = {
+            at: Date.now(),
+            scopeKey: scope.scopeKey,
+            skipped: true,
+            reason: 'recall_deadline',
+            latestUser: compact(latestUser, 600),
+            timeoutMs: settings.hookRecallTimeoutMs || DEFAULTS.hookRecallTimeoutMs,
+            preRecallMs,
+            recallBudgetMs,
+            emergencyAttempted: true,
+            emergencyRecovered: false
+          };
+          refreshLastRecallPanel();
+          opLog('before_recall_deadline', Runtime.lastRecall, 'warn');
+          pushActivityLog('recall_timeout', '리콜 제한시간을 초과했고 긴급 sparse 복구도 실패해 이번 요청은 정적 기억 계약만 유지합니다.', {
+            scopeKey: scope.scopeKey,
+            timeoutMs: settings.hookRecallTimeoutMs || DEFAULTS.hookRecallTimeoutMs,
+            reason: 'recall_deadline',
+            preRecallMs,
+            recallBudgetMs
+          }, 'warn');
+          return injectStableFlashbackPrefix(messages, {
+            liveMessages: liveChat.normalized || [],
+            currentUserResolution: pendingCapture.currentUserResolution
+          });
+        }
+        recall = emergencyRecall;
+        hookDeadlinePhase = 'emergency_render';
+        hookDeadlineAt = Date.now() + Math.max(900, FLASHBACK_EMERGENCY_RECALL_TIMEOUT_MS);
+        opLog('before_recall_emergency_sparse_recovered', {
           scopeKey: scope.scopeKey,
-          skipped: true,
-          reason: 'recall_deadline',
-          latestUser: compact(latestUser, 600),
-          timeoutMs: settings.hookRecallTimeoutMs || DEFAULTS.hookRecallTimeoutMs,
-          preRecallMs,
-          recallBudgetMs
-        };
-        refreshLastRecallPanel();
-        opLog('before_recall_deadline', Runtime.lastRecall, 'warn');
-        pushActivityLog('recall_timeout', '리콜 제한시간을 초과해 이번 요청은 기억 주입 없이 진행합니다.', {
-          scopeKey: scope.scopeKey,
-          timeoutMs: settings.hookRecallTimeoutMs || DEFAULTS.hookRecallTimeoutMs,
-          reason: 'recall_deadline',
+          selected: Array.isArray(recall.records) ? recall.records.length : 0,
+          currentStateFacts: Array.isArray(recall.currentStateFacts) ? recall.currentStateFacts.length : 0,
           preRecallMs,
           recallBudgetMs
         }, 'warn');
-        return injectStableFlashbackPrefix(messages, {
-          liveMessages: liveChat.normalized || [],
-          currentUserResolution: pendingCapture.currentUserResolution
-        });
+        pushActivityLog('recall_emergency_recovered', '정규 리콜 제한시간을 넘겨 최근 실제 U+A 증거를 sparse 방식으로 제한 복구했습니다.', {
+          scopeKey: scope.scopeKey,
+          selected: Array.isArray(recall.records) ? recall.records.length : 0,
+          reason: 'emergency_sparse_recall'
+        }, 'warn');
       }
       recall.stageElapsed = {
         ...(recall.stageElapsed || {}),
@@ -19194,9 +19645,10 @@
         ...settings,
         maxInjectionChars: dynamicAllowedChars
       };
-      const dynamicBlock = budgetedRecallSettings.maxInjectionChars >= 800
-        ? formatFlashbackDynamicEvidenceBlock(recall, budgetedRecallSettings)
-        : '';
+      const evidenceBudgetPlan = budgetedRecallSettings.maxInjectionChars >= 800
+        ? planFlashbackEvidenceBudget(recall, budgetedRecallSettings, dynamicAllowedChars)
+        : { text: '', tier: 'none', targetChars: 0, appliedChars: dynamicAllowedChars, actualChars: 0, attempts: [], pressure: null, contextConstrained: true };
+      const dynamicBlock = evidenceBudgetPlan.text || '';
       ensureHookDeadline('beforeRequest evidence rendering');
       recall.stageElapsed = { ...(recall.stageElapsed || {}), renderInjection: Date.now() - renderStageStartedAt };
       Runtime.lastRecall = {
@@ -19224,6 +19676,16 @@
         storageForeignScopeKey: recall.storageForeignScopeKey || '',
         storageRecordCountMismatch: recall.storageRecordCountMismatch === true,
         hostInjectionBudget,
+        evidenceBudgetPlan: {
+          tier: evidenceBudgetPlan.tier,
+          targetChars: evidenceBudgetPlan.targetChars,
+          appliedChars: evidenceBudgetPlan.appliedChars,
+          actualChars: evidenceBudgetPlan.actualChars,
+          attempts: evidenceBudgetPlan.attempts,
+          pressure: evidenceBudgetPlan.pressure,
+          contextConstrained: evidenceBudgetPlan.contextConstrained
+        },
+        emergencySparse: recall.emergencySparse === true,
         queryType: recall.queryType || '',
         temporalIntent: recall.temporalIntent || '',
         truthIntent: recall.truthIntent || '',
@@ -23473,6 +23935,14 @@ ${cleanedText}`, 80),
   publicApi._test.providerSafeInputTokenLimit = providerSafeInputTokenLimit;
   publicApi._test.splitEmbeddingInputByTokenBudget = splitEmbeddingInputByTokenBudget;
   publicApi._test.combineEmbeddingPartVectors = combineEmbeddingPartVectors;
+  publicApi._test.currentStateValidityProfile = currentStateValidityProfile;
+  publicApi._test.applyCurrentStateValidityAging = applyCurrentStateValidityAging;
+  publicApi._test.buildLatentEpisodeCueContext = buildLatentEpisodeCueContext;
+  publicApi._test.latentEpisodeCueScore = latentEpisodeCueScore;
+  publicApi._test.applyLatentEpisodicReactivation = applyLatentEpisodicReactivation;
+  publicApi._test.flashbackEvidencePressureForRenderedBlock = flashbackEvidencePressureForRenderedBlock;
+  publicApi._test.planFlashbackEvidenceBudget = planFlashbackEvidenceBudget;
+  publicApi._test.emergencySparseRecall = emergencySparseRecall;
   publicApi._test.finalizedCaptureCommitSettings = finalizedCaptureCommitSettings;
   publicApi._test.embeddingProfileDescriptor = embeddingProfileDescriptor;
   publicApi._test.embeddingProfileId = embeddingProfileId;
@@ -23607,6 +24077,7 @@ ${cleanedText}`, 80),
         Runtime.queryEmbeddingCache.clear();
         Runtime.queryEmbeddingInFlight.clear();
         Runtime.documentEmbeddingCache.clear();
+        Runtime.latentEpisodeCooldown.clear();
         Runtime.embeddingDiagnostics.length = 0;
         terminateComputeWorker();
         try { await closeGui({ hideContainer: true, removeRoot: true }); } catch (_) {}
