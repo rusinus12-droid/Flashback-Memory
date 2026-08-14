@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.0
+//@display-name ⚡ FLASHBACK Memory v0.11.1
 //@api 3.0
-//@version 0.11.0
+//@version 0.11.1
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,15 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.1
+ *
+ * v0.11.1 hardens turn-worldline reconciliation against transient or incomplete
+ * live-chat snapshots. First-pass quarantine now stays durably in the active shard
+ * while remaining recall-inactive; retirement requires a second distinct observation
+ * that also survives a stability window. Empty live snapshots cannot mass-retire a
+ * non-empty scope, startup performs an exact restore-only pass from the reversible
+ * retired pool, and debug exports now expose request-hook and worldline health.
+ *
  * ⚡ FLASHBACK Memory v0.11.0
  *
  * v0.11.0 ports the parts of HAYAKU 2.4 that strengthen independent episodic
@@ -541,7 +550,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.0';
+  const PLUGIN_VERSION = '0.11.1';
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -615,6 +624,11 @@
   const TURN_WORLDLINE_VERSION = 'flashback_turn_worldline_v1';
   const TURN_WORLDLINE_BINDING_POLICY_VERSION = 3;
   const TURN_WORLDLINE_RETIREMENT_REQUIRED_OBSERVATIONS = 2;
+  // A missing branch must remain missing across both a distinct observation and a
+  // short wall-clock stability window before active records are moved to retired.
+  // Quarantine itself is recall-inactive, so this delay protects durability without
+  // letting a stale branch influence model-facing recall.
+  const TURN_WORLDLINE_RETIREMENT_MIN_STABLE_MS = 6000;
   // Keep at least the default 1,200-response retention horizon plus reroll
   // variants. A smaller cap can sever the still-visible prefix during a long
   // rollback (for example T300 -> T10) and make exact branch restore impossible.
@@ -975,6 +989,7 @@
     lastExternalRetirement: null,
     lastEpisodeIndex: null,
     lastStorageAction: null,
+    lastWorldlineReconciliation: null,
     settingsMigration: null,
     argumentAudit: null,
     argumentOverrides: Object.freeze({}),
@@ -6534,6 +6549,7 @@
       supersededBy: compact(node.supersededBy || '', 96),
       missingObservations: Math.max(0, Number(node.missingObservations || 0) || 0),
       lastMissingObservationHash: compact(node.lastMissingObservationHash || '', 96),
+      missingSinceAt: Math.max(0, Number(node.missingSinceAt || 0) || 0),
       createdAt: Math.max(0, Number(node.createdAt || 0) || 0),
       updatedAt: Math.max(0, Number(node.updatedAt || 0) || 0)
     })).sort((a, b) => a.originalOrdinal - b.originalOrdinal || a.createdAt - b.createdAt).slice(-TURN_WORLDLINE_MAX_NODES);
@@ -10584,8 +10600,9 @@
       return [identity.pairIndex, identity.userHash, identity.assistantHash];
     })
   ));
-  const reconcileFlashbackTurnWorldline = (value, scopeKey, liveState = {}) => {
+  const reconcileFlashbackTurnWorldline = (value, scopeKey, liveState = {}, options = {}) => {
     const previous = normalizeTurnWorldline(value, scopeKey);
+    const allowRetirement = options.allowRetirement !== false;
     const normalizedLive = conversationStateWithIndexes(liveState);
     const liveHash = flashbackLiveWorldlineHash(scopeKey, normalizedLive);
     const observationHash = stableHash(`${liveHash}\n${normalizedLive.observationToken || liveHash}`);
@@ -10613,6 +10630,7 @@
           supersededBy: '',
           missingObservations: 0,
           lastMissingObservationHash: '',
+          missingSinceAt: 0,
           createdAt: timestamp,
           updatedAt: timestamp
         };
@@ -10626,6 +10644,7 @@
           supersededBy: '',
           missingObservations: 0,
           lastMissingObservationHash: '',
+          missingSinceAt: 0,
           updatedAt: timestamp
         });
       }
@@ -10644,25 +10663,35 @@
         node.supersededBy = sibling.turnNodeId;
         node.missingObservations = 0;
         node.lastMissingObservationHash = '';
+        node.missingSinceAt = 0;
       } else if (node.status !== 'inactive_variant') {
-        const distinctObservation = !node.lastMissingObservationHash
-          || node.lastMissingObservationHash !== observationHash;
-        const observations = Math.max(
-          1,
-          Number(node.missingObservations || 0) + (distinctObservation ? 1 : 0)
-        );
-        const finalStatus = node.pairIndex > maxPair ? 'orphaned' : 'detached_branch';
-        const alreadyFinal = ['orphaned', 'detached_branch'].includes(node.status);
-        node.status = alreadyFinal
-          ? node.status
-          : observations >= TURN_WORLDLINE_RETIREMENT_REQUIRED_OBSERVATIONS
-            ? finalStatus
-            : 'quarantined';
-        node.supersededBy = '';
-        node.missingObservations = observations;
-        if (distinctObservation) node.lastMissingObservationHash = observationHash;
+        // Restore-only reconciliation may reactivate exact live matches, but must
+        // never demote anything that was not observed in this snapshot.
+        if (allowRetirement) {
+          const distinctObservation = !node.lastMissingObservationHash
+            || node.lastMissingObservationHash !== observationHash;
+          const observations = Math.max(
+            1,
+            Number(node.missingObservations || 0) + (distinctObservation ? 1 : 0)
+          );
+          const missingSinceAt = Math.max(0, Number(node.missingSinceAt || 0) || timestamp);
+          const stableMissingMs = Math.max(0, timestamp - missingSinceAt);
+          const finalStatus = node.pairIndex > maxPair ? 'orphaned' : 'detached_branch';
+          const alreadyFinal = ['orphaned', 'detached_branch'].includes(node.status);
+          const retirementConfirmed = observations >= TURN_WORLDLINE_RETIREMENT_REQUIRED_OBSERVATIONS
+            && stableMissingMs >= TURN_WORLDLINE_RETIREMENT_MIN_STABLE_MS;
+          node.status = alreadyFinal
+            ? node.status
+            : retirementConfirmed
+              ? finalStatus
+              : 'quarantined';
+          node.supersededBy = '';
+          node.missingObservations = observations;
+          node.missingSinceAt = missingSinceAt;
+          if (distinctObservation) node.lastMissingObservationHash = observationHash;
+        }
       }
-      node.activeOrdinal = 0;
+      node.activeOrdinal = node.status === 'active' ? node.pairIndex : 0;
       node.updatedAt = timestamp;
     }
     const worldline = normalizeTurnWorldline({
@@ -10780,7 +10809,27 @@
     const normalizedObservedLive = conversationStateWithIndexes(liveState);
     const observedLiveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedObservedLive);
     const manifest = await loadScopeManifest(scope.scopeKey);
-    if (manifest.turnWorldlineLiveHash === observedLiveHash
+    const forceReconcile = options.forceReconcile === true;
+    const allowRetirement = options.allowRetirement !== false;
+    const observedPairCount = Math.max(0, Number(normalizedObservedLive.pairCount || normalizedObservedLive.pairs?.length || 0) || 0);
+    const manifestResponseTurns = Math.max(0, Number(manifest.responseTurnCount || 0) || 0);
+    const manifestChatMessages = Math.max(0, Number(manifest.chatMessageCount || 0) || 0);
+    // An empty-but-structurally-readable host snapshot can occur transiently while
+    // RisuAI swaps chat state. Never interpret that one frame as a rollback to T0.
+    if (allowRetirement && observedPairCount === 0 && (manifestResponseTurns > 0 || manifestChatMessages > 1)) {
+      const guarded = {
+        changed: false,
+        reason: 'worldline_empty_snapshot_guard',
+        liveHash: observedLiveHash,
+        observedPairCount,
+        manifestResponseTurns,
+        manifestChatMessages
+      };
+      Runtime.lastWorldlineReconciliation = { at: Date.now(), scopeKey: scope.scopeKey, ...guarded };
+      opLog('worldline_empty_snapshot_guard', { scopeKey: scope.scopeKey, ...guarded }, 'warn');
+      return guarded;
+    }
+    if (!forceReconcile && manifest.turnWorldlineLiveHash === observedLiveHash
       && manifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION
       && manifest.turnWorldlinePendingRetirement !== true) {
       return { changed: false, reason: 'worldline_current', liveHash: observedLiveHash };
@@ -10802,7 +10851,7 @@
       }
       const normalizedLive = protectedTarget?.state || normalizedObservedLive;
       const liveHash = flashbackLiveWorldlineHash(scope.scopeKey, normalizedLive);
-      if (currentManifest.turnWorldlineLiveHash === liveHash
+      if (!forceReconcile && currentManifest.turnWorldlineLiveHash === liveHash
         && currentManifest.turnWorldlineBindingPolicyVersion >= TURN_WORLDLINE_BINDING_POLICY_VERSION
         && currentManifest.turnWorldlinePendingRetirement !== true) {
         return {
@@ -10817,7 +10866,7 @@
       if (currentManifest.turnWorldlineLiveHash && currentManifest.turnWorldlineLiveHash !== liveHash) {
         abortEmbeddingJobs('worldline_changed');
       }
-      const reconciled = reconcileFlashbackTurnWorldline(storedWorldline, scope.scopeKey, normalizedLive);
+      const reconciled = reconcileFlashbackTurnWorldline(storedWorldline, scope.scopeKey, normalizedLive, { allowRetirement });
       const inheritedResponseMap = new Map();
       const inheritedLineageNodeIds = new Set();
       const inheritedLineageLogicalIds = new Set();
@@ -10897,17 +10946,44 @@
         }
       }
       const newlyRetired = [];
+      const quarantinedResponses = [];
+      const preservedResponses = [];
+      let quarantineRecordChanges = 0;
       for (const group of activeGroups) {
         if (usedActive.has(group.key)) continue;
         const node = nodeById.get(group.turnNodeId) || currentWorldline.nodes.find(candidate => candidate.logicalTurnId === group.logicalTurnId && candidate.variantId === group.variantId);
-        const status = inactiveFlashbackWorldlineStatus(node, 'orphaned');
+        const status = inactiveFlashbackWorldlineStatus(node, allowRetirement ? 'orphaned' : 'active');
+        if (!allowRetirement) {
+          // Restore-only passes may reactivate exact matches from retired storage,
+          // but leave every unmatched active record byte-for-byte in the live commit.
+          preservedResponses.push(...group.records);
+          continue;
+        }
+        if (status === 'quarantined') {
+          // Keep first-pass quarantine in the durable active shard. The lifecycle
+          // gate makes it non-recallable, while an exact later live match can restore
+          // it without depending on the bounded retired-record pool.
+          const annotated = annotateWorldlineRecords(group.records, node, 'quarantined');
+          quarantineRecordChanges += annotated.filter((record, index) => {
+            const previous = group.records[index] || {};
+            return record.turnNodeId !== previous.turnNodeId
+              || record.logicalTurnId !== previous.logicalTurnId
+              || record.variantId !== previous.variantId
+              || record.parentTurnNodeId !== previous.parentTurnNodeId
+              || record.lifecycleStatus !== previous.lifecycleStatus
+              || text(record.retiredAt || '') !== text(previous.retiredAt || '');
+          }).length;
+          quarantinedResponses.push(...annotated);
+          continue;
+        }
         newlyRetired.push(...annotateWorldlineRecords(group.records, node, status));
       }
+      nextResponses.push(...preservedResponses, ...quarantinedResponses);
       const restoredRecordKeys = new Set(nextResponses.map(record => text(record.id || record.hash || '')));
       // A complete live U+A replacement can legitimately have zero byte-equal
-      // record matches. The first observation now moves the unmatched records to
-      // a reversible quarantine instead of aborting capture or deleting data.
-      // A second distinct observation finalizes the branch status.
+      // record matches. The first observation is now a true durable quarantine:
+      // the records stay in the active commit but are recall-inactive. Only a later,
+      // stable confirmed observation moves them into the bounded retired pool.
       const retiredPool = [
         ...timelineRetiredRecords.filter(record => !restoredRecordKeys.has(text(record.id || record.hash || ''))),
         ...newlyRetired
@@ -10915,6 +10991,7 @@
       const responseChanged = recoveredInheritedRecords > 0
         || normalizedInheritedRecords > 0
         || newlyRetired.length > 0
+        || quarantineRecordChanges > 0
         || retiredLifecycleChanges > 0
         || restoredKeys.size > 0
         || activeLineageChanges > 0
@@ -10949,18 +11026,56 @@
         orphanedNodes: worldline.nodes.filter(node => node.status === 'orphaned').length,
         retiredRecords: worldline.retiredRecords.length,
         newlyRetiredRecords: newlyRetired.length,
+        newlyRetiredTurns: [...new Set(newlyRetired.map(record => finiteTurnIndex(record)).filter(Boolean))].sort((a, b) => a - b),
+        quarantinedRecords: quarantinedResponses.length,
+        quarantinedTurns: [...new Set(quarantinedResponses.map(record => finiteTurnIndex(record)).filter(Boolean))].sort((a, b) => a - b),
         activeLineageChanges,
         restoredRecords: restoredRecordKeys.size,
+        restoredTurnGroups: restoredKeys.size,
         recoveredInheritedRecords,
         normalizedInheritedRecords,
+        observedPairCount: Number(normalizedLive.pairCount || normalizedLive.pairs?.length || 0) || 0,
+        allowRetirement,
         manifest: savedManifest
       };
     });
+    const rangeForTurns = values => {
+      const turns = (Array.isArray(values) ? values : []).map(Number).filter(value => Number.isFinite(value) && value > 0).sort((a, b) => a - b);
+      return turns.length ? { min: turns[0], max: turns[turns.length - 1], count: turns.length } : null;
+    };
+    Runtime.lastWorldlineReconciliation = {
+      at: Date.now(),
+      scopeKey: scope.scopeKey,
+      reason: result.reason || '',
+      changed: result.changed === true,
+      allowRetirement,
+      observedPairCount: Number(result.observedPairCount || normalizedObservedLive.pairCount || 0) || 0,
+      activeNodes: Number(result.activeNodes || 0) || 0,
+      quarantinedNodes: Number(result.quarantinedNodes || 0) || 0,
+      detachedBranches: Number(result.detachedBranches || 0) || 0,
+      orphanedNodes: Number(result.orphanedNodes || 0) || 0,
+      retiredRecords: Number(result.retiredRecords || 0) || 0,
+      newlyRetiredRecords: Number(result.newlyRetiredRecords || 0) || 0,
+      newlyRetiredTurnRange: rangeForTurns(result.newlyRetiredTurns),
+      quarantinedRecords: Number(result.quarantinedRecords || 0) || 0,
+      quarantinedTurnRange: rangeForTurns(result.quarantinedTurns),
+      restoredRecords: Number(result.restoredRecords || 0) || 0,
+      restoredTurnGroups: Number(result.restoredTurnGroups || 0) || 0,
+      generationTargetProtected: result.generationTargetProtected === true
+    };
     if (result.changed && result.reason === 'worldline_records_reconciled') {
       scheduleEpisodeIndexRebuild(scope, cfg, { reason: 'turn_worldline_reconcile', force: true });
       invalidateGuiDataCache('all');
+      if (Number(result.quarantinedRecords || 0) > 0) {
+        pushActivityLog('worldline_quarantine', '분기 불일치 기억을 삭제하지 않고 안전 격리했습니다.', {
+          scopeKey: scope.scopeKey,
+          stored: result.quarantinedRecords,
+          turnIndex: Number(result.quarantinedTurns?.[0] || 0) || 0,
+          reason: 'awaiting_stable_worldline_confirmation'
+        }, 'warn');
+      }
       if (Number(result.newlyRetiredRecords || 0) > 0) {
-        pushActivityLog('orphan_memory_cleaned', '고아 메모리를 정리했습니다.', {
+        pushActivityLog('orphan_memory_retired', '안정적으로 확인된 비활성 분기 기억을 retired 보관소로 이동했습니다.', {
           scopeKey: scope.scopeKey,
           retiredRecords: result.newlyRetiredRecords,
           inactiveVariants: result.inactiveVariants,
@@ -23641,6 +23756,40 @@ ${cleanedText}`, 80),
     embeddingKey: undefined
   });
 
+  const debugWorldlineSnapshot = async (scope = {}) => {
+    if (!scope?.scopeKey) return null;
+    const worldline = await loadTurnWorldline(scope.scopeKey).catch(() => emptyTurnWorldline(scope.scopeKey));
+    const counts = { active: 0, quarantined: 0, inactiveVariant: 0, detachedBranch: 0, orphaned: 0 };
+    for (const node of Array.isArray(worldline.nodes) ? worldline.nodes : []) {
+      if (node.status === 'active') counts.active += 1;
+      else if (node.status === 'quarantined') counts.quarantined += 1;
+      else if (node.status === 'inactive_variant') counts.inactiveVariant += 1;
+      else if (node.status === 'detached_branch') counts.detachedBranch += 1;
+      else if (node.status === 'orphaned') counts.orphaned += 1;
+    }
+    const retiredGroups = responseGroupsForWorldline(worldline.retiredRecords || []);
+    const retiredTurns = [...new Set(retiredGroups.map(group => Number(group.turnIndex || 0)).filter(Boolean))].sort((a, b) => a - b);
+    const quarantinedTurns = (worldline.nodes || []).filter(node => node.status === 'quarantined').map(node => Number(node.pairIndex || 0)).filter(Boolean).sort((a, b) => a - b);
+    const range = values => values.length ? { min: values[0], max: values[values.length - 1], count: values.length } : null;
+    return {
+      revision: Number(worldline.revision || 0) || 0,
+      liveHash: text(worldline.liveHash || ''),
+      headTurnNodeId: text(worldline.headTurnNodeId || ''),
+      nodeCount: Array.isArray(worldline.nodes) ? worldline.nodes.length : 0,
+      nodeStatus: counts,
+      retiredRecords: Array.isArray(worldline.retiredRecords) ? worldline.retiredRecords.length : 0,
+      retiredResponseTurns: retiredTurns.length,
+      retiredTurnRange: range(retiredTurns),
+      quarantinedTurnRange: range(quarantinedTurns),
+      retirementPolicy: {
+        requiredObservations: TURN_WORLDLINE_RETIREMENT_REQUIRED_OBSERVATIONS,
+        minStableMs: TURN_WORLDLINE_RETIREMENT_MIN_STABLE_MS,
+        quarantineStoredInActiveShard: true
+      },
+      lastReconciliation: Runtime.lastWorldlineReconciliation ? cloneRuntimeValue(Runtime.lastWorldlineReconciliation, null) : null
+    };
+  };
+
   const debugState = async () => {
     const settings = await loadSettings(true);
     const scope = await resolveCurrentScope(false);
@@ -23648,6 +23797,7 @@ ${cleanedText}`, 80),
     Runtime.effectiveSettings = effectiveSettings;
     syncFlashbackRuntimeState(settings, scope);
     const snapshot = await debugScopeStatsSnapshot(scope);
+    const worldline = await debugWorldlineSnapshot(scope);
     const operationLogs = await flushOperationLogs();
     const embeddingKeyPersistence = await inspectEmbeddingKeyPersistence({ includeArgument: true });
     return {
@@ -23657,6 +23807,7 @@ ${cleanedText}`, 80),
       runtime: FlashbackRuntimeState.snapshot(),
       scope,
       manifest: snapshot.manifest,
+      worldline,
       records: Number(snapshot.stats?.recordTotal || 0) || 0,
       stats: snapshot.stats,
       lastRecall: Runtime.lastRecall,
@@ -23750,7 +23901,19 @@ ${cleanedText}`, 80),
           manualEditor: !!Runtime.guiManualEditorDataCache
         }
       },
-      registered: { setting: !!Runtime.registered.setting, action: !!Runtime.registered.button, hamburger: !!Runtime.registered.hamburgerButton, chat: !!Runtime.registered.chatButton, autoOpenScheduled: !!Runtime.autoOpenScheduled },
+      registered: {
+        setting: !!Runtime.registered.setting,
+        action: !!Runtime.registered.button,
+        hamburger: !!Runtime.registered.hamburgerButton,
+        chat: !!Runtime.registered.chatButton,
+        autoOpenScheduled: !!Runtime.autoOpenScheduled,
+        requestHooks: {
+          beforeRequest: Runtime.replacersRegistered.before === true,
+          afterRequest: Runtime.replacersRegistered.after === true,
+          callbacksPresent: typeof Runtime.registered.before === 'function' && typeof Runtime.registered.after === 'function',
+          retryScheduled: Runtime.requestHookRetryScheduled === true
+        }
+      },
       operationLogs,
       operationLogError: Runtime.lastOperationLogError || '',
       warnings: Runtime.warnings.slice(-20)
@@ -23878,7 +24041,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.resolvePendingCaptureJournalMode = resolvePendingCaptureJournalMode;
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
@@ -24010,8 +24173,24 @@ ${cleanedText}`, 80),
       Promise.resolve().then(async () => {
         const snapshot = await loadRisuSnapshot(false);
         const scope = applyCurrentScope(resolveScopeFromSnapshot(snapshot));
+        const live = liveChatReadState(snapshot.chat || {});
+        if (live.known && live.normalized.length) {
+          const liveState = liveChatStateFromNormalized(live.normalized);
+          const restored = await synchronizeFlashbackTurnWorldline(scope, liveState, Runtime.settings, {
+            allowRetirement: false,
+            forceReconcile: true,
+            reason: 'startup_restore_only'
+          });
+          if (Number(restored?.restoredRecords || 0) > 0) {
+            pushActivityLog('worldline_startup_restored', '기존 retired 보관소에서 현재 대화와 정확히 일치하는 기억을 복구했습니다.', {
+              scopeKey: scope.scopeKey,
+              stored: Number(restored.restoredRecords || 0) || 0,
+              reason: 'startup_exact_restore_only'
+            }, 'success');
+          }
+        }
         await scheduleLegacyGlobalMigration(scope, Runtime.settings);
-      }).catch(error => warn('legacy response migration scheduling failed', error));
+      }).catch(error => warn('startup worldline restore / legacy migration scheduling failed', error));
     }, 4500);
 
     Runtime.registered.before = beforeRequest;
