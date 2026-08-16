@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.1
+//@display-name ⚡ FLASHBACK Memory v0.11.2
 //@api 3.0
-//@version 0.11.1
+//@version 0.11.2
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,16 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.2
+ *
+ * v0.11.2 makes embedding credentials survive host-specific plugin update and
+ * reinstall paths by maintaining three verified copies: the declared
+ * embedding_key plugin argument, a save-synced pluginStorage backup, and the
+ * existing device-local plugin cache. Startup reconciles whichever copy
+ * survives without changing the selected provider, model, endpoint, or vector
+ * dimensions. Maintenance performs a one-vector remote preflight and never
+ * commits hash fallback vectors over an existing remote-provider corpus.
+ *
  * ⚡ FLASHBACK Memory v0.11.1
  *
  * v0.11.1 hardens turn-worldline reconciliation against transient or incomplete
@@ -407,7 +417,7 @@
     }
     const knownMethods = [
       'registerSetting', 'registerButton', 'showContainer', 'hideContainer',
-      'addRisuReplacer', 'removeRisuReplacer', 'onUnload', 'getArgument', 'getArg',
+      'addRisuReplacer', 'removeRisuReplacer', 'onUnload', 'getArgument', 'getArg', 'setArgument', 'setArg',
       'getCharacter', 'getChar', 'getDatabase', 'getCurrentCharacterIndex',
       'getCurrentChatIndex', 'getChatFromIndex', 'getLocalPluginStorage',
       'nativeFetch', 'risuFetch'
@@ -550,7 +560,10 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.1';
+  const PLUGIN_VERSION = '0.11.2';
+  const EMBEDDING_KEY_ARGUMENT = 'embedding_key';
+  const EMBEDDING_CREDENTIAL_SCHEMA = 'flashback_memory.embedding_credential.v3';
+  const EMBEDDING_CREDENTIAL_VERSION = 3;
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
@@ -613,6 +626,7 @@
     maintenanceJournal: `${PLUGIN_STORAGE_ID}:maintenance_journal:v1`,
     pendingCaptureJournal: `${PLUGIN_STORAGE_ID}:pending_capture_journal:v1`,
     localSecret: `${PLUGIN_STORAGE_ID}:embedding_secret:v2`,
+    syncedSecret: `${PLUGIN_STORAGE_ID}:embedding_secret_synced:v1`,
     legacyManifest: `${PLUGIN_STORAGE_ID}:manifest:v1`,
     legacyShardPrefix: `${PLUGIN_STORAGE_ID}:records:shard:`,
     legacyMigration: `${PLUGIN_STORAGE_ID}:legacy_migration:v2`
@@ -1004,6 +1018,7 @@
     activityLog: [],
     maintenanceJournal: null,
     maintenanceActiveOperationId: '',
+    lastMaintenanceEmbeddingPreflight: null,
     sessionEmbeddingKey: '',
     embeddingKeyPersistence: Object.freeze({
       requested: false,
@@ -1013,7 +1028,14 @@
       saveSucceeded: false,
       verified: false,
       source: 'none',
-      reason: 'not_checked'
+      effectiveSource: 'none',
+      durableAcrossUpdate: false,
+      recoveredFrom: '',
+      conflict: false,
+      reason: 'not_checked',
+      argument: Object.freeze({ backend: 'pluginArgument', available: false, readable: false, writable: false, removable: false, present: false, verified: false, sourceKey: '', reason: 'not_checked' }),
+      synced: Object.freeze({ backend: 'pluginStorage', available: false, readable: false, writable: false, removable: false, present: false, verified: false, reason: 'not_checked' }),
+      local: Object.freeze({ backend: 'unknown', available: false, readable: false, writable: false, removable: false, present: false, verified: false, reason: 'not_checked' })
     }),
     warnings: [],
     registered: { before: null, after: null, setting: null, button: null, hamburgerButton: null, chatButton: null },
@@ -2529,6 +2551,14 @@
     return PROVIDER_CHOICES.includes(raw) ? raw : DEFAULTS.embeddingProvider;
   };
 
+  const EMBEDDING_CREDENTIAL_REQUIRED_PROVIDERS = Object.freeze(new Set([
+    'openai', 'voyageai', 'voyage_context', 'gemini', 'gemini-embedding',
+    'cohere', 'jina', 'mistral', 'bedrock', 'dashscope', 'vertex', 'vertex-embedding'
+  ]));
+
+  const providerRequiresEmbeddingCredential = provider => EMBEDDING_CREDENTIAL_REQUIRED_PROVIDERS.has(normalizeProvider(provider));
+
+
   const ollamaModelBaseName = (model = '') => {
     const raw = text(model || '').trim().toLowerCase().replace(/@sha256:[a-f0-9]+$/i, '');
     if (!raw) return '';
@@ -3239,24 +3269,94 @@
     } catch (_) { return false; }
   }
 
+  const argumentKeyCandidates = name => [name, `${PLUGIN_SLUG}::${name}`, `${PLUGIN_STORAGE_ID}::${name}`];
+
+  const readPluginArgumentExact = async (key) => {
+    const candidates = [getLiveApi(['getArgument']), getLiveApi(['getArg']), getLiveApi()].filter(Boolean);
+    const seen = new Set();
+    for (const api of candidates) {
+      if (seen.has(api)) continue;
+      seen.add(api);
+      const readers = [];
+      if (typeof api?.getArgument === 'function') readers.push(api.getArgument.bind(api));
+      if (typeof api?.getArg === 'function' && api.getArg !== api.getArgument) readers.push(api.getArg.bind(api));
+      for (const reader of readers) {
+        try {
+          const value = await reader(key);
+          if (value !== undefined && value !== null) return value;
+        } catch (_) {}
+      }
+    }
+    return undefined;
+  };
+
   const getArgument = async (name, fallback = '') => {
-    const names = [name, `${PLUGIN_SLUG}::${name}`, `${PLUGIN_STORAGE_ID}::${name}`];
-    for (const key of names) {
-      const argApi = getLiveApi(['getArgument']) || getLiveApi(['getArg']) || getLiveApi();
-      try {
-        if (typeof argApi?.getArgument === 'function') {
-          const value = await argApi.getArgument(key);
-          if (value !== undefined && value !== null && value !== '') return value;
-        }
-      } catch (_) {}
-      try {
-        if (typeof argApi?.getArg === 'function') {
-          const value = await argApi.getArg(key);
-          if (value !== undefined && value !== null && value !== '') return value;
-        }
-      } catch (_) {}
+    for (const key of argumentKeyCandidates(name)) {
+      const value = await readPluginArgumentExact(key);
+      if (value !== undefined && value !== null && value !== '') return value;
     }
     return fallback;
+  };
+
+  const setPluginArgumentValue = async (name, value) => {
+    const clean = value == null ? '' : String(value);
+    const apiCandidates = [getLiveApi(['setArgument']), getLiveApi(['setArg']), getLiveApi()].filter(Boolean);
+    const writers = [];
+    const seenApis = new Set();
+    for (const api of apiCandidates) {
+      if (seenApis.has(api)) continue;
+      seenApis.add(api);
+      if (typeof api?.setArgument === 'function') writers.push({ api, method: 'setArgument', fn: api.setArgument.bind(api) });
+      if (typeof api?.setArg === 'function' && api.setArg !== api.setArgument) writers.push({ api, method: 'setArg', fn: api.setArg.bind(api) });
+    }
+    const keys = argumentKeyCandidates(name);
+    if (!writers.length) {
+      const current = text(await getArgument(name, '') || '').trim();
+      return { ok: clean ? current === clean : !current, attempted: false, verified: clean ? current === clean : !current, key: '', method: '', reason: 'argument_write_unavailable' };
+    }
+
+    if (!clean) {
+      let attempted = false;
+      let lastError = '';
+      for (const key of keys) {
+        for (const writer of writers) {
+          try {
+            const result = await writer.fn(key, '');
+            if (result === false) continue;
+            attempted = true;
+          } catch (error) {
+            lastError = formatErrorMessage(error, 300);
+          }
+        }
+      }
+      const remaining = text(await getArgument(name, '') || '').trim();
+      return {
+        ok: !remaining && attempted,
+        attempted,
+        verified: !remaining,
+        key: '',
+        method: writers[0]?.method || '',
+        reason: !remaining ? (attempted ? 'argument_cleared' : 'argument_already_blank') : 'argument_clear_verify_failed',
+        error: lastError
+      };
+    }
+
+    let lastError = '';
+    for (const key of keys) {
+      for (const writer of writers) {
+        try {
+          const result = await writer.fn(key, clean);
+          if (result === false) continue;
+          const exact = text(await readPluginArgumentExact(key) || '').trim();
+          if (exact === clean) return { ok: true, attempted: true, verified: true, key, method: writer.method, reason: 'argument_saved_and_verified' };
+          const generic = text(await getArgument(name, '') || '').trim();
+          if (generic === clean) return { ok: true, attempted: true, verified: true, key, method: writer.method, reason: 'argument_saved_and_verified' };
+        } catch (error) {
+          lastError = formatErrorMessage(error, 300);
+        }
+      }
+    }
+    return { ok: false, attempted: true, verified: false, key: '', method: '', reason: 'argument_save_verify_failed', error: lastError };
   };
 
   const NUMERIC_ARGUMENT_NAMES = Object.freeze(new Set([
@@ -3742,159 +3842,495 @@
     return normalized;
   };
 
-  const storedEmbeddingKeyValue = (value) => {
-    if (value && typeof value === 'object' && value.key) return text(value.key).trim();
-    if (typeof value === 'string' && value.trim()) return value.trim();
-    return '';
+  const storedEmbeddingCredentialMeta = (value) => {
+    let parsed = value;
+    if (typeof value === 'string' && value.trim()) parsed = tryJsonParse(value, value);
+    const key = parsed && typeof parsed === 'object' && parsed.key
+      ? text(parsed.key).trim()
+      : (typeof parsed === 'string' ? parsed.trim() : '');
+    const savedAt = parsed && typeof parsed === 'object' ? text(parsed.savedAt || '').trim() : '';
+    return {
+      key,
+      keyHash: parsed && typeof parsed === 'object' ? text(parsed.keyHash || '').trim() : '',
+      savedAt,
+      savedAtMs: savedAt ? Math.max(0, Date.parse(savedAt) || 0) : 0,
+      version: parsed && typeof parsed === 'object' ? Math.max(0, Number(parsed.version || 0) || 0) : 0
+    };
   };
 
+  const storedEmbeddingKeyValue = value => storedEmbeddingCredentialMeta(value).key;
+
+  const embeddingCredentialEnvelope = (key = '') => ({
+    schema: EMBEDDING_CREDENTIAL_SCHEMA,
+    version: EMBEDDING_CREDENTIAL_VERSION,
+    savedAt: nowIso(),
+    providerHint: normalizeProvider(Runtime.settings?.embeddingProvider || DEFAULTS.embeddingProvider),
+    keyHash: key ? stableHash(key) : '',
+    key: text(key || '').trim()
+  });
+
+  const embeddingArgumentBackendState = async () => {
+    const candidates = getApiCandidates();
+    const readable = candidates.some(api => typeof api?.getArgument === 'function' || typeof api?.getArg === 'function');
+    const writable = candidates.some(api => typeof api?.setArgument === 'function' || typeof api?.setArg === 'function');
+    let value = '';
+    let sourceKey = '';
+    if (readable) {
+      for (const key of argumentKeyCandidates(EMBEDDING_KEY_ARGUMENT)) {
+        const candidate = text(await readPluginArgumentExact(key) || '').trim();
+        if (!candidate) continue;
+        value = candidate;
+        sourceKey = key;
+        break;
+      }
+    }
+    return {
+      value,
+      backend: 'pluginArgument',
+      available: readable || writable,
+      readable,
+      writable,
+      removable: writable,
+      present: !!value,
+      verified: !!value && readable,
+      sourceKey,
+      reason: !readable && !writable ? 'argument_api_unavailable' : (value ? 'argument_key_available' : 'argument_key_missing')
+    };
+  };
+
+  const embeddingSyncedBackendState = async () => {
+    const storeApi = getLiveApi();
+    const readable = typeof storeApi?.pluginStorage?.getItem === 'function';
+    const writable = typeof storeApi?.pluginStorage?.setItem === 'function';
+    const removable = typeof storeApi?.pluginStorage?.removeItem === 'function' || writable;
+    let raw = null;
+    let readError = '';
+    if (readable) {
+      try { raw = await RisuCompat.getItem(STORAGE.syncedSecret); }
+      catch (error) { readError = formatErrorMessage(error, 300); }
+    }
+    const credential = storedEmbeddingCredentialMeta(raw);
+    const value = credential.key;
+    return {
+      value,
+      savedAt: credential.savedAt,
+      savedAtMs: credential.savedAtMs,
+      keyHash: credential.keyHash,
+      credentialVersion: credential.version,
+      backend: 'pluginStorage',
+      available: readable || writable,
+      readable,
+      writable,
+      removable,
+      present: !!value,
+      verified: !!value && readable && !readError,
+      reason: readError ? 'synced_key_read_failed' : (!readable && !writable ? 'synced_storage_unavailable' : (value ? 'synced_key_available' : 'synced_key_missing')),
+      error: readError
+    };
+  };
+
+  const embeddingLocalBackendState = async () => {
+    const storage = await RisuCompat.localStorageStatus();
+    const raw = storage.readable ? await RisuCompat.localGetItem(STORAGE.localSecret) : null;
+    const credential = storedEmbeddingCredentialMeta(raw);
+    const value = credential.key;
+    return {
+      value,
+      savedAt: credential.savedAt,
+      savedAtMs: credential.savedAtMs,
+      keyHash: credential.keyHash,
+      credentialVersion: credential.version,
+      backend: text(storage.backend || 'unavailable'),
+      available: !!storage.available,
+      readable: !!storage.readable,
+      writable: !!storage.writable,
+      removable: !!storage.removable,
+      present: !!value,
+      verified: !!value && !!storage.readable,
+      reason: !storage.available ? 'local_storage_unavailable' : (value ? 'local_key_available' : 'local_key_missing')
+    };
+  };
+
+  const publicEmbeddingBackendState = (state = {}, fallbackBackend = 'unknown') => Object.freeze({
+    backend: text(state?.backend || fallbackBackend),
+    available: !!state?.available,
+    readable: !!state?.readable,
+    writable: !!state?.writable,
+    removable: !!state?.removable,
+    present: !!state?.present,
+    verified: !!state?.verified,
+    sourceKey: text(state?.sourceKey || ''),
+    savedAt: text(state?.savedAt || ''),
+    reason: text(state?.reason || ''),
+    error: text(state?.error || '')
+  });
+
   const setEmbeddingKeyPersistenceStatus = (status = {}) => {
+    const argument = publicEmbeddingBackendState(status.argument || {}, 'pluginArgument');
+    const synced = publicEmbeddingBackendState(status.synced || {}, 'pluginStorage');
+    const local = publicEmbeddingBackendState(status.local || {}, 'unavailable');
+    const durable = status.durableAcrossUpdate != null
+      ? !!status.durableAcrossUpdate
+      : !!(argument.verified || synced.verified);
     Runtime.embeddingKeyPersistence = Object.freeze({
       requested: !!status.requested,
-      backend: text(status.backend || 'unavailable'),
-      available: !!status.available,
+      backend: text(status.backend || [argument.verified ? 'pluginArgument' : '', synced.verified ? 'pluginStorage' : '', local.verified ? local.backend : ''].filter(Boolean).join('+') || 'unavailable'),
+      available: status.available != null ? !!status.available : !!(argument.available || synced.available || local.available),
       keyPresent: !!status.keyPresent,
       saveSucceeded: !!status.saveSucceeded,
       verified: !!status.verified,
-      source: text(status.source || 'none'),
-      reason: text(status.reason || '')
+      source: text(status.source || status.effectiveSource || 'none'),
+      effectiveSource: text(status.effectiveSource || status.source || 'none'),
+      durableAcrossUpdate: durable,
+      recoveredFrom: text(status.recoveredFrom || ''),
+      conflict: !!status.conflict,
+      reason: text(status.reason || ''),
+      argument,
+      synced,
+      local
     });
     return Runtime.embeddingKeyPersistence;
   };
 
   const embeddingKeyPersistenceError = (code, message, status = {}) => {
-    setEmbeddingKeyPersistenceStatus({ ...status, saveSucceeded: false, verified: false, reason: code.toLowerCase() });
+    const persistence = setEmbeddingKeyPersistenceStatus({ ...status, saveSucceeded: false, reason: code.toLowerCase() });
     const error = new Error(message);
     error.code = code;
+    error.persistence = persistence;
     return error;
   };
 
-  const inspectEmbeddingKeyPersistence = async ({ includeArgument = false } = {}) => {
-    const storage = await RisuCompat.localStorageStatus();
-    const localValue = storage.readable
-      ? await RisuCompat.localGetItem(STORAGE.localSecret)
-      : null;
-    const localKeyPresent = !!storedEmbeddingKeyValue(localValue);
-    const argumentKeyPresent = includeArgument
-      ? !!text(await getArgument('embedding_key', '') || '').trim()
-      : false;
-    const source = Runtime.sessionEmbeddingKey
-      ? (Runtime.embeddingKeyPersistence?.source === 'local' ? 'local' : 'session')
-      : (localKeyPresent ? 'local' : (argumentKeyPresent ? 'argument' : 'none'));
+  const credentialBackendMatches = (state = {}, key = '') => !!(
+    key && state?.verified && text(state?.value || '').trim() === key
+  );
+
+  const credentialSourceFor = (argument, synced, local, key = '') => {
+    const sources = [];
+    if (credentialBackendMatches(argument, key)) sources.push('argument');
+    if (credentialBackendMatches(synced, key)) sources.push('synced');
+    if (credentialBackendMatches(local, key)) sources.push('local');
+    return sources.length ? sources.join('+') : (key ? 'session' : 'none');
+  };
+
+  const selectEmbeddingCredential = (argument = {}, synced = {}, local = {}) => {
+    const entries = [
+      { backend: 'argument', state: argument, durable: true, preference: 2 },
+      { backend: 'synced', state: synced, durable: true, preference: 3 },
+      { backend: 'local', state: local, durable: false, preference: 1 }
+    ].filter(entry => text(entry.state?.value || '').trim());
+    if (!entries.length) return { key: '', origin: 'none', reason: 'stored_key_missing', conflict: false };
+
+    const groups = new Map();
+    for (const entry of entries) {
+      const key = text(entry.state.value).trim();
+      if (!groups.has(key)) groups.set(key, { key, entries: [], maxSavedAtMs: 0, preference: 0, durable: false });
+      const group = groups.get(key);
+      group.entries.push(entry);
+      group.maxSavedAtMs = Math.max(group.maxSavedAtMs, Number(entry.state.savedAtMs || 0) || 0);
+      group.preference = Math.max(group.preference, entry.preference);
+      group.durable = group.durable || entry.durable;
+    }
+    const ranked = Array.from(groups.values()).sort((a, b) =>
+      b.entries.length - a.entries.length
+      || Number(b.durable) - Number(a.durable)
+      || b.preference - a.preference
+      || b.maxSavedAtMs - a.maxSavedAtMs
+      || a.key.localeCompare(b.key)
+    );
+    const selected = ranked[0];
+    const order = { argument: 0, synced: 1, local: 2 };
+    const origin = selected.entries.map(entry => entry.backend).sort((a, b) => order[a] - order[b]).join('+');
+    const conflict = groups.size > 1;
+    return {
+      key: selected.key,
+      origin,
+      conflict,
+      reason: !conflict
+        ? 'credential_consensus'
+        : (selected.entries.length >= 2
+          ? 'credential_majority_selected'
+          : (origin === 'synced' ? 'synced_credential_selected' : `${origin}_credential_selected`))
+    };
+  };
+
+  const credentialStatusFromBackends = ({ argument, synced, local, effectiveKey = '', effectiveSource = '', reason = '', recoveredFrom = '', conflict = false, saveSucceeded = null } = {}) => {
+    const key = text(effectiveKey || '').trim();
+    const argumentVerified = credentialBackendMatches(argument, key);
+    const syncedVerified = credentialBackendMatches(synced, key);
+    const localVerified = credentialBackendMatches(local, key);
+    const source = effectiveSource || credentialSourceFor(argument, synced, local, key);
+    const durable = argumentVerified || syncedVerified;
     return setEmbeddingKeyPersistenceStatus({
       requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: localKeyPresent,
-      saveSucceeded: localKeyPresent && !!Runtime.embeddingKeyPersistence?.saveSucceeded,
-      verified: localKeyPresent,
+      argument: { ...argument, verified: argumentVerified },
+      synced: { ...synced, verified: syncedVerified },
+      local: { ...local, verified: localVerified },
+      keyPresent: !!key,
+      verified: !!key && (argumentVerified || syncedVerified || localVerified || source === 'session'),
+      saveSucceeded: saveSucceeded == null ? durable : !!saveSucceeded,
+      effectiveSource: source,
       source,
-      reason: !storage.available ? 'storage_unavailable' : (localKeyPresent ? 'stored_key_available' : 'stored_key_missing')
+      durableAcrossUpdate: durable,
+      recoveredFrom,
+      conflict,
+      reason: reason || (!key
+        ? 'stored_key_missing'
+        : (argumentVerified && syncedVerified && localVerified
+          ? 'credential_verified_all_stores'
+          : (durable ? 'credential_verified_durable_store' : (localVerified ? 'local_key_available_update_risk' : 'session_key_only'))))
     });
   };
 
-  const readEmbeddingKey = async () => {
-    if (Runtime.sessionEmbeddingKey) return Runtime.sessionEmbeddingKey;
-    const storage = await RisuCompat.localStorageStatus();
-    const local = storage.readable ? await RisuCompat.localGetItem(STORAGE.localSecret) : null;
-    const localKey = storedEmbeddingKeyValue(local);
-    if (localKey) {
-      Runtime.sessionEmbeddingKey = localKey;
-      setEmbeddingKeyPersistenceStatus({
-        requested: true,
-        backend: storage.backend,
-        available: storage.available,
-        keyPresent: true,
-        saveSucceeded: Runtime.embeddingKeyPersistence?.saveSucceeded,
-        verified: true,
-        source: 'local',
-        reason: 'stored_key_loaded'
-      });
-      return localKey;
+  const writeEmbeddingKeyLocalBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const before = await embeddingLocalBackendState();
+    if (!clean) {
+      if (!before.present && before.readable) return { ...before, ok: true, verified: true, reason: 'local_key_already_blank' };
+      if (!before.removable) return { ...before, ok: false, verified: false, reason: 'local_key_clear_unavailable' };
+      const removed = await RisuCompat.localRemoveItem(STORAGE.localSecret);
+      const after = await embeddingLocalBackendState();
+      return { ...after, ok: !!removed && !after.present, verified: !!after.readable && !after.present, reason: !after.present ? 'local_key_cleared' : 'local_key_clear_verify_failed' };
     }
-    setEmbeddingKeyPersistenceStatus({
-      requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: false,
-      saveSucceeded: false,
-      verified: false,
-      source: 'none',
-      reason: storage.available ? 'stored_key_missing' : 'storage_unavailable'
+    if (!before.readable || !before.writable) return { ...before, ok: false, verified: false, reason: 'local_key_write_unavailable' };
+    const saved = await RisuCompat.localSetItem(STORAGE.localSecret, embeddingCredentialEnvelope(clean));
+    const after = await embeddingLocalBackendState();
+    return { ...after, ok: !!saved && after.value === clean, verified: !!saved && after.value === clean, reason: after.value === clean ? 'local_key_saved_and_verified' : 'local_key_save_verify_failed' };
+  };
+
+  const writeEmbeddingKeySyncedBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const before = await embeddingSyncedBackendState();
+    if (!clean) {
+      if (!before.present && before.readable) return { ...before, ok: true, verified: true, reason: 'synced_key_already_blank' };
+      if (!before.removable) return { ...before, ok: false, verified: false, reason: 'synced_key_clear_unavailable' };
+      let removed = false;
+      try { removed = await RisuCompat.removeItem(STORAGE.syncedSecret); } catch (_) { removed = false; }
+      const after = await embeddingSyncedBackendState();
+      return { ...after, ok: !!removed && !after.present, verified: !!after.readable && !after.present, reason: !after.present ? 'synced_key_cleared' : 'synced_key_clear_verify_failed' };
+    }
+    if (!before.readable || !before.writable) return { ...before, ok: false, verified: false, reason: 'synced_key_write_unavailable' };
+    let saved = false;
+    try {
+      await requireStorageWrite(STORAGE.syncedSecret, safeStringify(embeddingCredentialEnvelope(clean)), 'synced embedding key save');
+      saved = true;
+    } catch (_) { saved = false; }
+    const after = await embeddingSyncedBackendState();
+    return { ...after, ok: saved && after.value === clean, verified: saved && after.value === clean, reason: after.value === clean ? 'synced_key_saved_and_verified' : 'synced_key_save_verify_failed' };
+  };
+
+  const writeEmbeddingKeyArgumentBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const write = await setPluginArgumentValue(EMBEDDING_KEY_ARGUMENT, clean);
+    const after = await embeddingArgumentBackendState();
+    const verified = clean ? after.value === clean : !after.present;
+    return {
+      ...after,
+      ok: verified && (write.ok || write.reason === 'argument_already_blank'),
+      verified,
+      reason: verified ? (clean ? 'argument_key_saved_and_verified' : 'argument_key_cleared') : (write.reason || 'argument_key_write_failed'),
+      writeAttempted: !!write.attempted,
+      writeMethod: text(write.method || ''),
+      error: text(write.error || '')
+    };
+  };
+
+  const inspectEmbeddingKeyPersistence = async (_options = {}) => {
+    const [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const session = text(Runtime.sessionEmbeddingKey || '').trim();
+    const selected = selectEmbeddingCredential(argument, synced, local);
+    const effectiveKey = session || selected.key;
+    return credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey,
+      effectiveSource: credentialSourceFor(argument, synced, local, effectiveKey),
+      conflict: selected.conflict,
+      reason: !effectiveKey ? 'stored_key_missing' : (selected.conflict ? selected.reason : 'credential_inspected')
     });
-    const argumentKey = text(await getArgument('embedding_key', '') || '').trim();
-    if (argumentKey) {
-      Runtime.sessionEmbeddingKey = argumentKey;
-      try {
-        await saveEmbeddingKeyLocal(argumentKey);
-      } catch (_) {
-        setEmbeddingKeyPersistenceStatus({
-          ...Runtime.embeddingKeyPersistence,
-          requested: true,
-          source: 'argument',
-          reason: 'argument_key_loaded_storage_unavailable'
-        });
+  };
+
+  const readEmbeddingKey = async (options = {}) => {
+    if (Runtime.sessionEmbeddingKey && options.force !== true) return Runtime.sessionEmbeddingKey;
+    let [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const selection = selectEmbeddingCredential(argument, synced, local);
+    const conflict = selection.conflict;
+    const selected = selection.key;
+    const selectedOrigin = selection.origin;
+    const recoveredStores = [];
+
+    if (selected) {
+      // Repair the non-refreshing stores first. Some hosts may reload a plugin when
+      // setArgument mutates metadata, so a synced/local copy must already exist.
+      if (synced.value !== selected) {
+        const repaired = await writeEmbeddingKeySyncedBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('synced');
       }
+      if (local.value !== selected) {
+        const repaired = await writeEmbeddingKeyLocalBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('local');
+      }
+      if (argument.value !== selected) {
+        const repaired = await writeEmbeddingKeyArgumentBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('argument');
+      }
+      [argument, synced, local] = await Promise.all([
+        embeddingArgumentBackendState(),
+        embeddingSyncedBackendState(),
+        embeddingLocalBackendState()
+      ]);
     }
-    return argumentKey;
+
+    Runtime.sessionEmbeddingKey = selected;
+    const finalValues = [argument.value, synced.value, local.value].map(value => text(value || '').trim()).filter(Boolean);
+    const finalConflict = new Set(finalValues).size > 1;
+    const status = credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey: selected,
+      effectiveSource: credentialSourceFor(argument, synced, local, selected),
+      recoveredFrom: recoveredStores.length ? selectedOrigin : '',
+      conflict: finalConflict,
+      reason: !selected
+        ? 'stored_key_missing'
+        : (recoveredStores.length
+          ? `${selection.reason}_reconciled_${recoveredStores.join('_')}`
+          : (finalConflict ? selection.reason : 'credential_loaded')),
+      saveSucceeded: !!selected && (credentialBackendMatches(argument, selected) || credentialBackendMatches(synced, selected))
+    });
+    if (selected && recoveredStores.length) {
+      pushActivityLog('embedding_key_recovered', '저장된 임베딩 키를 복구해 영속 저장소를 다시 맞췄습니다.', {
+        recoveredFrom: selectedOrigin,
+        repairedStores: recoveredStores,
+        durableAcrossUpdate: status.durableAcrossUpdate
+      }, status.durableAcrossUpdate ? 'success' : 'warn');
+    }
+    return selected;
   };
 
+  // Backward-compatible public name. v0.11.2 persists and verifies the current
+  // credential in the plugin argument, save-synced pluginStorage, and the
+  // device-local plugin cache. Provider/model settings are never rewritten here.
   const saveEmbeddingKeyLocal = async (key) => {
     const clean = text(key || '').trim();
     const previous = Runtime.sessionEmbeddingKey;
     if (previous !== clean) abortEmbeddingJobs('credential_changed');
     Runtime.sessionEmbeddingKey = clean;
-    const storage = await RisuCompat.localStorageStatus();
-    const baseStatus = {
-      requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: false,
-      source: clean ? 'session' : 'none'
-    };
 
     if (!clean) {
-      if (!storage.removable) {
-        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_UNAVAILABLE', '임베딩 키 로컬 저장소를 사용할 수 없어 삭제 여부를 확인하지 못했습니다.', baseStatus);
+      await writeEmbeddingKeyLocalBackend('').catch(() => null);
+      await writeEmbeddingKeySyncedBackend('').catch(() => null);
+      await writeEmbeddingKeyArgumentBackend('').catch(() => null);
+      const [argument, synced, local] = await Promise.all([
+        embeddingArgumentBackendState(),
+        embeddingSyncedBackendState(),
+        embeddingLocalBackendState()
+      ]);
+      if (argument.present || synced.present || local.present) {
+        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_FAILED', '임베딩 키를 모든 영속 저장소에서 삭제하지 못했습니다.', {
+          requested: true,
+          argument,
+          synced,
+          local,
+          keyPresent: true,
+          effectiveSource: credentialSourceFor(argument, synced, local, argument.value || synced.value || local.value || ''),
+          reason: 'credential_clear_verify_failed'
+        });
       }
-      const removed = await RisuCompat.localRemoveItem(STORAGE.localSecret);
-      const remaining = storage.readable ? storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret)) : '';
-      if (!removed || remaining) {
-        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_FAILED', '로컬 저장소에서 임베딩 키를 삭제하지 못했습니다.', { ...baseStatus, keyPresent: !!remaining });
-      }
-      return setEmbeddingKeyPersistenceStatus({
-        ...baseStatus,
-        saveSucceeded: true,
-        verified: storage.readable,
-        reason: 'stored_key_cleared'
+      return credentialStatusFromBackends({
+        argument,
+        synced,
+        local,
+        effectiveKey: '',
+        effectiveSource: 'none',
+        reason: 'credential_cleared_all_stores',
+        saveSucceeded: true
       });
     }
 
-    if (!storage.readable || !storage.writable) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_UNAVAILABLE', '임베딩 키를 유지할 로컬 저장소를 사용할 수 없습니다.', baseStatus);
+    // Store non-refreshing copies first, then write the declared argument.
+    await writeEmbeddingKeyLocalBackend(clean).catch(() => null);
+    await writeEmbeddingKeySyncedBackend(clean).catch(() => null);
+    await writeEmbeddingKeyArgumentBackend(clean).catch(() => null);
+    const [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const argumentVerified = credentialBackendMatches(argument, clean);
+    const syncedVerified = credentialBackendMatches(synced, clean);
+    const localVerified = credentialBackendMatches(local, clean);
+    const durable = argumentVerified || syncedVerified;
+    const matchingCopies = [argumentVerified, syncedVerified, localVerified].filter(Boolean).length;
+    const conflictingCopies = [argument, synced, local].filter(state => state?.present && text(state.value || '').trim() !== clean).length;
+    if (!durable) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_DURABILITY_FAILED', '임베딩 키는 현재 세션에 적용됐지만 업데이트 후에도 유지되는 저장소에 기록하지 못했습니다.', {
+        requested: true,
+        argument,
+        synced,
+        local,
+        keyPresent: true,
+        effectiveSource: localVerified ? 'local' : 'session',
+        reason: 'durable_credential_store_unavailable'
+      });
     }
-    const saved = await RisuCompat.localSetItem(STORAGE.localSecret, { savedAt: nowIso(), key: clean });
-    if (!saved) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_FAILED', '임베딩 키 로컬 저장에 실패했습니다.', baseStatus);
+    // Never report a save as durable when one new copy is outvoted by a stale
+    // surviving credential. Two matching copies form a deterministic recovery
+    // majority; one matching durable copy is accepted only when other stores are
+    // blank or unavailable rather than contradictory.
+    if (conflictingCopies > 0 && matchingCopies < 2) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_CONFLICT', '임베딩 키는 한 저장소에 기록됐지만 이전 키가 다른 저장소에 남아 있어 업데이트 후 복구 값을 확정할 수 없습니다. 다시 저장해 주세요.', {
+        requested: true,
+        argument: { ...argument, verified: argumentVerified },
+        synced: { ...synced, verified: syncedVerified },
+        local: { ...local, verified: localVerified },
+        keyPresent: true,
+        effectiveSource: credentialSourceFor(argument, synced, local, clean),
+        conflict: true,
+        reason: 'credential_save_conflict_unresolved'
+      });
     }
-    const verifiedKey = storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret));
-    if (verifiedKey !== clean) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_VERIFY_FAILED', '임베딩 키 저장 후 재조회 검증에 실패했습니다.', baseStatus);
-    }
-    return setEmbeddingKeyPersistenceStatus({
-      ...baseStatus,
-      keyPresent: true,
-      saveSucceeded: true,
-      verified: true,
-      source: 'local',
-      reason: 'saved_and_verified'
+    const status = credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey: clean,
+      effectiveSource: credentialSourceFor(argument, synced, local, clean),
+      reason: argumentVerified && syncedVerified && localVerified
+        ? 'credential_saved_and_verified_all_stores'
+        : 'credential_saved_and_verified_durable_store',
+      saveSucceeded: true
     });
+    if (!argumentVerified || !syncedVerified || !localVerified) {
+      warn('embedding key saved with partial backend availability', {
+        argumentVerified,
+        syncedVerified,
+        localVerified
+      });
+    }
+    return status;
   };
+
+  const saveEmbeddingCredential = saveEmbeddingKeyLocal;
 
   const embeddingKeyPersistenceStatusText = () => {
     const status = Runtime.embeddingKeyPersistence || {};
-    if (status.verified && status.keyPresent) return `키 유지 확인됨 · ${status.backend}`;
-    if (!status.available) return '키 유지 실패 · 사용할 수 있는 로컬 저장소가 없습니다.';
+    if (status.keyPresent && status.argument?.verified && status.synced?.verified && status.local?.verified) return '키 유지 확인됨 · 설정 + 동기화 백업 + 로컬';
+    if (status.keyPresent && status.synced?.verified && status.local?.verified) return '키 유지 확인됨 · 동기화 백업 + 로컬';
+    if (status.keyPresent && status.argument?.verified && status.local?.verified) return '키 유지 확인됨 · 플러그인 설정 + 로컬';
+    if (status.keyPresent && status.synced?.verified) return '키 유지 확인됨 · 동기화 백업';
+    if (status.keyPresent && status.argument?.verified) return '키 유지 확인됨 · 플러그인 설정';
+    if (status.keyPresent && status.local?.verified) return '키는 현재 기기에만 저장됨 · 업데이트 후 유실 위험';
+    if (!status.available) return '키 유지 실패 · 사용할 수 있는 저장소가 없습니다.';
     return '키 유지 대기 · 키를 입력하고 저장해 주세요.';
   };
 
@@ -4455,10 +4891,11 @@
     Runtime.embeddingControllers.clear();
     Runtime.embeddingActiveRequests.clear();
     Runtime.queryEmbeddingInFlight.clear();
-    if (reason === 'settings_changed') {
+    if (reason === 'settings_changed' || reason === 'credential_changed') {
       const invalidatedQueries = Runtime.queryEmbeddingCache.size;
       Runtime.queryEmbeddingCache.clear();
       Runtime.documentEmbeddingCache.clear();
+      Runtime.lastMaintenanceEmbeddingPreflight = null;
       if (invalidatedQueries) Runtime.queryEmbeddingCacheStats.invalidations += invalidatedQueries;
     }
     return Runtime.embeddingGeneration;
@@ -5403,13 +5840,14 @@
     const startedAt = Date.now();
     Runtime.lastEmbedUsedFallback = false;
     Runtime.lastEmbedError = '';
+    const allowHashFallback = options.allowHashFallback !== false && cfg.fallbackHashEmbedding === true;
     try {
       const result = await createEmbeddingProviderAdapter(cfg).embedTexts(list, { ...options, purpose: options.purpose || (options.taskType === 'query' ? 'query' : 'document') });
       return tagEmbeddingVectorsExtended(result.vectors, result, false);
     } catch (rawError) {
       const error = classifyEmbeddingError(rawError, { provider: cfg.embeddingProvider });
-      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: Math.max(0, Date.now() - startedAt), cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: cfg.fallbackHashEmbedding === true });
-      if (!cfg.fallbackHashEmbedding || error.type === 'ABORTED') throw error;
+      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: Math.max(0, Date.now() - startedAt), cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: allowHashFallback });
+      if (!allowHashFallback || error.type === 'ABORTED') throw error;
       warn('embedding endpoint failed; using hash fallback for all texts (dimension drift guard)', error);
       Runtime.lastEmbedUsedFallback = true;
       Runtime.lastEmbedError = sanitizeEmbeddingErrorMessage(error.message || error.type);
@@ -10106,6 +10544,7 @@
         purpose: 'document',
         contextGroupIds: missingIndexes.map(index => text(drafts[index]?.sourceHash || drafts[index]?.sourceId || `draft:${index}`)),
         concurrency: cfg.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        allowHashFallback: options.allowHashFallback !== false,
         onProgress: options.onProgress
       })
       : tagEmbeddingVectors([], false);
@@ -11750,6 +12189,7 @@
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(true));
     const records = await buildRecordsFromSources(sourceList, cfg, scope, {
       reuseRecords: options.reuseRecords,
+      allowHashFallback: options.allowHashFallback !== false,
       onProgress: options.onProgress
     });
     const embeddingStats = records.flashbackEmbeddingStats || {};
@@ -11846,6 +12286,7 @@
           skipGuiRefresh: true,
           replaceTurnPair: true,
           reuseRecords: loadedAfterSync.records,
+          allowHashFallback: options.allowHashFallback !== false,
           onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '동기화')
         })
         : { sources: 0, chunks: 0, inserted: 0, updated: 0, deduped: 0, total: loadedAfterSync.records.length, embeddingCost: null };
@@ -11941,6 +12382,7 @@
     const rebuildSettings = { ...settings, maxResponseItems: Number.MAX_SAFE_INTEGER };
     const records = await buildRecordsFromSources(sources, rebuildSettings, scope, {
       reuseRecords: previous.records,
+      allowHashFallback: options.allowHashFallback !== false,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '재구축')
     });
     if (!records.length) throw new Error('현재 채팅에서 재구축 가능한 응답 기억을 만들지 못했습니다.');
@@ -20328,6 +20770,7 @@
       purpose: 'document',
       contextGroupIds: next.map((record, index) => text(record.sourceHash || record.sourceId || `record:${index}`)),
       concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+      allowHashFallback: false,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '전체 벡터 갱신')
     });
     const fallbackUsed = vectors.flashbackFallbackUsed === true;
@@ -20487,7 +20930,8 @@
     const vectors = await embedTexts(bounded.map(item => item.record.text), settings, {
       purpose: 'document',
       contextGroupIds: bounded.map(item => text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`)),
-      concurrency: expectedProvider === 'hash' ? 1 : 1
+      concurrency: expectedProvider === 'hash' ? 1 : 1,
+      allowHashFallback: false
     });
     if (vectors.flashbackFallbackUsed === true && expectedProvider !== 'hash') {
       return finish({ scopeKey: scope.scopeKey, selected: bounded.length, reembedded: 0, pending: selected.length, reason: 'provider_failed_old_vectors_preserved', errorType: Runtime.lastEmbeddingDiagnostic?.errorType || 'UNKNOWN' });
@@ -20802,6 +21246,7 @@ ${cleanedText}`, 80),
           ? batch.map((record, index) => text(record.sourceHash || record.sourceId || `record:${reembedIndexes[index]}`))
           : undefined,
         concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        allowHashFallback: false,
         onProgress: maintenanceEmbeddingProgressCallback(opts.maintenanceOperationId, '기억 정제')
       });
       const fallbackUsed = vectors.flashbackFallbackUsed === true;
@@ -20910,6 +21355,9 @@ ${cleanedText}`, 80),
     }
     if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.liveChunkSchemaMismatch || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageManifestCorrupt === true || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
       return { strategy: 'live_source_required', stages: [], blocked: true };
+    }
+    if (plan.embeddingCredentialMissing === true) {
+      return { strategy: 'credential_required', stages: [], blocked: true, reason: 'embedding_credential_missing' };
     }
     if (plan.requiresFullRebuild) {
       return {
@@ -21021,7 +21469,19 @@ ${cleanedText}`, 80),
     const episodeStale = settings.episodeIndexEnabled
       && (text(rawLoaded.manifest.episodeSourceDigest || '') !== text(baseDigest || '') || missingEpisodeIndexForEligibleTurns(responseRecords, episodeRecords, settings));
     const externalRecords = rawLoaded.records.filter(record => !isRetainedMemoryRecord(record)).length;
+    const estimatedEmbeddingChunks = requiresFullRebuild ? syncEstimate.chunks : syncEstimate.chunks + recordsNeedingEmbedding;
     const estimatedTokens = requiresFullRebuild ? syncEstimate.tokens : syncEstimate.tokens + repairTokens;
+    const embeddingWorkPending = requiresFullRebuild
+      || estimatedEmbeddingChunks > 0
+      || diff.missing.length > 0
+      || diff.changed.length > 0
+      || recordsNeedingEmbedding > 0;
+    // Reading first reconciles the plugin argument, save-synced backup, and
+    // device-local cache without rewriting provider/model settings.
+    await readEmbeddingKey().catch(error => warn('embedding credential reconciliation failed during maintenance inspection', error));
+    const credentialStatus = await inspectEmbeddingKeyPersistence({ includeArgument: true });
+    const embeddingCredentialRequired = settings.embeddingEnabled !== false && providerRequiresEmbeddingCredential(settings.embeddingProvider);
+    const embeddingCredentialMissing = embeddingCredentialRequired && embeddingWorkPending && !credentialStatus.keyPresent;
     const plan = {
       at: Date.now(),
       scopeKey: scope.scopeKey,
@@ -21059,9 +21519,21 @@ ${cleanedText}`, 80),
       requiresFullRebuild,
       recordsNeedingEmbedding,
       episodeStale,
-      estimatedEmbeddingChunks: requiresFullRebuild ? syncEstimate.chunks : syncEstimate.chunks + recordsNeedingEmbedding,
+      embeddingWorkPending,
+      estimatedEmbeddingChunks,
       estimatedEmbeddingTokens: estimatedTokens,
-      embeddingCost: estimateEmbeddingCostForTokens(estimatedTokens, settings)
+      embeddingCost: estimateEmbeddingCostForTokens(estimatedTokens, settings),
+      embeddingCredentialRequired,
+      embeddingCredentialMissing,
+      embeddingCredential: {
+        present: !!credentialStatus.keyPresent,
+        source: text(credentialStatus.effectiveSource || credentialStatus.source || 'none'),
+        durableAcrossUpdate: !!credentialStatus.durableAcrossUpdate,
+        argumentVerified: !!credentialStatus.argument?.verified,
+        syncedVerified: !!credentialStatus.synced?.verified,
+        localVerified: !!credentialStatus.local?.verified,
+        reason: text(credentialStatus.reason || '')
+      }
     };
     plan.healthy = !plan.missingTurns
       && !plan.changedTurns
@@ -21079,7 +21551,8 @@ ${cleanedText}`, 80),
       && !plan.shardIndexMismatch
       && !plan.sanitizerVersionMismatch
       && !plan.liveChunkSchemaMismatch
-      && !plan.episodeStale;
+      && !plan.episodeStale
+      && !plan.embeddingCredentialMissing;
     plan.automatic = automaticMaintenanceStrategyForPlan(plan);
     Object.defineProperty(plan, '_maintenanceContext', {
       value: { settings, snapshot, scope, rawLoaded },
@@ -21087,6 +21560,137 @@ ${cleanedText}`, 80),
       configurable: true
     });
     return plan;
+  };
+
+  const maintenanceEmbeddingWorkRequested = (mode = 'auto', plan = {}) => {
+    const normalizedMode = normalizeChoice(mode, ['auto', 'sync', 'rebuild', 'reembed'], 'auto');
+    if (normalizedMode === 'rebuild' || normalizedMode === 'reembed') return true;
+    if (normalizedMode === 'sync') return Number(plan.estimatedEmbeddingChunks || 0) > 0 || Number(plan.missingTurns || 0) > 0 || Number(plan.changedTurns || 0) > 0;
+    const stages = Array.isArray(plan.automatic?.stages) ? plan.automatic.stages : [];
+    return plan.requiresFullRebuild === true
+      || stages.some(stage => ['sync', 'reembed', 'rebuild'].includes(stage))
+      || Number(plan.estimatedEmbeddingChunks || 0) > 0;
+  };
+
+  const requireMaintenanceEmbeddingCredential = async (settings = DEFAULTS, plan = {}, mode = 'auto') => {
+    const cfg = normalizeSettings(settings || DEFAULTS);
+    const provider = normalizeProvider(cfg.embeddingProvider);
+    const workRequested = maintenanceEmbeddingWorkRequested(mode, plan);
+
+    if (!workRequested) {
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: !!Runtime.sessionEmbeddingKey,
+        tested: false,
+        skipped: true,
+        reason: 'no_embedding_work'
+      };
+    }
+
+    // Disabled embedding would otherwise enter createEmbeddingProviderAdapter's
+    // ordinary hash path. Maintenance is a replacement operation, so silently
+    // converting existing remote vectors to hash vectors is never allowed.
+    if (cfg.embeddingEnabled === false) {
+      const error = new Error('임베딩이 꺼져 있어 기억 벡터 유지보수를 실행할 수 없습니다. 기존 벡터는 변경하지 않았습니다.');
+      error.code = 'FLASHBACK_EMBEDDING_DISABLED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
+
+    if (provider === 'hash') {
+      return { required: false, present: true, tested: false, local: true, reason: 'hash_provider' };
+    }
+
+    const key = text(await readEmbeddingKey() || '').trim();
+    if (providerRequiresEmbeddingCredential(provider) && !key) {
+      const error = new Error(`현재 ${cfg.embeddingProvider} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`);
+      error.code = 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
+
+    // A one-item, no-retry, no-fallback probe runs before any shard, record, or
+    // episode mutation. This catches expired credentials and unreachable local/
+    // custom endpoints without launching a bulk re-embedding job.
+    const credentialFingerprint = stableHash(`${provider}\n${cfg.embeddingModel}\n${embeddingRequestSettingsFingerprint(cfg)}\n${stableHash(key)}`);
+    const cached = Runtime.lastMaintenanceEmbeddingPreflight;
+    if (cached?.ok === true
+      && cached.fingerprint === credentialFingerprint
+      && Date.now() - Number(cached.at || 0) < 5 * 60 * 1000) {
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: providerRequiresEmbeddingCredential(provider) ? !!key : true,
+        tested: true,
+        cached: true,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: Number(cached.dimensions || 0) || 0,
+        persistence: Runtime.embeddingKeyPersistence
+      };
+    }
+
+    const preflightSettings = normalizeSettings({
+      ...cfg,
+      embeddingMaxRetries: 0,
+      embeddingFallbackProvider: '',
+      fallbackHashEmbedding: false
+    });
+    const startedAt = Date.now();
+    try {
+      const probe = `Flashback maintenance embedding preflight ${Date.now()} ${stableHash(plan.scopeKey || 'scope')}`;
+      const vectors = await embedTexts([probe], preflightSettings, {
+        purpose: 'query',
+        allowHashFallback: false,
+        deadlineAt: startedAt + Math.min(12000, Math.max(3000, Number(cfg.embeddingTimeoutMs || DEFAULTS.embeddingTimeoutMs) || DEFAULTS.embeddingTimeoutMs))
+      });
+      const vector = Array.isArray(vectors?.[0]) ? vectors[0] : [];
+      if (!vector.length) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding preflight returned an empty vector.');
+      Runtime.lastMaintenanceEmbeddingPreflight = Object.freeze({
+        at: Date.now(),
+        ok: true,
+        fingerprint: credentialFingerprint,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: vector.length,
+        elapsedMs: Date.now() - startedAt
+      });
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: providerRequiresEmbeddingCredential(provider) ? !!key : true,
+        tested: true,
+        cached: false,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: vector.length,
+        elapsedMs: Date.now() - startedAt,
+        persistence: Runtime.embeddingKeyPersistence
+      };
+    } catch (rawError) {
+      const classified = classifyEmbeddingError(rawError, { provider });
+      Runtime.lastMaintenanceEmbeddingPreflight = Object.freeze({
+        at: Date.now(),
+        ok: false,
+        fingerprint: credentialFingerprint,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        errorType: classified.type,
+        elapsedMs: Date.now() - startedAt
+      });
+      const authentication = classified.type === 'AUTH_ERROR';
+      const error = new Error(authentication
+        ? `${cfg.embeddingProvider} 임베딩 인증에 실패했습니다. 기존 벡터는 변경하지 않았습니다. API 키 또는 액세스 토큰을 다시 저장해 주세요.`
+        : `${cfg.embeddingProvider} 임베딩 사전 연결 확인에 실패했습니다. 기존 벡터는 변경하지 않았습니다: ${formatErrorMessage(classified, 420)}`);
+      error.code = authentication ? 'FLASHBACK_EMBEDDING_AUTH_REQUIRED' : 'FLASHBACK_EMBEDDING_PREFLIGHT_FAILED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.errorType = classified.type;
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
   };
 
   const maintenanceOperationTotals = (operation = {}) => {
@@ -21157,10 +21761,11 @@ ${cleanedText}`, 80),
     const planContext = before?._maintenanceContext && typeof before._maintenanceContext === 'object'
       ? before._maintenanceContext
       : {};
-    const settings = planContext.settings || sharedSettings || undefined;
+    const settings = normalizeSettings(planContext.settings || sharedSettings || await loadSettings(true));
     const snapshot = planContext.snapshot || sharedSnapshot || undefined;
     const scope = planContext.scope?.scopeKey ? planContext.scope : sharedScope;
-    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync' };
+    const embeddingPreflight = await requireMaintenanceEmbeddingCredential(settings, before, normalizedMode);
+    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync', allowHashFallback: false };
     await persistMaintenanceJournal({
       operationId,
       status: 'running',
@@ -21187,14 +21792,17 @@ ${cleanedText}`, 80),
       operation = await rebuildCurrentChatMemory(rebuildOptions);
       } else if (normalizedMode === 'reembed') {
         await persistMaintenanceJournal({ operationId, status: 'running', stage: 'reembed', scopeKey: before.scopeKey || '', strategy: 'reembed', stages: ['reembed'] });
-        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId });
+        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId, allowHashFallback: false });
     } else {
       const automatic = before.automatic || automaticMaintenanceStrategyForPlan(before);
       if (automatic.blocked) {
-        const error = before.storageForeignScopeKey
-          ? new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.')
-          : new Error('구형 정제기로 저장된 기억을 복구하려면 원문이 남아 있는 현재 채팅을 먼저 열어야 합니다.');
-        error.code = before.storageForeignScopeKey ? 'FLASHBACK_STORAGE_SCOPE_COLLISION' : 'FLASHBACK_LIVE_SOURCE_REQUIRED';
+        const credentialBlocked = automatic.strategy === 'credential_required' || before.embeddingCredentialMissing === true;
+        const error = credentialBlocked
+          ? new Error(`현재 ${settings?.embeddingProvider || '원격'} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`)
+          : (before.storageForeignScopeKey
+            ? new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.')
+            : new Error('구형 정제기로 저장된 기억을 복구하려면 원문이 남아 있는 현재 채팅을 먼저 열어야 합니다.'));
+        error.code = credentialBlocked ? 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED' : (before.storageForeignScopeKey ? 'FLASHBACK_STORAGE_SCOPE_COLLISION' : 'FLASHBACK_LIVE_SOURCE_REQUIRED');
         error.scopeKey = before.scopeKey || '';
         if (before.storageForeignScopeKey) error.foreignScopeKey = before.storageForeignScopeKey;
         throw error;
@@ -21248,6 +21856,7 @@ ${cleanedText}`, 80),
             forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch,
             forceIndexRebuild: before.shardIndexMismatch === true,
             reembedChanged: true,
+            allowHashFallback: false,
             maintenanceOperationId: operationId
           });
         }
@@ -21279,6 +21888,7 @@ ${cleanedText}`, 80),
       scopeKey: after.scopeKey || before.scopeKey,
       before,
       after,
+      embeddingPreflight,
       operation,
       healthy: after.healthy === true
     };
@@ -21379,7 +21989,8 @@ ${cleanedText}`, 80),
       targeted_repair: '상태별 선택 복구',
       full_rebuild: '현재 채팅 전체 재구축',
       live_source_required: '현재 채팅 원문 필요',
-      scope_collision: '저장 범위 충돌 — 자동 변경 차단'
+      scope_collision: '저장 범위 충돌 — 자동 변경 차단',
+      credential_required: '임베딩 API 키 필요 — 기존 벡터 보존'
     };
     const stageLabels = {
       sync: '누락·변경 동기화',
@@ -21401,12 +22012,15 @@ ${cleanedText}`, 80),
     `리콜 샤드 인덱스 v${formatNumber(plan.shardIndexVersion)} / v${formatNumber(plan.shardIndexExpectedVersion || FLASHBACK_SHARD_INDEX_VERSION)} · ${plan.shardIndexMismatch ? '재구축 필요' : '정상'}`,
     `저장 무결성: 매니페스트 ${plan.storageManifestCorrupt ? '손상' : '정상'} · 누락 샤드 ${formatNumber(plan.storageMissingShards)} · 손상 샤드 ${formatNumber(plan.storageCorruptShards)} · 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'} · 범위 충돌 ${plan.storageForeignScopeKey ? '예' : '아니오'}`,
     `벡터 복구 ${formatNumber(plan.recordsNeedingEmbedding)} · 프로바이더 불일치 ${formatNumber(plan.providerMismatch)}`,
+    `임베딩 키 ${plan.embeddingCredentialRequired ? (plan.embeddingCredential?.present ? `확인됨 · ${plan.embeddingCredential?.durableAcrossUpdate ? '업데이트 보존 경로 있음' : '현재 기기 전용'}` : (plan.embeddingWorkPending ? '없음 · 원격 복구 차단' : '없음 · 현재 기억 데이터는 유지')) : '필요 없음'}`,
     `에피소드 인덱스 ${plan.episodeStale ? '갱신 필요' : '정상'}`,
     `자동 복구 경로: ${maintenanceStrategyText(plan.automatic)}`,
     `예상 임베딩 ${formatNumber(plan.estimatedEmbeddingChunks)}개 / ${formatNumber(plan.estimatedEmbeddingTokens)} tokens / ${formatCostSummary(plan.embeddingCost)}`,
     plan.healthy
       ? '판정: 현재 데이터가 정상입니다.'
-      : (plan.storageForeignScopeKey ? '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.' : '판정: 자동 점검·복구로 정리할 항목이 있습니다.')
+      : (plan.embeddingCredentialMissing
+        ? '판정: 임베딩 키가 없어 기존 벡터를 보존하고 자동 복구를 차단했습니다.'
+        : (plan.storageForeignScopeKey ? '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.' : '판정: 자동 점검·복구로 정리할 항목이 있습니다.'))
   ].join('\n');
 
   const maintenanceResultText = (result = {}) => [
@@ -22128,7 +22742,7 @@ ${cleanedText}`, 80),
           <div class="field"><label>Provider</label><select id="embeddingProvider">${providerOptions}</select></div>
           <div class="field"><label>모델</label><input id="embeddingModel" list="embeddingModelSuggestions" value="${escapeHtml(settings.embeddingModel)}" /><datalist id="embeddingModelSuggestions">${recommendedModels}</datalist></div>
           <div class="field"><label>Base URL / 서버 주소</label><input id="embeddingUrl" value="${escapeHtml(settings.embeddingUrl)}" placeholder="비워두면 기본값" /></div>
-          <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="입력 후 저장하면 로컬 저장소에 유지됩니다" /></div>
+          <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="입력 후 저장하면 설정·동기화 백업·로컬에 보관됩니다" /></div>
           <div class="field"><label>벡터 차원 (0=자동)</label><input id="embeddingDimensions" type="number" min="0" max="65536" value="${settings.embeddingDimensions}" /></div>
           <div class="field"><label>요청 제한시간(ms)</label><input id="embeddingTimeoutMs" type="number" min="3000" max="180000" value="${settings.embeddingTimeoutMs}" /></div>
           <div class="field"><label>배치 크기</label><input id="embeddingBatchSize" type="number" min="1" max="128" value="${settings.embeddingBatchSize}" /></div>
@@ -23475,7 +24089,7 @@ ${cleanedText}`, 80),
       if (Number(node?.value) > 8000) node.value = '8000';
     });
     getGuiNode('clearEmbeddingKeyBtn')?.addEventListener('click', async () => {
-      if (!await guiConfirm('로컬에 저장된 API 키 또는 액세스 토큰을 삭제할까요?')) return;
+      if (!await guiConfirm('저장된 API 키 또는 액세스 토큰을 모든 키 저장소에서 삭제할까요?')) return;
       setBusy(true, '임베딩 키 삭제');
       try {
         const keyPersistence = await saveEmbeddingKeyLocal('');
@@ -23572,7 +24186,7 @@ ${cleanedText}`, 80),
       catch (error) { await guiError('자동 복구 진단 실패', error); }
       finally { setBusy(false); }
       if (!plan) return;
-      if (plan.healthy) {
+      if (plan.healthy || plan.automatic?.blocked) {
         await guiAlert(maintenancePlanText(plan), '기억 유지보수');
         return;
       }
@@ -23858,6 +24472,15 @@ ${cleanedText}`, 80),
       lastExternalRetirement: Runtime.lastExternalRetirement,
       lastEpisodeIndex: Runtime.lastEpisodeIndex,
       maintenanceJournal: Runtime.maintenanceJournal,
+      maintenanceEmbeddingPreflight: Runtime.lastMaintenanceEmbeddingPreflight ? {
+        at: Number(Runtime.lastMaintenanceEmbeddingPreflight.at || 0) || 0,
+        ok: Runtime.lastMaintenanceEmbeddingPreflight.ok === true,
+        provider: text(Runtime.lastMaintenanceEmbeddingPreflight.provider || ''),
+        model: text(Runtime.lastMaintenanceEmbeddingPreflight.model || ''),
+        dimensions: Number(Runtime.lastMaintenanceEmbeddingPreflight.dimensions || 0) || 0,
+        errorType: text(Runtime.lastMaintenanceEmbeddingPreflight.errorType || ''),
+        elapsedMs: Math.max(0, Number(Runtime.lastMaintenanceEmbeddingPreflight.elapsedMs || 0) || 0)
+      } : null,
       activityLog: activityLogSnapshot(),
       settingsMigration: Runtime.settingsMigration,
       argumentAudit: Runtime.argumentAudit,
@@ -24003,6 +24626,8 @@ ${cleanedText}`, 80),
     }),
     loadSettings,
     saveSettings,
+    saveEmbeddingCredential,
+    inspectEmbeddingKeyPersistence,
     discoverOllamaModels,
     inspectOllamaModel,
     memory: Object.freeze({
@@ -24041,7 +24666,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, saveEmbeddingCredential, inspectEmbeddingKeyPersistence, setPluginArgumentValue, embeddingArgumentBackendState, embeddingSyncedBackendState, embeddingLocalBackendState, selectEmbeddingCredential, providerRequiresEmbeddingCredential, maintenanceEmbeddingWorkRequested, requireMaintenanceEmbeddingCredential, embedTexts, inspectLastEmbedFallback: () => Runtime.lastEmbedUsedFallback === true, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.resolvePendingCaptureJournalMode = resolvePendingCaptureJournalMode;
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
@@ -24140,8 +24765,17 @@ ${cleanedText}`, 80),
       captureAfterRequest: Runtime.settings.captureAfterRequest,
       operationLogEnabled: Runtime.settings.operationLogEnabled
     });
-    await readEmbeddingKey().catch(error => warn('embedding key persistence load failed', error));
+    await readEmbeddingKey({ force: true }).catch(error => warn('embedding key persistence load failed', error));
     await inspectEmbeddingKeyPersistence({ includeArgument: true }).catch(error => warn('embedding key persistence inspection failed', error));
+    // Web hosts may remount pluginStorage shortly after a plugin update. Recheck
+    // twice so a delayed synchronized credential can repair argument/local mirrors
+    // before the next bulk embedding operation.
+    for (const retryDelay of [2200, 8000]) {
+      scheduleTimer(() => {
+        readEmbeddingKey({ force: true })
+          .catch(error => warn('delayed embedding credential reconciliation failed', error));
+      }, retryDelay);
+    }
     if (!Runtime.settings.operationLogEnabled) {
       Runtime.operationLogCache = null;
       await RisuCompat.removeItem(STORAGE.operationLog).catch(() => false);
