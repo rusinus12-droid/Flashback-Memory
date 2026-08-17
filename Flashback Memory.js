@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.7
+//@display-name ⚡ FLASHBACK Memory v0.11.9
 //@api 3.0
-//@version 0.11.7
+//@version 0.11.9
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,19 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.9
+ *
+ * v0.11.9 makes the native FLASHBACK GUI archive-aware after immutable RE:TRACE session handoff: current-scope totals, type/token statistics, storage rows, and status badges include the verified shared archive while local shard counts remain physically accurate. The archive remains read-only and is never copied back into the target scope.
+ * v0.11.8 makes ordinary RisuAI chat-copy adoption proactive and keeps diagnostics
+ * observational: a lightweight current-chat identity observer runs only cheap host
+ * index/chat reads and invokes the existing verified clone path when the active chat
+ * or bound Persona actually changes, with bounded follow-up probes for delayed Persona
+ * forks. Heuristic copy-source selection now favors exact transcript fingerprint/tail
+ * evidence over title-only similarity, and title-based cloning requires an equal nonzero
+ * message count. Debug export now resolves the GUI/read-only scope and cannot create/clone
+ * memory as a side effect. The clone algorithm, immutable RE:TRACE handoff, source
+ * preservation, and embedding provider/model selection are unchanged.
+ *
  * ⚡ FLASHBACK Memory v0.11.7
  *
  * v0.11.7 adds the RE:TRACE peer-compatibility v1 capability handshake. Future
@@ -612,7 +625,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.7';
+  const PLUGIN_VERSION = '0.11.9';
   const EMBEDDING_KEY_ARGUMENT = 'embedding_key';
   const EMBEDDING_CREDENTIAL_SCHEMA = 'flashback_memory.embedding_credential.v3';
   const EMBEDDING_CREDENTIAL_VERSION = 3;
@@ -1000,6 +1013,9 @@
     return true;
   };
   const SCOPE_REGISTRY_REMEMBER_TTL_MS = 30000;
+  const NATIVE_COPY_OBSERVER_POLL_MS = 1800;
+  const NATIVE_COPY_OBSERVER_FOLLOWUP_MS = Object.freeze([900, 3200]);
+
 
   // 캐시 안전화(v0.8.8) — 응답 모델 프롬프트 prefix 캐시 보호 + 임베딩 로컬 캐시.
   // 정적 계약 마커는 기존 VECTOR RAG MEMORY 동적 블록과 분리된 별도 메시지로 들어간다.
@@ -1121,6 +1137,19 @@
     scopeRegistryRememberCache: new Map(),
     scopeRegistryRetryTasks: new Set(),
     scopeRegistryRetryGeneration: sharedScopeRegistryRetryGeneration,
+    nativeCopyObserver: {
+      running: false,
+      inFlight: false,
+      timer: null,
+      lastIdentity: '',
+      lastAt: 0,
+      checks: 0,
+      changes: 0,
+      adoptions: 0,
+      lastReason: '',
+      lastResult: null,
+      lastError: ''
+    },
     computeWorker: null,
     computeWorkerUrl: '',
     computeWorkerSeq: 0,
@@ -7189,12 +7218,19 @@
 
   const guiStorageRowFromManifest = (manifest = {}, scope = {}) => {
     const stats = normalizeStatsForDisplay(manifest.stats && typeof manifest.stats === 'object' ? manifest.stats : statsForRecords([]));
+    const archiveRef = normalizeFlashbackArchiveRef(manifest.archiveRef);
+    const localCount = Math.max(0, Number(manifest.localCount ?? manifest.count ?? stats.recordTotal ?? 0) || 0);
+    const archiveCount = Math.max(0, Number(manifest.archiveCount ?? archiveRef?.recordCount ?? 0) || 0);
+    const count = localCount + archiveCount;
     return {
       ...scope,
       ...manifest,
-      manifest,
-      stats,
-      count: Math.max(0, Number(manifest.count || stats.recordTotal || 0) || 0),
+      manifest: { ...manifest, localCount, archiveCount, count, archiveRef },
+      stats: { ...stats, recordTotal: Math.max(Number(stats.recordTotal || 0), count) },
+      count,
+      localCount,
+      archiveCount,
+      archiveRef,
       shardCount: Math.max(0, Number(manifest.shardCount || 0) || 0),
       commitId: text(manifest.commitId || ''),
       updatedAt: manifest.updatedAt || scope.updatedAt || scope.seenAt || 0,
@@ -7209,8 +7245,17 @@
       ...scope,
       scopeKey: text(manifest.scopeKey || scope.scopeKey || Runtime.currentScope?.scopeKey || '')
     };
-    const count = Math.max(0, Number(manifest.count || stats.recordTotal || 0) || 0);
-    return { scope: resolvedScope, manifest: { ...manifest, stats, count }, records: { length: count }, stats };
+    const archiveRef = normalizeFlashbackArchiveRef(manifest.archiveRef);
+    const localCount = Math.max(0, Number(manifest.localCount ?? manifest.count ?? stats.recordTotal ?? 0) || 0);
+    const archiveCount = Math.max(0, Number(manifest.archiveCount ?? archiveRef?.recordCount ?? 0) || 0);
+    const count = localCount + archiveCount;
+    const displayStats = { ...stats, recordTotal: Math.max(Number(stats.recordTotal || 0), count) };
+    return {
+      scope: resolvedScope,
+      manifest: { ...manifest, stats: displayStats, count, localCount, archiveCount, archiveRef },
+      records: { length: count },
+      stats: displayStats
+    };
   };
 
   const scheduleGuiWriteThroughRepaint = () => {
@@ -8905,9 +8950,13 @@
     if (!sameActorScope(source, target)) return false;
     const sourceTitle = cloneBaseTitle(source.chatTitle || '');
     const targetTitle = cloneBaseTitle(target.chatTitle || '');
+    const sourceMessageCount = Math.max(0, Number(source.chatMessageCount || 0) || 0);
+    const targetMessageCount = Math.max(0, Number(target.chatMessageCount || 0) || 0);
     const titleCopy = !!sourceTitle
       && sourceTitle === targetTitle
-      && text(source.chatTitle || '') !== text(target.chatTitle || '');
+      && text(source.chatTitle || '') !== text(target.chatTitle || '')
+      && sourceMessageCount > 0
+      && sourceMessageCount === targetMessageCount;
     const tailCopy = !!source.chatTailHash
       && source.chatTailHash === target.chatTailHash
       && Number(source.chatMessageCount || 0) > 0
@@ -9042,10 +9091,26 @@
     const weighted = [];
     for (const candidate of candidates.values()) {
       const weight = await scopeStoredWeight(candidate.source);
-      if (weight > 0) weighted.push({ ...candidate, weight });
+      if (weight <= 0) continue;
+      let transcriptRank = 0;
+      if (candidate.source.chatFingerprint && scope.chatFingerprint && candidate.source.chatFingerprint === scope.chatFingerprint) transcriptRank += 8;
+      if (candidate.source.chatTailHash && scope.chatTailHash && candidate.source.chatTailHash === scope.chatTailHash) transcriptRank += 4;
+      if (Number(candidate.source.chatMessageCount || 0) > 0
+        && Number(candidate.source.chatMessageCount || 0) === Number(scope.chatMessageCount || 0)) transcriptRank += 2;
+      const authoritativeRank = candidate.reason === 'same_chat_persona_scope_recovery' ? 3
+        : candidate.reason === 'explicit_copy_source' ? 2
+          : 0;
+      weighted.push({ ...candidate, weight, transcriptRank, authoritativeRank });
     }
-    weighted.sort((a, b) => b.priority - a.priority || b.weight - a.weight || Number(b.source.seenAt || 0) - Number(a.source.seenAt || 0));
-    return weighted[0] ? { source: weighted[0].source, reason: weighted[0].reason, weight: weighted[0].weight } : null;
+    weighted.sort((a, b) => b.authoritativeRank - a.authoritativeRank
+      || b.transcriptRank - a.transcriptRank
+      || b.priority - a.priority
+      || b.weight - a.weight
+      || Number(b.source.seenAt || 0) - Number(a.source.seenAt || 0));
+    return weighted[0] ? {
+      source: weighted[0].source, reason: weighted[0].reason, weight: weighted[0].weight,
+      transcriptRank: weighted[0].transcriptRank, candidateCount: weighted.length
+    } : null;
   };
 
   const liveRecordForNativeChatCopy = (record, fromScopeKey, toScopeKey, clonedAt) => ({
@@ -9519,6 +9584,90 @@
     chat.fileName,
     chat.filename
   ], 24);
+
+  const lightweightNativeCopyObserverIdentity = async () => {
+    const api = getLiveApi(['getCurrentCharacterIndex', 'getCurrentChatIndex', 'getChatFromIndex']) || getLiveApi();
+    if (typeof api?.getCurrentCharacterIndex !== 'function' || typeof api?.getCurrentChatIndex !== 'function') return '';
+    const [charIndexRaw, chatIndexRaw] = await Promise.all([
+      safeApi('nativeCopyObserver:getCurrentCharacterIndex', () => api.getCurrentCharacterIndex(), { silent: true }),
+      safeApi('nativeCopyObserver:getCurrentChatIndex', () => api.getCurrentChatIndex(), { silent: true })
+    ]);
+    const charIndex = Number(charIndexRaw);
+    const chatIndex = Number(chatIndexRaw);
+    if (!Number.isFinite(charIndex) || !Number.isFinite(chatIndex)) return '';
+    let chat = null;
+    if (typeof api?.getChatFromIndex === 'function') {
+      chat = await safeApi('nativeCopyObserver:getChatFromIndex', () => api.getChatFromIndex(charIndex, chatIndex), { silent: true });
+    }
+    const chatId = chatIdentityValues(chat || {})[0] || '';
+    const personaId = firstFilled(
+      chat?.bindedPersona, chat?.boundPersona, chat?.personaId, chat?.personaID,
+      chat?.selectedPersonaId, chat?.meta?.personaId, chat?.metadata?.personaId
+    );
+    return `${charIndex}:${chatIndex}:${chatId}:${personaId}`;
+  };
+
+  const runNativeCopyObserverAdoptionProbe = async (reason = 'observer') => {
+    const observer = Runtime.nativeCopyObserver;
+    if (Runtime.unloaded || observer.inFlight) return observer.lastResult;
+    observer.inFlight = true;
+    observer.lastAt = Date.now();
+    observer.lastReason = reason;
+    observer.lastError = '';
+    try {
+      const bundle = await resolveCurrentScopeBundle(false);
+      const result = bundle?.storageReady || null;
+      observer.lastResult = cloneRuntimeValue(result, null);
+      if (result?.adopted === true) {
+        observer.adoptions += 1;
+        try { invalidateGuiDataCache('all'); } catch (_) {}
+        pushActivityLog('native_chat_copy_adopted', '복사된 채팅의 FLASHBACK 기억을 자동으로 연결했습니다.', {
+          scopeKey: bundle?.scope?.scopeKey || '',
+          reason: result?.reason || reason,
+          records: Number(result?.cloned?.records || result?.handoff?.records || 0) || 0,
+          archiveRecords: Number(result?.cloned?.archiveRecords || 0) || 0
+        }, 'success');
+      }
+      return result;
+    } catch (error) {
+      observer.lastError = formatErrorMessage(error, 500);
+      warn('native chat-copy observer adoption probe failed', error);
+      return null;
+    } finally {
+      observer.inFlight = false;
+    }
+  };
+
+  const scheduleNativeCopyObserverFollowups = reason => {
+    for (const delayMs of NATIVE_COPY_OBSERVER_FOLLOWUP_MS) {
+      scheduleTimer(() => {
+        runNativeCopyObserverAdoptionProbe(`${reason}_followup_${delayMs}`).catch(error => warn('native copy follow-up probe failed', error));
+      }, delayMs);
+    }
+  };
+
+  const startNativeCopyObserver = () => {
+    const observer = Runtime.nativeCopyObserver;
+    if (observer.running || Runtime.unloaded) return false;
+    observer.running = true;
+    const poll = async () => {
+      if (Runtime.unloaded || !observer.running) return;
+      observer.checks += 1;
+      let identity = '';
+      try { identity = await lightweightNativeCopyObserverIdentity(); }
+      catch (error) { observer.lastError = formatErrorMessage(error, 500); }
+      if (identity && identity !== observer.lastIdentity) {
+        const firstObservation = !observer.lastIdentity;
+        observer.lastIdentity = identity;
+        observer.changes += 1;
+        await runNativeCopyObserverAdoptionProbe(firstObservation ? 'observer_initial_scope' : 'observer_scope_changed');
+        scheduleNativeCopyObserverFollowups(firstObservation ? 'observer_initial_scope' : 'observer_scope_changed');
+      }
+      if (!Runtime.unloaded && observer.running) observer.timer = scheduleTimer(() => { poll().catch(error => warn('native copy observer poll failed', error)); }, NATIVE_COPY_OBSERVER_POLL_MS);
+    };
+    observer.timer = scheduleTimer(() => { poll().catch(error => warn('native copy observer startup failed', error)); }, 250);
+    return true;
+  };
 
   const sessionHandoffTargetSnapshot = (snapshot = {}, targetChatId = '') => {
     const wanted = text(targetChatId || '').trim();
@@ -22979,7 +23128,11 @@ ${cleanedText}`, 80),
   const currentScopeStats = async (options = {}) => {
     const ttlMs = clampInt(options.ttlMs, 0, 60000, 5000);
     const cached = Runtime.guiCurrentStatsCache;
-    if (options.force !== true && cached?.value && Date.now() - Number(cached.at || 0) <= ttlMs) {
+    const cachedNeedsArchiveSummary = Boolean(
+      normalizeFlashbackArchiveRef(cached?.value?.manifest?.archiveRef)
+      && cached?.value?.manifest?.summaryOnly !== true
+    );
+    if (options.force !== true && !cachedNeedsArchiveSummary && cached?.value && Date.now() - Number(cached.at || 0) <= ttlMs) {
       Runtime.guiPerf.currentStatsCacheHits += 1;
       return cached.value;
     }
@@ -22987,10 +23140,20 @@ ${cleanedText}`, 80),
     const task = (async () => {
       Runtime.guiPerf.currentStatsLoads += 1;
       const scope = await resolveCurrentScopeForGui();
-      const manifest = await loadScopeManifest(scope);
-      const stats = normalizeStatsForDisplay(manifest.stats && typeof manifest.stats === 'object' ? manifest.stats : statsForRecords([]));
-      const count = manifest.count || stats.recordTotal || 0;
-      const value = { scope, manifest: { ...manifest, stats, count }, records: { length: count }, stats };
+      // Immutable RE:TRACE handoff intentionally leaves the target's local shards
+      // empty and links a shared archive. Reuse the existing manifest-only archive
+      // summary so the GUI shows logical inherited memory without hydrating archive
+      // record shards/vectors or mutating storage.
+      const summary = await debugScopeStatsSnapshot(scope);
+      const manifest = summary?.manifest || await loadScopeManifest(scope);
+      const stats = normalizeStatsForDisplay(summary?.stats || manifest.stats || statsForRecords([]));
+      const count = Math.max(0, Number(manifest.count || stats.recordTotal || 0) || 0);
+      const value = {
+        scope: summary?.scope || scope,
+        manifest: { ...manifest, stats, count },
+        records: { length: count },
+        stats
+      };
       Runtime.guiCurrentStatsCache = { at: Date.now(), value };
       return value;
     })();
@@ -23488,7 +23651,7 @@ ${cleanedText}`, 80),
         <td><strong>${escapeHtml(item.characterName || 'Unknown')}</strong><div class="muted tiny">${escapeHtml(item.chatTitle || item.chatId || '')}</div><div class="muted tiny">${escapeHtml(item.personaName || '')}</div>${copied}</td>
         <td>${formatNumber(item.stats?.tokenTotal || 0)}</td>
         <td>${formatNumber(item.count || 0)}</td>
-        <td>${formatNumber(item.shardCount || 0)}</td>
+        <td>${formatNumber(item.shardCount || 0)} / ${formatNumber(item.archiveCount || 0)}</td>
         <td class="muted tiny">${escapeHtml(item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '-')}</td>
         <td><button class="btn btn-danger small" data-delete-scope="${escapeHtml(scopeKey)}">삭제</button></td>
       </tr>`;
@@ -23946,7 +24109,7 @@ ${cleanedText}`, 80),
       <div id="manualEditorPanel" class="card manual-editor-card">${renderManualEditorPanelHtml(null)}</div>
       <div class="card table-card storage-table-card">
         <div class="storage-table-head"><strong>스코프 스토리지 관리</strong><span>현재 스코프는 선택 삭제에서 제외되며 위의 전용 버튼으로만 삭제합니다.</span></div>
-        <div class="storage-table-scroll"><table class="data-table"><thead><tr><th><input id="selectAllScopes" class="storage-scope-select" type="checkbox" aria-label="현재 스코프를 제외한 모든 스코프 선택" /></th><th>캐릭터 / 채팅</th><th>토큰</th><th>chunks</th><th>shards</th><th>업데이트</th><th></th></tr></thead><tbody id="storageRows"><tr><td colspan="7" class="muted">${escapeHtml(initialText)}</td></tr></tbody></table></div>
+        <div class="storage-table-scroll"><table class="data-table"><thead><tr><th><input id="selectAllScopes" class="storage-scope-select" type="checkbox" aria-label="현재 스코프를 제외한 모든 스코프 선택" /></th><th>캐릭터 / 채팅</th><th>토큰</th><th>chunks</th><th>shards / archive</th><th>업데이트</th><th></th></tr></thead><tbody id="storageRows"><tr><td colspan="7" class="muted">${escapeHtml(initialText)}</td></tr></tbody></table></div>
       </div>
     </section>`;
   };
@@ -24254,7 +24417,7 @@ ${cleanedText}`, 80),
         <div class="status-sep"></div>
         <div class="status-item"><span id="busyStatus">대기 중</span></div>
         <div class="status-sep"></div>
-        <div class="status-item">shard <span id="statusShardCount">${formatNumber(current.manifest.shardCount || 0)}</span> / <span id="statusShardSize">${formatNumber(current.manifest.shardSize || DEFAULTS.shardSize)}</span></div>
+        <div class="status-item">local shard <span id="statusShardCount">${formatNumber(current.manifest.shardCount || 0)}</span> / <span id="statusShardSize">${formatNumber(current.manifest.shardSize || DEFAULTS.shardSize)}</span> · archive <span id="statusArchiveCount">${formatNumber(current.manifest.archiveCount || 0)}</span></div>
       </div>
       <div id="lastRecallPanel" class="last-recall-panel">${renderLastRecallPanel(Runtime.lastRecall, current.scope.scopeKey)}</div>
       ${buildProviderTab(settings, current.stats).replace('class="panel active"', `class="panel ${activeTab === 'provider' ? 'active' : ''}"`)}
@@ -24767,6 +24930,7 @@ ${cleanedText}`, 80),
     setNodeText('storageShardCountNav', formatNumber(currentShardCount));
     setNodeText('statusShardCount', formatNumber(currentShardCount));
     setNodeText('statusShardSize', formatNumber(currentShardSize));
+    setNodeText('statusArchiveCount', formatNumber(Math.max(0, Number(current.manifest?.archiveCount || 0) || 0)));
     setNodeText('metricEmbeddingCost', formatCostSummary(currentCost));
     setNodeHtml('metricEmbedding', `${escapeHtml(settings.embeddingProvider)}<br><span class="muted">${escapeHtml(settings.embeddingModel)}</span>`);
     setNodeText('metricMode', settings.mode);
@@ -25586,7 +25750,9 @@ ${cleanedText}`, 80),
 
   const debugState = async () => {
     const settings = await loadSettings(true);
-    const scope = await resolveCurrentScope(false);
+    // Diagnostics must never be a hidden mutation trigger. Use the same read-only
+    // scope resolver as the GUI; the background observer owns durable copy adoption.
+    const scope = await resolveCurrentScopeForGui();
     const effectiveSettings = settings;
     Runtime.effectiveSettings = effectiveSettings;
     syncFlashbackRuntimeState(settings, scope);
@@ -25650,6 +25816,7 @@ ${cleanedText}`, 80),
       },
       lastImport: Runtime.lastImport,
       lastClone: Runtime.lastClone,
+      nativeCopyObserver: cloneRuntimeValue(Runtime.nativeCopyObserver, null),
       lastHandoff: Runtime.lastHandoff,
       lastLegacyCompactionRestore: Runtime.lastLegacyCompactionRestore,
       lastLegacyCompactionFinalize: Runtime.lastLegacyCompactionFinalize,
@@ -25962,6 +26129,10 @@ ${cleanedText}`, 80),
       captureAfterRequest: Runtime.settings.captureAfterRequest,
       operationLogEnabled: Runtime.settings.operationLogEnabled
     });
+    // Ordinary chat copies should be adopted before the first model request. The
+    // observer performs only lightweight host identity reads until a real scope
+    // change is detected, then reuses the existing verified clone path.
+    startNativeCopyObserver();
     await readEmbeddingKey({ force: true }).catch(error => warn('embedding key persistence load failed', error));
     await inspectEmbeddingKeyPersistence({ includeArgument: true }).catch(error => warn('embedding key persistence inspection failed', error));
     // Web hosts may remount pluginStorage shortly after a plugin update. Recheck
@@ -26071,6 +26242,8 @@ ${cleanedText}`, 80),
           await withDeadline(flushOperationLogs(), 1500, 'operation log unload flush').catch(() => {});
         }
         abortEmbeddingJobs('plugin_unloaded');
+        Runtime.nativeCopyObserver.running = false;
+        Runtime.nativeCopyObserver.timer = null;
         clearScheduledTimers();
         Runtime.driftChecksInFlight.clear();
         Runtime.driftDismissed.clear();
