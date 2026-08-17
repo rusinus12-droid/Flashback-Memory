@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.1
+//@display-name ⚡ FLASHBACK Memory v0.11.7
 //@api 3.0
-//@version 0.11.1
+//@version 0.11.7
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,68 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.7
+ *
+ * v0.11.7 adds the RE:TRACE peer-compatibility v1 capability handshake. Future
+ * FLASHBACK version bumps are accepted by protocol/feature contract rather than
+ * exact version matching, while the existing immutable-source v2 session handoff,
+ * source fingerprint proof, durable target readback, and archive-backed recall
+ * semantics remain unchanged.
+ *
+ * ⚡ FLASHBACK Memory v0.11.6
+ *
+ * v0.11.6 adds multi-select deletion to Scope Storage Management. Non-current
+ * scope rows have persistent selection checkboxes, a select-all control, and a
+ * batch delete action with explicit confirmation, progress, per-scope failure
+ * isolation, and permanent-session-history protection. The active/current scope
+ * remains deliberately excluded from batch selection and keeps its separate
+ * destructive action, preventing an old-library cleanup from erasing the live
+ * conversation by mistake.
+ *
+ * ⚡ FLASHBACK Memory v0.11.5
+ *
+ * v0.11.5 fixes stale shard counters in the fast GUI repaint path. The sidebar
+ * Storage badge and the top status-bar shard count/size now have stable DOM ids
+ * and are refreshed from the current manifest together with chunks/tokens, so a
+ * background restore or write-through manifest update cannot leave them at the
+ * skeleton-era zero value. This patch changes display synchronization only.
+ *
+ * ⚡ FLASHBACK Memory v0.11.4
+ *
+ * v0.11.4 separates GUI metadata refresh from deep storage inspection and
+ * serializes legacy-compaction recovery before remote vector upgrades. Manifest
+ * writes now update current-scope and storage-list caches directly instead of
+ * invalidating every GUI cache; storage rows render from registry metadata first
+ * and only missing legacy metadata hydrates in the background. The manual memory
+ * viewer reads only the newest/oldest shards needed for ordinary paging, while
+ * search and longest-sort remain exact full scans. Legacy archive recovery no
+ * longer starts episode/worldline/vector work in parallel: current worldline
+ * reconciliation completes first, then episode indexes rebuild, then Voyage or
+ * another remote provider upgrades temporary hash vectors. Concurrently changed
+ * progressive batches are retried later instead of being silently abandoned.
+ *
+ * ⚡ FLASHBACK Memory v0.11.3
+ *
+ * v0.11.3 makes Memory Bridge handoff strictly non-destructive. A source scope
+ * is now read-only during handoff: its manifest, active commit, shards, vector
+ * sidecars, and worldline are fingerprinted before/after, while a separate
+ * immutable archive layer is created for the target. Source compaction is
+ * disabled even through the legacy helper name. Completed transfers receive a
+ * separate handoff receipt for idempotent retries. Legacy v0.11.2 archive-only
+ * source scopes are repaired from verified archives without deleting the archive;
+ * missing archive vectors receive temporary local hash vectors and can later be
+ * upgraded by normal progressive re-embedding.
+ *
+ * ⚡ FLASHBACK Memory v0.11.2
+ *
+ * v0.11.2 makes embedding credentials survive host-specific plugin update and
+ * reinstall paths by maintaining three verified copies: the declared
+ * embedding_key plugin argument, a save-synced pluginStorage backup, and the
+ * existing device-local plugin cache. Startup reconciles whichever copy
+ * survives without changing the selected provider, model, endpoint, or vector
+ * dimensions. Maintenance performs a one-vector remote preflight and never
+ * commits hash fallback vectors over an existing remote-provider corpus.
+ *
  * ⚡ FLASHBACK Memory v0.11.1
  *
  * v0.11.1 hardens turn-worldline reconciliation against transient or incomplete
@@ -259,8 +321,8 @@
  * - Flashback does not read peer runtime state, IPC channels, prompt budgets, canon
  *   snapshots, or retrieval results. It always operates as a standalone memory engine.
  * - PluginStorage is isolated per chat scope. A native copied chat receives a
- *   fresh live branch, while only a validated Memory Bridge handoff turns the
- *   predecessor scope into permanent session history.
+ *   fresh live branch. A validated Memory Bridge handoff creates an immutable
+ *   history layer for the target without modifying the predecessor scope.
  */
 
 (async () => {
@@ -407,7 +469,7 @@
     }
     const knownMethods = [
       'registerSetting', 'registerButton', 'showContainer', 'hideContainer',
-      'addRisuReplacer', 'removeRisuReplacer', 'onUnload', 'getArgument', 'getArg',
+      'addRisuReplacer', 'removeRisuReplacer', 'onUnload', 'getArgument', 'getArg', 'setArgument', 'setArg',
       'getCharacter', 'getChar', 'getDatabase', 'getCurrentCharacterIndex',
       'getCurrentChatIndex', 'getChatFromIndex', 'getLocalPluginStorage',
       'nativeFetch', 'risuFetch'
@@ -550,9 +612,18 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.1';
+  const PLUGIN_VERSION = '0.11.7';
+  const EMBEDDING_KEY_ARGUMENT = 'embedding_key';
+  const EMBEDDING_CREDENTIAL_SCHEMA = 'flashback_memory.embedding_credential.v3';
+  const EMBEDDING_CREDENTIAL_VERSION = 3;
   const PROMPT_CACHE_MIN_PREFIX_TOKENS = 1024;
   const MEMORY_SESSION_BRIDGE_SCHEMA = 'memory-session-bridge-v1';
+  const MEMORY_SESSION_BRIDGE_SCHEMA_V2 = 'memory-session-bridge-v2';
+  const MEMORY_SESSION_BRIDGE_ACCEPTED_SCHEMAS = new Set([MEMORY_SESSION_BRIDGE_SCHEMA, MEMORY_SESSION_BRIDGE_SCHEMA_V2]);
+  const MEMORY_SESSION_HANDOFF_CONTRACT = 'flashback_memory.handoff_immutable_source.v2';
+  const FLASHBACK_HANDOFF_LEDGER_SCHEMA = 'flashback_memory.handoff_ledger.v2';
+  const FLASHBACK_HANDOFF_LEDGER_MAX_RECEIPTS = 96;
+  const FLASHBACK_LEGACY_COMPACTION_RESTORE_VERSION = 1;
   const FLASHBACK_ARCHIVE_REF_SCHEMA = 'flashback_memory.archive_ref.v1';
   const FLASHBACK_ARCHIVE_SCOPE_PREFIX = 'flashback_archive_v1:';
   const FLASHBACK_ARCHIVE_MAX_DEPTH = 256;
@@ -570,6 +641,9 @@
   const MEMORY_SESSION_BRIDGE_PLUGIN_ID = 'flashback_hayaku_bridge';
   const MEMORY_SESSION_BRIDGE_REQUEST_CHANNEL = 'flashback_memory_bridge_request_v1';
   const MEMORY_SESSION_BRIDGE_RESPONSE_CHANNEL = 'flashback_memory_bridge_response_v1';
+  const RETRACE_PEER_COMPATIBILITY_SCHEMA = 'retrace.peer_compatibility.v1';
+  const RETRACE_PEER_PROTOCOL_MAJOR = 1;
+  const FLASHBACK_HANDOFF_RECEIPT_SCHEMA = 'flashback_memory.session_handoff_adoption.v4';
   const INJECTION_HEADER = '[FLASHBACK EVIDENCE]';
   const INJECTION_FOOTER = '[/FLASHBACK EVIDENCE]';
   const ACTIVE_CONTINUITY_EVIDENCE_HEADER = '[ACTIVE CONTINUITY EVIDENCE]';
@@ -613,6 +687,8 @@
     maintenanceJournal: `${PLUGIN_STORAGE_ID}:maintenance_journal:v1`,
     pendingCaptureJournal: `${PLUGIN_STORAGE_ID}:pending_capture_journal:v1`,
     localSecret: `${PLUGIN_STORAGE_ID}:embedding_secret:v2`,
+    syncedSecret: `${PLUGIN_STORAGE_ID}:embedding_secret_synced:v1`,
+    handoffLedger: `${PLUGIN_STORAGE_ID}:handoff_ledger:v2`,
     legacyManifest: `${PLUGIN_STORAGE_ID}:manifest:v1`,
     legacyShardPrefix: `${PLUGIN_STORAGE_ID}:records:shard:`,
     legacyMigration: `${PLUGIN_STORAGE_ID}:legacy_migration:v2`
@@ -986,6 +1062,9 @@
     lastCapture: null,
     lastImport: null,
     lastClone: null,
+    lastHandoff: null,
+    lastLegacyCompactionRestore: null,
+    lastLegacyCompactionFinalize: null,
     lastExternalRetirement: null,
     lastEpisodeIndex: null,
     lastStorageAction: null,
@@ -1004,6 +1083,7 @@
     activityLog: [],
     maintenanceJournal: null,
     maintenanceActiveOperationId: '',
+    lastMaintenanceEmbeddingPreflight: null,
     sessionEmbeddingKey: '',
     embeddingKeyPersistence: Object.freeze({
       requested: false,
@@ -1013,7 +1093,14 @@
       saveSucceeded: false,
       verified: false,
       source: 'none',
-      reason: 'not_checked'
+      effectiveSource: 'none',
+      durableAcrossUpdate: false,
+      recoveredFrom: '',
+      conflict: false,
+      reason: 'not_checked',
+      argument: Object.freeze({ backend: 'pluginArgument', available: false, readable: false, writable: false, removable: false, present: false, verified: false, sourceKey: '', reason: 'not_checked' }),
+      synced: Object.freeze({ backend: 'pluginStorage', available: false, readable: false, writable: false, removable: false, present: false, verified: false, reason: 'not_checked' }),
+      local: Object.freeze({ backend: 'unknown', available: false, readable: false, writable: false, removable: false, present: false, verified: false, reason: 'not_checked' })
     }),
     warnings: [],
     registered: { before: null, after: null, setting: null, button: null, hamburgerButton: null, chatButton: null },
@@ -1047,25 +1134,40 @@
     guiStorageStatsCache: null,
     guiCurrentStatsInFlight: null,
     guiStorageStatsInFlight: null,
+    guiStorageStatsInFlightMode: '',
+    guiStorageHydrationInFlight: new Map(),
     guiCostRefreshInFlight: null,
     guiManualEditorDataCache: null,
+    guiStorageSelectedScopeKeys: new Set(),
+    guiSummaryRepaintScheduled: false,
     guiScopeReadyByKey: new Map(),
     guiLastRememberedScopeKey: '',
     guiLastRememberedScopeAt: 0,
     guiRefreshToken: 0,
+    legacyRestoreFinalizeInFlight: new Map(),
+    progressiveReembedRetryByScope: new Map(),
     guiPerf: {
       fullMounts: 0,
       summaryRefreshes: 0,
+      summaryWriteThroughs: 0,
       storageLoads: 0,
       storageCacheHits: 0,
+      storageRegistryFastLoads: 0,
+      storageBackgroundHydrations: 0,
+      storageBackgroundHydrationRows: 0,
       currentStatsLoads: 0,
       currentStatsCacheHits: 0,
       hiddenRefreshSkips: 0,
       tabFastSwitches: 0,
       manualShardReads: 0,
       manualShardSkips: 0,
+      manualDirectionalEarlyStops: 0,
       manualCacheHits: 0,
-      lastOpenMs: 0
+      lastOpenMs: 0,
+      lastSummaryMs: 0,
+      lastStorageFastMs: 0,
+      lastStorageHydrationMs: 0,
+      lastManualEditorMs: 0
     },
     guiBusyDepth: 0,
     guiBusyLabel: '',
@@ -2529,6 +2631,14 @@
     return PROVIDER_CHOICES.includes(raw) ? raw : DEFAULTS.embeddingProvider;
   };
 
+  const EMBEDDING_CREDENTIAL_REQUIRED_PROVIDERS = Object.freeze(new Set([
+    'openai', 'voyageai', 'voyage_context', 'gemini', 'gemini-embedding',
+    'cohere', 'jina', 'mistral', 'bedrock', 'dashscope', 'vertex', 'vertex-embedding'
+  ]));
+
+  const providerRequiresEmbeddingCredential = provider => EMBEDDING_CREDENTIAL_REQUIRED_PROVIDERS.has(normalizeProvider(provider));
+
+
   const ollamaModelBaseName = (model = '') => {
     const raw = text(model || '').trim().toLowerCase().replace(/@sha256:[a-f0-9]+$/i, '');
     if (!raw) return '';
@@ -3239,24 +3349,94 @@
     } catch (_) { return false; }
   }
 
+  const argumentKeyCandidates = name => [name, `${PLUGIN_SLUG}::${name}`, `${PLUGIN_STORAGE_ID}::${name}`];
+
+  const readPluginArgumentExact = async (key) => {
+    const candidates = [getLiveApi(['getArgument']), getLiveApi(['getArg']), getLiveApi()].filter(Boolean);
+    const seen = new Set();
+    for (const api of candidates) {
+      if (seen.has(api)) continue;
+      seen.add(api);
+      const readers = [];
+      if (typeof api?.getArgument === 'function') readers.push(api.getArgument.bind(api));
+      if (typeof api?.getArg === 'function' && api.getArg !== api.getArgument) readers.push(api.getArg.bind(api));
+      for (const reader of readers) {
+        try {
+          const value = await reader(key);
+          if (value !== undefined && value !== null) return value;
+        } catch (_) {}
+      }
+    }
+    return undefined;
+  };
+
   const getArgument = async (name, fallback = '') => {
-    const names = [name, `${PLUGIN_SLUG}::${name}`, `${PLUGIN_STORAGE_ID}::${name}`];
-    for (const key of names) {
-      const argApi = getLiveApi(['getArgument']) || getLiveApi(['getArg']) || getLiveApi();
-      try {
-        if (typeof argApi?.getArgument === 'function') {
-          const value = await argApi.getArgument(key);
-          if (value !== undefined && value !== null && value !== '') return value;
-        }
-      } catch (_) {}
-      try {
-        if (typeof argApi?.getArg === 'function') {
-          const value = await argApi.getArg(key);
-          if (value !== undefined && value !== null && value !== '') return value;
-        }
-      } catch (_) {}
+    for (const key of argumentKeyCandidates(name)) {
+      const value = await readPluginArgumentExact(key);
+      if (value !== undefined && value !== null && value !== '') return value;
     }
     return fallback;
+  };
+
+  const setPluginArgumentValue = async (name, value) => {
+    const clean = value == null ? '' : String(value);
+    const apiCandidates = [getLiveApi(['setArgument']), getLiveApi(['setArg']), getLiveApi()].filter(Boolean);
+    const writers = [];
+    const seenApis = new Set();
+    for (const api of apiCandidates) {
+      if (seenApis.has(api)) continue;
+      seenApis.add(api);
+      if (typeof api?.setArgument === 'function') writers.push({ api, method: 'setArgument', fn: api.setArgument.bind(api) });
+      if (typeof api?.setArg === 'function' && api.setArg !== api.setArgument) writers.push({ api, method: 'setArg', fn: api.setArg.bind(api) });
+    }
+    const keys = argumentKeyCandidates(name);
+    if (!writers.length) {
+      const current = text(await getArgument(name, '') || '').trim();
+      return { ok: clean ? current === clean : !current, attempted: false, verified: clean ? current === clean : !current, key: '', method: '', reason: 'argument_write_unavailable' };
+    }
+
+    if (!clean) {
+      let attempted = false;
+      let lastError = '';
+      for (const key of keys) {
+        for (const writer of writers) {
+          try {
+            const result = await writer.fn(key, '');
+            if (result === false) continue;
+            attempted = true;
+          } catch (error) {
+            lastError = formatErrorMessage(error, 300);
+          }
+        }
+      }
+      const remaining = text(await getArgument(name, '') || '').trim();
+      return {
+        ok: !remaining && attempted,
+        attempted,
+        verified: !remaining,
+        key: '',
+        method: writers[0]?.method || '',
+        reason: !remaining ? (attempted ? 'argument_cleared' : 'argument_already_blank') : 'argument_clear_verify_failed',
+        error: lastError
+      };
+    }
+
+    let lastError = '';
+    for (const key of keys) {
+      for (const writer of writers) {
+        try {
+          const result = await writer.fn(key, clean);
+          if (result === false) continue;
+          const exact = text(await readPluginArgumentExact(key) || '').trim();
+          if (exact === clean) return { ok: true, attempted: true, verified: true, key, method: writer.method, reason: 'argument_saved_and_verified' };
+          const generic = text(await getArgument(name, '') || '').trim();
+          if (generic === clean) return { ok: true, attempted: true, verified: true, key, method: writer.method, reason: 'argument_saved_and_verified' };
+        } catch (error) {
+          lastError = formatErrorMessage(error, 300);
+        }
+      }
+    }
+    return { ok: false, attempted: true, verified: false, key: '', method: '', reason: 'argument_save_verify_failed', error: lastError };
   };
 
   const NUMERIC_ARGUMENT_NAMES = Object.freeze(new Set([
@@ -3526,6 +3706,10 @@
       peerRuntimeReads: false,
       peerIpc: false,
       ownerLedgerBridgeIpc: true,
+      sourcePreservingHandoff: true,
+      handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT,
+      sourceCompactionOnHandoff: false,
+      retraceCompatibility: flashbackRetraceCompatibility(),
       peerEvidenceSnapshots: false,
       requestTypes: ['model']
     };
@@ -3742,159 +3926,495 @@
     return normalized;
   };
 
-  const storedEmbeddingKeyValue = (value) => {
-    if (value && typeof value === 'object' && value.key) return text(value.key).trim();
-    if (typeof value === 'string' && value.trim()) return value.trim();
-    return '';
+  const storedEmbeddingCredentialMeta = (value) => {
+    let parsed = value;
+    if (typeof value === 'string' && value.trim()) parsed = tryJsonParse(value, value);
+    const key = parsed && typeof parsed === 'object' && parsed.key
+      ? text(parsed.key).trim()
+      : (typeof parsed === 'string' ? parsed.trim() : '');
+    const savedAt = parsed && typeof parsed === 'object' ? text(parsed.savedAt || '').trim() : '';
+    return {
+      key,
+      keyHash: parsed && typeof parsed === 'object' ? text(parsed.keyHash || '').trim() : '',
+      savedAt,
+      savedAtMs: savedAt ? Math.max(0, Date.parse(savedAt) || 0) : 0,
+      version: parsed && typeof parsed === 'object' ? Math.max(0, Number(parsed.version || 0) || 0) : 0
+    };
   };
 
+  const storedEmbeddingKeyValue = value => storedEmbeddingCredentialMeta(value).key;
+
+  const embeddingCredentialEnvelope = (key = '') => ({
+    schema: EMBEDDING_CREDENTIAL_SCHEMA,
+    version: EMBEDDING_CREDENTIAL_VERSION,
+    savedAt: nowIso(),
+    providerHint: normalizeProvider(Runtime.settings?.embeddingProvider || DEFAULTS.embeddingProvider),
+    keyHash: key ? stableHash(key) : '',
+    key: text(key || '').trim()
+  });
+
+  const embeddingArgumentBackendState = async () => {
+    const candidates = getApiCandidates();
+    const readable = candidates.some(api => typeof api?.getArgument === 'function' || typeof api?.getArg === 'function');
+    const writable = candidates.some(api => typeof api?.setArgument === 'function' || typeof api?.setArg === 'function');
+    let value = '';
+    let sourceKey = '';
+    if (readable) {
+      for (const key of argumentKeyCandidates(EMBEDDING_KEY_ARGUMENT)) {
+        const candidate = text(await readPluginArgumentExact(key) || '').trim();
+        if (!candidate) continue;
+        value = candidate;
+        sourceKey = key;
+        break;
+      }
+    }
+    return {
+      value,
+      backend: 'pluginArgument',
+      available: readable || writable,
+      readable,
+      writable,
+      removable: writable,
+      present: !!value,
+      verified: !!value && readable,
+      sourceKey,
+      reason: !readable && !writable ? 'argument_api_unavailable' : (value ? 'argument_key_available' : 'argument_key_missing')
+    };
+  };
+
+  const embeddingSyncedBackendState = async () => {
+    const storeApi = getLiveApi();
+    const readable = typeof storeApi?.pluginStorage?.getItem === 'function';
+    const writable = typeof storeApi?.pluginStorage?.setItem === 'function';
+    const removable = typeof storeApi?.pluginStorage?.removeItem === 'function' || writable;
+    let raw = null;
+    let readError = '';
+    if (readable) {
+      try { raw = await RisuCompat.getItem(STORAGE.syncedSecret); }
+      catch (error) { readError = formatErrorMessage(error, 300); }
+    }
+    const credential = storedEmbeddingCredentialMeta(raw);
+    const value = credential.key;
+    return {
+      value,
+      savedAt: credential.savedAt,
+      savedAtMs: credential.savedAtMs,
+      keyHash: credential.keyHash,
+      credentialVersion: credential.version,
+      backend: 'pluginStorage',
+      available: readable || writable,
+      readable,
+      writable,
+      removable,
+      present: !!value,
+      verified: !!value && readable && !readError,
+      reason: readError ? 'synced_key_read_failed' : (!readable && !writable ? 'synced_storage_unavailable' : (value ? 'synced_key_available' : 'synced_key_missing')),
+      error: readError
+    };
+  };
+
+  const embeddingLocalBackendState = async () => {
+    const storage = await RisuCompat.localStorageStatus();
+    const raw = storage.readable ? await RisuCompat.localGetItem(STORAGE.localSecret) : null;
+    const credential = storedEmbeddingCredentialMeta(raw);
+    const value = credential.key;
+    return {
+      value,
+      savedAt: credential.savedAt,
+      savedAtMs: credential.savedAtMs,
+      keyHash: credential.keyHash,
+      credentialVersion: credential.version,
+      backend: text(storage.backend || 'unavailable'),
+      available: !!storage.available,
+      readable: !!storage.readable,
+      writable: !!storage.writable,
+      removable: !!storage.removable,
+      present: !!value,
+      verified: !!value && !!storage.readable,
+      reason: !storage.available ? 'local_storage_unavailable' : (value ? 'local_key_available' : 'local_key_missing')
+    };
+  };
+
+  const publicEmbeddingBackendState = (state = {}, fallbackBackend = 'unknown') => Object.freeze({
+    backend: text(state?.backend || fallbackBackend),
+    available: !!state?.available,
+    readable: !!state?.readable,
+    writable: !!state?.writable,
+    removable: !!state?.removable,
+    present: !!state?.present,
+    verified: !!state?.verified,
+    sourceKey: text(state?.sourceKey || ''),
+    savedAt: text(state?.savedAt || ''),
+    reason: text(state?.reason || ''),
+    error: text(state?.error || '')
+  });
+
   const setEmbeddingKeyPersistenceStatus = (status = {}) => {
+    const argument = publicEmbeddingBackendState(status.argument || {}, 'pluginArgument');
+    const synced = publicEmbeddingBackendState(status.synced || {}, 'pluginStorage');
+    const local = publicEmbeddingBackendState(status.local || {}, 'unavailable');
+    const durable = status.durableAcrossUpdate != null
+      ? !!status.durableAcrossUpdate
+      : !!(argument.verified || synced.verified);
     Runtime.embeddingKeyPersistence = Object.freeze({
       requested: !!status.requested,
-      backend: text(status.backend || 'unavailable'),
-      available: !!status.available,
+      backend: text(status.backend || [argument.verified ? 'pluginArgument' : '', synced.verified ? 'pluginStorage' : '', local.verified ? local.backend : ''].filter(Boolean).join('+') || 'unavailable'),
+      available: status.available != null ? !!status.available : !!(argument.available || synced.available || local.available),
       keyPresent: !!status.keyPresent,
       saveSucceeded: !!status.saveSucceeded,
       verified: !!status.verified,
-      source: text(status.source || 'none'),
-      reason: text(status.reason || '')
+      source: text(status.source || status.effectiveSource || 'none'),
+      effectiveSource: text(status.effectiveSource || status.source || 'none'),
+      durableAcrossUpdate: durable,
+      recoveredFrom: text(status.recoveredFrom || ''),
+      conflict: !!status.conflict,
+      reason: text(status.reason || ''),
+      argument,
+      synced,
+      local
     });
     return Runtime.embeddingKeyPersistence;
   };
 
   const embeddingKeyPersistenceError = (code, message, status = {}) => {
-    setEmbeddingKeyPersistenceStatus({ ...status, saveSucceeded: false, verified: false, reason: code.toLowerCase() });
+    const persistence = setEmbeddingKeyPersistenceStatus({ ...status, saveSucceeded: false, reason: code.toLowerCase() });
     const error = new Error(message);
     error.code = code;
+    error.persistence = persistence;
     return error;
   };
 
-  const inspectEmbeddingKeyPersistence = async ({ includeArgument = false } = {}) => {
-    const storage = await RisuCompat.localStorageStatus();
-    const localValue = storage.readable
-      ? await RisuCompat.localGetItem(STORAGE.localSecret)
-      : null;
-    const localKeyPresent = !!storedEmbeddingKeyValue(localValue);
-    const argumentKeyPresent = includeArgument
-      ? !!text(await getArgument('embedding_key', '') || '').trim()
-      : false;
-    const source = Runtime.sessionEmbeddingKey
-      ? (Runtime.embeddingKeyPersistence?.source === 'local' ? 'local' : 'session')
-      : (localKeyPresent ? 'local' : (argumentKeyPresent ? 'argument' : 'none'));
+  const credentialBackendMatches = (state = {}, key = '') => !!(
+    key && state?.verified && text(state?.value || '').trim() === key
+  );
+
+  const credentialSourceFor = (argument, synced, local, key = '') => {
+    const sources = [];
+    if (credentialBackendMatches(argument, key)) sources.push('argument');
+    if (credentialBackendMatches(synced, key)) sources.push('synced');
+    if (credentialBackendMatches(local, key)) sources.push('local');
+    return sources.length ? sources.join('+') : (key ? 'session' : 'none');
+  };
+
+  const selectEmbeddingCredential = (argument = {}, synced = {}, local = {}) => {
+    const entries = [
+      { backend: 'argument', state: argument, durable: true, preference: 2 },
+      { backend: 'synced', state: synced, durable: true, preference: 3 },
+      { backend: 'local', state: local, durable: false, preference: 1 }
+    ].filter(entry => text(entry.state?.value || '').trim());
+    if (!entries.length) return { key: '', origin: 'none', reason: 'stored_key_missing', conflict: false };
+
+    const groups = new Map();
+    for (const entry of entries) {
+      const key = text(entry.state.value).trim();
+      if (!groups.has(key)) groups.set(key, { key, entries: [], maxSavedAtMs: 0, preference: 0, durable: false });
+      const group = groups.get(key);
+      group.entries.push(entry);
+      group.maxSavedAtMs = Math.max(group.maxSavedAtMs, Number(entry.state.savedAtMs || 0) || 0);
+      group.preference = Math.max(group.preference, entry.preference);
+      group.durable = group.durable || entry.durable;
+    }
+    const ranked = Array.from(groups.values()).sort((a, b) =>
+      b.entries.length - a.entries.length
+      || Number(b.durable) - Number(a.durable)
+      || b.preference - a.preference
+      || b.maxSavedAtMs - a.maxSavedAtMs
+      || a.key.localeCompare(b.key)
+    );
+    const selected = ranked[0];
+    const order = { argument: 0, synced: 1, local: 2 };
+    const origin = selected.entries.map(entry => entry.backend).sort((a, b) => order[a] - order[b]).join('+');
+    const conflict = groups.size > 1;
+    return {
+      key: selected.key,
+      origin,
+      conflict,
+      reason: !conflict
+        ? 'credential_consensus'
+        : (selected.entries.length >= 2
+          ? 'credential_majority_selected'
+          : (origin === 'synced' ? 'synced_credential_selected' : `${origin}_credential_selected`))
+    };
+  };
+
+  const credentialStatusFromBackends = ({ argument, synced, local, effectiveKey = '', effectiveSource = '', reason = '', recoveredFrom = '', conflict = false, saveSucceeded = null } = {}) => {
+    const key = text(effectiveKey || '').trim();
+    const argumentVerified = credentialBackendMatches(argument, key);
+    const syncedVerified = credentialBackendMatches(synced, key);
+    const localVerified = credentialBackendMatches(local, key);
+    const source = effectiveSource || credentialSourceFor(argument, synced, local, key);
+    const durable = argumentVerified || syncedVerified;
     return setEmbeddingKeyPersistenceStatus({
       requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: localKeyPresent,
-      saveSucceeded: localKeyPresent && !!Runtime.embeddingKeyPersistence?.saveSucceeded,
-      verified: localKeyPresent,
+      argument: { ...argument, verified: argumentVerified },
+      synced: { ...synced, verified: syncedVerified },
+      local: { ...local, verified: localVerified },
+      keyPresent: !!key,
+      verified: !!key && (argumentVerified || syncedVerified || localVerified || source === 'session'),
+      saveSucceeded: saveSucceeded == null ? durable : !!saveSucceeded,
+      effectiveSource: source,
       source,
-      reason: !storage.available ? 'storage_unavailable' : (localKeyPresent ? 'stored_key_available' : 'stored_key_missing')
+      durableAcrossUpdate: durable,
+      recoveredFrom,
+      conflict,
+      reason: reason || (!key
+        ? 'stored_key_missing'
+        : (argumentVerified && syncedVerified && localVerified
+          ? 'credential_verified_all_stores'
+          : (durable ? 'credential_verified_durable_store' : (localVerified ? 'local_key_available_update_risk' : 'session_key_only'))))
     });
   };
 
-  const readEmbeddingKey = async () => {
-    if (Runtime.sessionEmbeddingKey) return Runtime.sessionEmbeddingKey;
-    const storage = await RisuCompat.localStorageStatus();
-    const local = storage.readable ? await RisuCompat.localGetItem(STORAGE.localSecret) : null;
-    const localKey = storedEmbeddingKeyValue(local);
-    if (localKey) {
-      Runtime.sessionEmbeddingKey = localKey;
-      setEmbeddingKeyPersistenceStatus({
-        requested: true,
-        backend: storage.backend,
-        available: storage.available,
-        keyPresent: true,
-        saveSucceeded: Runtime.embeddingKeyPersistence?.saveSucceeded,
-        verified: true,
-        source: 'local',
-        reason: 'stored_key_loaded'
-      });
-      return localKey;
+  const writeEmbeddingKeyLocalBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const before = await embeddingLocalBackendState();
+    if (!clean) {
+      if (!before.present && before.readable) return { ...before, ok: true, verified: true, reason: 'local_key_already_blank' };
+      if (!before.removable) return { ...before, ok: false, verified: false, reason: 'local_key_clear_unavailable' };
+      const removed = await RisuCompat.localRemoveItem(STORAGE.localSecret);
+      const after = await embeddingLocalBackendState();
+      return { ...after, ok: !!removed && !after.present, verified: !!after.readable && !after.present, reason: !after.present ? 'local_key_cleared' : 'local_key_clear_verify_failed' };
     }
-    setEmbeddingKeyPersistenceStatus({
-      requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: false,
-      saveSucceeded: false,
-      verified: false,
-      source: 'none',
-      reason: storage.available ? 'stored_key_missing' : 'storage_unavailable'
+    if (!before.readable || !before.writable) return { ...before, ok: false, verified: false, reason: 'local_key_write_unavailable' };
+    const saved = await RisuCompat.localSetItem(STORAGE.localSecret, embeddingCredentialEnvelope(clean));
+    const after = await embeddingLocalBackendState();
+    return { ...after, ok: !!saved && after.value === clean, verified: !!saved && after.value === clean, reason: after.value === clean ? 'local_key_saved_and_verified' : 'local_key_save_verify_failed' };
+  };
+
+  const writeEmbeddingKeySyncedBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const before = await embeddingSyncedBackendState();
+    if (!clean) {
+      if (!before.present && before.readable) return { ...before, ok: true, verified: true, reason: 'synced_key_already_blank' };
+      if (!before.removable) return { ...before, ok: false, verified: false, reason: 'synced_key_clear_unavailable' };
+      let removed = false;
+      try { removed = await RisuCompat.removeItem(STORAGE.syncedSecret); } catch (_) { removed = false; }
+      const after = await embeddingSyncedBackendState();
+      return { ...after, ok: !!removed && !after.present, verified: !!after.readable && !after.present, reason: !after.present ? 'synced_key_cleared' : 'synced_key_clear_verify_failed' };
+    }
+    if (!before.readable || !before.writable) return { ...before, ok: false, verified: false, reason: 'synced_key_write_unavailable' };
+    let saved = false;
+    try {
+      await requireStorageWrite(STORAGE.syncedSecret, safeStringify(embeddingCredentialEnvelope(clean)), 'synced embedding key save');
+      saved = true;
+    } catch (_) { saved = false; }
+    const after = await embeddingSyncedBackendState();
+    return { ...after, ok: saved && after.value === clean, verified: saved && after.value === clean, reason: after.value === clean ? 'synced_key_saved_and_verified' : 'synced_key_save_verify_failed' };
+  };
+
+  const writeEmbeddingKeyArgumentBackend = async (key) => {
+    const clean = text(key || '').trim();
+    const write = await setPluginArgumentValue(EMBEDDING_KEY_ARGUMENT, clean);
+    const after = await embeddingArgumentBackendState();
+    const verified = clean ? after.value === clean : !after.present;
+    return {
+      ...after,
+      ok: verified && (write.ok || write.reason === 'argument_already_blank'),
+      verified,
+      reason: verified ? (clean ? 'argument_key_saved_and_verified' : 'argument_key_cleared') : (write.reason || 'argument_key_write_failed'),
+      writeAttempted: !!write.attempted,
+      writeMethod: text(write.method || ''),
+      error: text(write.error || '')
+    };
+  };
+
+  const inspectEmbeddingKeyPersistence = async (_options = {}) => {
+    const [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const session = text(Runtime.sessionEmbeddingKey || '').trim();
+    const selected = selectEmbeddingCredential(argument, synced, local);
+    const effectiveKey = session || selected.key;
+    return credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey,
+      effectiveSource: credentialSourceFor(argument, synced, local, effectiveKey),
+      conflict: selected.conflict,
+      reason: !effectiveKey ? 'stored_key_missing' : (selected.conflict ? selected.reason : 'credential_inspected')
     });
-    const argumentKey = text(await getArgument('embedding_key', '') || '').trim();
-    if (argumentKey) {
-      Runtime.sessionEmbeddingKey = argumentKey;
-      try {
-        await saveEmbeddingKeyLocal(argumentKey);
-      } catch (_) {
-        setEmbeddingKeyPersistenceStatus({
-          ...Runtime.embeddingKeyPersistence,
-          requested: true,
-          source: 'argument',
-          reason: 'argument_key_loaded_storage_unavailable'
-        });
+  };
+
+  const readEmbeddingKey = async (options = {}) => {
+    if (Runtime.sessionEmbeddingKey && options.force !== true) return Runtime.sessionEmbeddingKey;
+    let [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const selection = selectEmbeddingCredential(argument, synced, local);
+    const conflict = selection.conflict;
+    const selected = selection.key;
+    const selectedOrigin = selection.origin;
+    const recoveredStores = [];
+
+    if (selected) {
+      // Repair the non-refreshing stores first. Some hosts may reload a plugin when
+      // setArgument mutates metadata, so a synced/local copy must already exist.
+      if (synced.value !== selected) {
+        const repaired = await writeEmbeddingKeySyncedBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('synced');
       }
+      if (local.value !== selected) {
+        const repaired = await writeEmbeddingKeyLocalBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('local');
+      }
+      if (argument.value !== selected) {
+        const repaired = await writeEmbeddingKeyArgumentBackend(selected).catch(() => null);
+        if (repaired?.verified) recoveredStores.push('argument');
+      }
+      [argument, synced, local] = await Promise.all([
+        embeddingArgumentBackendState(),
+        embeddingSyncedBackendState(),
+        embeddingLocalBackendState()
+      ]);
     }
-    return argumentKey;
+
+    Runtime.sessionEmbeddingKey = selected;
+    const finalValues = [argument.value, synced.value, local.value].map(value => text(value || '').trim()).filter(Boolean);
+    const finalConflict = new Set(finalValues).size > 1;
+    const status = credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey: selected,
+      effectiveSource: credentialSourceFor(argument, synced, local, selected),
+      recoveredFrom: recoveredStores.length ? selectedOrigin : '',
+      conflict: finalConflict,
+      reason: !selected
+        ? 'stored_key_missing'
+        : (recoveredStores.length
+          ? `${selection.reason}_reconciled_${recoveredStores.join('_')}`
+          : (finalConflict ? selection.reason : 'credential_loaded')),
+      saveSucceeded: !!selected && (credentialBackendMatches(argument, selected) || credentialBackendMatches(synced, selected))
+    });
+    if (selected && recoveredStores.length) {
+      pushActivityLog('embedding_key_recovered', '저장된 임베딩 키를 복구해 영속 저장소를 다시 맞췄습니다.', {
+        recoveredFrom: selectedOrigin,
+        repairedStores: recoveredStores,
+        durableAcrossUpdate: status.durableAcrossUpdate
+      }, status.durableAcrossUpdate ? 'success' : 'warn');
+    }
+    return selected;
   };
 
+  // Backward-compatible public name. v0.11.2 persists and verifies the current
+  // credential in the plugin argument, save-synced pluginStorage, and the
+  // device-local plugin cache. Provider/model settings are never rewritten here.
   const saveEmbeddingKeyLocal = async (key) => {
     const clean = text(key || '').trim();
     const previous = Runtime.sessionEmbeddingKey;
     if (previous !== clean) abortEmbeddingJobs('credential_changed');
     Runtime.sessionEmbeddingKey = clean;
-    const storage = await RisuCompat.localStorageStatus();
-    const baseStatus = {
-      requested: true,
-      backend: storage.backend,
-      available: storage.available,
-      keyPresent: false,
-      source: clean ? 'session' : 'none'
-    };
 
     if (!clean) {
-      if (!storage.removable) {
-        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_UNAVAILABLE', '임베딩 키 로컬 저장소를 사용할 수 없어 삭제 여부를 확인하지 못했습니다.', baseStatus);
+      await writeEmbeddingKeyLocalBackend('').catch(() => null);
+      await writeEmbeddingKeySyncedBackend('').catch(() => null);
+      await writeEmbeddingKeyArgumentBackend('').catch(() => null);
+      const [argument, synced, local] = await Promise.all([
+        embeddingArgumentBackendState(),
+        embeddingSyncedBackendState(),
+        embeddingLocalBackendState()
+      ]);
+      if (argument.present || synced.present || local.present) {
+        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_FAILED', '임베딩 키를 모든 영속 저장소에서 삭제하지 못했습니다.', {
+          requested: true,
+          argument,
+          synced,
+          local,
+          keyPresent: true,
+          effectiveSource: credentialSourceFor(argument, synced, local, argument.value || synced.value || local.value || ''),
+          reason: 'credential_clear_verify_failed'
+        });
       }
-      const removed = await RisuCompat.localRemoveItem(STORAGE.localSecret);
-      const remaining = storage.readable ? storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret)) : '';
-      if (!removed || remaining) {
-        throw embeddingKeyPersistenceError('EMBEDDING_KEY_CLEAR_FAILED', '로컬 저장소에서 임베딩 키를 삭제하지 못했습니다.', { ...baseStatus, keyPresent: !!remaining });
-      }
-      return setEmbeddingKeyPersistenceStatus({
-        ...baseStatus,
-        saveSucceeded: true,
-        verified: storage.readable,
-        reason: 'stored_key_cleared'
+      return credentialStatusFromBackends({
+        argument,
+        synced,
+        local,
+        effectiveKey: '',
+        effectiveSource: 'none',
+        reason: 'credential_cleared_all_stores',
+        saveSucceeded: true
       });
     }
 
-    if (!storage.readable || !storage.writable) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_UNAVAILABLE', '임베딩 키를 유지할 로컬 저장소를 사용할 수 없습니다.', baseStatus);
+    // Store non-refreshing copies first, then write the declared argument.
+    await writeEmbeddingKeyLocalBackend(clean).catch(() => null);
+    await writeEmbeddingKeySyncedBackend(clean).catch(() => null);
+    await writeEmbeddingKeyArgumentBackend(clean).catch(() => null);
+    const [argument, synced, local] = await Promise.all([
+      embeddingArgumentBackendState(),
+      embeddingSyncedBackendState(),
+      embeddingLocalBackendState()
+    ]);
+    const argumentVerified = credentialBackendMatches(argument, clean);
+    const syncedVerified = credentialBackendMatches(synced, clean);
+    const localVerified = credentialBackendMatches(local, clean);
+    const durable = argumentVerified || syncedVerified;
+    const matchingCopies = [argumentVerified, syncedVerified, localVerified].filter(Boolean).length;
+    const conflictingCopies = [argument, synced, local].filter(state => state?.present && text(state.value || '').trim() !== clean).length;
+    if (!durable) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_DURABILITY_FAILED', '임베딩 키는 현재 세션에 적용됐지만 업데이트 후에도 유지되는 저장소에 기록하지 못했습니다.', {
+        requested: true,
+        argument,
+        synced,
+        local,
+        keyPresent: true,
+        effectiveSource: localVerified ? 'local' : 'session',
+        reason: 'durable_credential_store_unavailable'
+      });
     }
-    const saved = await RisuCompat.localSetItem(STORAGE.localSecret, { savedAt: nowIso(), key: clean });
-    if (!saved) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_FAILED', '임베딩 키 로컬 저장에 실패했습니다.', baseStatus);
+    // Never report a save as durable when one new copy is outvoted by a stale
+    // surviving credential. Two matching copies form a deterministic recovery
+    // majority; one matching durable copy is accepted only when other stores are
+    // blank or unavailable rather than contradictory.
+    if (conflictingCopies > 0 && matchingCopies < 2) {
+      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_CONFLICT', '임베딩 키는 한 저장소에 기록됐지만 이전 키가 다른 저장소에 남아 있어 업데이트 후 복구 값을 확정할 수 없습니다. 다시 저장해 주세요.', {
+        requested: true,
+        argument: { ...argument, verified: argumentVerified },
+        synced: { ...synced, verified: syncedVerified },
+        local: { ...local, verified: localVerified },
+        keyPresent: true,
+        effectiveSource: credentialSourceFor(argument, synced, local, clean),
+        conflict: true,
+        reason: 'credential_save_conflict_unresolved'
+      });
     }
-    const verifiedKey = storedEmbeddingKeyValue(await RisuCompat.localGetItem(STORAGE.localSecret));
-    if (verifiedKey !== clean) {
-      throw embeddingKeyPersistenceError('EMBEDDING_KEY_PERSIST_VERIFY_FAILED', '임베딩 키 저장 후 재조회 검증에 실패했습니다.', baseStatus);
-    }
-    return setEmbeddingKeyPersistenceStatus({
-      ...baseStatus,
-      keyPresent: true,
-      saveSucceeded: true,
-      verified: true,
-      source: 'local',
-      reason: 'saved_and_verified'
+    const status = credentialStatusFromBackends({
+      argument,
+      synced,
+      local,
+      effectiveKey: clean,
+      effectiveSource: credentialSourceFor(argument, synced, local, clean),
+      reason: argumentVerified && syncedVerified && localVerified
+        ? 'credential_saved_and_verified_all_stores'
+        : 'credential_saved_and_verified_durable_store',
+      saveSucceeded: true
     });
+    if (!argumentVerified || !syncedVerified || !localVerified) {
+      warn('embedding key saved with partial backend availability', {
+        argumentVerified,
+        syncedVerified,
+        localVerified
+      });
+    }
+    return status;
   };
+
+  const saveEmbeddingCredential = saveEmbeddingKeyLocal;
 
   const embeddingKeyPersistenceStatusText = () => {
     const status = Runtime.embeddingKeyPersistence || {};
-    if (status.verified && status.keyPresent) return `키 유지 확인됨 · ${status.backend}`;
-    if (!status.available) return '키 유지 실패 · 사용할 수 있는 로컬 저장소가 없습니다.';
+    if (status.keyPresent && status.argument?.verified && status.synced?.verified && status.local?.verified) return '키 유지 확인됨 · 설정 + 동기화 백업 + 로컬';
+    if (status.keyPresent && status.synced?.verified && status.local?.verified) return '키 유지 확인됨 · 동기화 백업 + 로컬';
+    if (status.keyPresent && status.argument?.verified && status.local?.verified) return '키 유지 확인됨 · 플러그인 설정 + 로컬';
+    if (status.keyPresent && status.synced?.verified) return '키 유지 확인됨 · 동기화 백업';
+    if (status.keyPresent && status.argument?.verified) return '키 유지 확인됨 · 플러그인 설정';
+    if (status.keyPresent && status.local?.verified) return '키는 현재 기기에만 저장됨 · 업데이트 후 유실 위험';
+    if (!status.available) return '키 유지 실패 · 사용할 수 있는 저장소가 없습니다.';
     return '키 유지 대기 · 키를 입력하고 저장해 주세요.';
   };
 
@@ -4455,10 +4975,11 @@
     Runtime.embeddingControllers.clear();
     Runtime.embeddingActiveRequests.clear();
     Runtime.queryEmbeddingInFlight.clear();
-    if (reason === 'settings_changed') {
+    if (reason === 'settings_changed' || reason === 'credential_changed') {
       const invalidatedQueries = Runtime.queryEmbeddingCache.size;
       Runtime.queryEmbeddingCache.clear();
       Runtime.documentEmbeddingCache.clear();
+      Runtime.lastMaintenanceEmbeddingPreflight = null;
       if (invalidatedQueries) Runtime.queryEmbeddingCacheStats.invalidations += invalidatedQueries;
     }
     return Runtime.embeddingGeneration;
@@ -5403,13 +5924,14 @@
     const startedAt = Date.now();
     Runtime.lastEmbedUsedFallback = false;
     Runtime.lastEmbedError = '';
+    const allowHashFallback = options.allowHashFallback !== false && cfg.fallbackHashEmbedding === true;
     try {
       const result = await createEmbeddingProviderAdapter(cfg).embedTexts(list, { ...options, purpose: options.purpose || (options.taskType === 'query' ? 'query' : 'document') });
       return tagEmbeddingVectorsExtended(result.vectors, result, false);
     } catch (rawError) {
       const error = classifyEmbeddingError(rawError, { provider: cfg.embeddingProvider });
-      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: Math.max(0, Date.now() - startedAt), cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: cfg.fallbackHashEmbedding === true });
-      if (!cfg.fallbackHashEmbedding || error.type === 'ABORTED') throw error;
+      recordEmbeddingDiagnostic({ provider: normalizeProvider(cfg.embeddingProvider), model: cfg.embeddingModel, dimensions: cfg.embeddingDimensions || 0, profileId: embeddingProfileId(cfg, cfg.embeddingDimensions || 0), baseUrlMasked: maskedEmbeddingUrl(cfg.embeddingEndpoint || cfg.embeddingUrl), requestPurpose: options.purpose || options.taskType || 'document', inputCount: list.length, inputCharacters: list.reduce((sum, item) => sum + item.length, 0), batchCount: 0, elapsedMs: Math.max(0, Date.now() - startedAt), cacheHits: 0, cacheMisses: list.length, retryCount: Number(error.retryCount || 0) || 0, errorType: error.type, fallbackUsed: allowHashFallback });
+      if (!allowHashFallback || error.type === 'ABORTED') throw error;
       warn('embedding endpoint failed; using hash fallback for all texts (dimension drift guard)', error);
       Runtime.lastEmbedUsedFallback = true;
       Runtime.lastEmbedError = sanitizeEmbeddingErrorMessage(error.message || error.type);
@@ -5900,7 +6422,7 @@
       ? chat.memorySessionBridge
       : null;
     if (!marker) return { present: false, valid: false, reason: 'bridge_marker_absent', marker: null };
-    if (marker.schema !== MEMORY_SESSION_BRIDGE_SCHEMA) {
+    if (!MEMORY_SESSION_BRIDGE_ACCEPTED_SCHEMAS.has(text(marker.schema || '').trim())) {
       return { present: true, valid: false, reason: 'bridge_schema_invalid', marker };
     }
     if (marker.includeFlashback !== true) {
@@ -6410,9 +6932,19 @@
     for (const transientKey of ['manifestCorrupt', 'manifestRawPresent', 'foreignScopeKey', 'expectedCount', 'missingShards', 'corruptShards', 'recordCountMismatch']) delete next[transientKey];
     await requireStorageWrite(scopeKeys.manifest(next.scopeKey), safeStringify(next), 'scope manifest save');
     const registryScope = { ...scope, ...next };
+    const displayStats = normalizeStatsForDisplay(next.stats && typeof next.stats === 'object' ? next.stats : statsForRecords([]));
+    const responseStats = displayStats.byType?.response || {};
+    const episodeStats = displayStats.byType?.episode_index || {};
     const registryExtra = {
-      count: next.count,
-      tokenTotal: next.stats?.tokenTotal || 0,
+      guiSummaryVersion: 1,
+      count: Number(next.count || displayStats.recordTotal || 0) || 0,
+      tokenTotal: Number(displayStats.tokenTotal || 0) || 0,
+      responseCount: Number(responseStats.records || 0) || 0,
+      responseTokens: Number(responseStats.tokens || 0) || 0,
+      episodeCount: Number(episodeStats.records || 0) || 0,
+      episodeTokens: Number(episodeStats.tokens || 0) || 0,
+      shardCount: Math.max(0, Number(next.shardCount || 0) || 0),
+      commitId: text(next.commitId || ''),
       updatedAt: Date.now(),
       copiedFromScopeKey: next.copiedFromScopeKey || '',
       copiedFromChatId: next.copiedFromChatId || '',
@@ -6426,7 +6958,7 @@
         queueScopeRegistryRetry(registryScope, registryExtra, error);
       }
     }
-    invalidateGuiDataCache('all');
+    syncGuiCachesAfterManifestSave(next, registryScope, existing);
     return next;
   };
 
@@ -6621,6 +7153,112 @@
       byType[type].tokens += Number(value.tokens || 0) || 0;
     }
     return { ...stats, byType };
+  };
+
+  const guiStatsFromRegistryMeta = (meta = {}) => {
+    const responseRecords = Math.max(0, Number(meta.responseCount || 0) || 0);
+    const responseTokens = Math.max(0, Number(meta.responseTokens || 0) || 0);
+    const episodeRecords = Math.max(0, Number(meta.episodeCount || 0) || 0);
+    const episodeTokens = Math.max(0, Number(meta.episodeTokens || 0) || 0);
+    const recordTotal = Math.max(0, Number(meta.count || responseRecords + episodeRecords || 0) || 0);
+    const tokenTotal = Math.max(0, Number(meta.tokenTotal || responseTokens + episodeTokens || 0) || 0);
+    return normalizeStatsForDisplay({
+      byType: {
+        ...(responseRecords || responseTokens ? { response: { records: responseRecords, chars: 0, tokens: responseTokens } } : {}),
+        ...(episodeRecords || episodeTokens ? { episode_index: { records: episodeRecords, chars: 0, tokens: episodeTokens } } : {})
+      },
+      recordTotal,
+      charTotal: 0,
+      tokenTotal,
+      embeddingCost: null
+    });
+  };
+
+  const guiStorageRowFromRegistryMeta = (meta = {}) => {
+    const stats = guiStatsFromRegistryMeta(meta);
+    return {
+      ...meta,
+      stats,
+      count: Math.max(0, Number(meta.count || stats.recordTotal || 0) || 0),
+      shardCount: Math.max(0, Number(meta.shardCount || 0) || 0),
+      commitId: text(meta.commitId || ''),
+      updatedAt: meta.updatedAt || meta.seenAt || 0,
+      guiSummaryComplete: Number(meta.guiSummaryVersion || 0) >= 1
+    };
+  };
+
+  const guiStorageRowFromManifest = (manifest = {}, scope = {}) => {
+    const stats = normalizeStatsForDisplay(manifest.stats && typeof manifest.stats === 'object' ? manifest.stats : statsForRecords([]));
+    return {
+      ...scope,
+      ...manifest,
+      manifest,
+      stats,
+      count: Math.max(0, Number(manifest.count || stats.recordTotal || 0) || 0),
+      shardCount: Math.max(0, Number(manifest.shardCount || 0) || 0),
+      commitId: text(manifest.commitId || ''),
+      updatedAt: manifest.updatedAt || scope.updatedAt || scope.seenAt || 0,
+      guiSummaryComplete: true
+    };
+  };
+
+  const guiCurrentValueFromManifest = (manifest = {}, scope = {}) => {
+    const stats = normalizeStatsForDisplay(manifest.stats && typeof manifest.stats === 'object' ? manifest.stats : statsForRecords([]));
+    const resolvedScope = {
+      ...(Runtime.currentScope || {}),
+      ...scope,
+      scopeKey: text(manifest.scopeKey || scope.scopeKey || Runtime.currentScope?.scopeKey || '')
+    };
+    const count = Math.max(0, Number(manifest.count || stats.recordTotal || 0) || 0);
+    return { scope: resolvedScope, manifest: { ...manifest, stats, count }, records: { length: count }, stats };
+  };
+
+  const scheduleGuiWriteThroughRepaint = () => {
+    if (!isGuiRenderActive() || Runtime.guiSummaryRepaintScheduled) return false;
+    Runtime.guiSummaryRepaintScheduled = true;
+    scheduleTimer(() => {
+      Runtime.guiSummaryRepaintScheduled = false;
+      if (!isGuiRenderActive()) return;
+      const token = Runtime.guiRefreshToken;
+      updateGuiSummary({ refreshToken: token, preferCache: true })
+        .then(() => {
+          if (!isGuiRenderActive() || Runtime.guiTab !== 'storage') return;
+          const rows = Runtime.guiStorageStatsCache?.rows;
+          const scopeKey = Runtime.guiCurrentStatsCache?.value?.scope?.scopeKey || Runtime.currentScope?.scopeKey || '';
+          if (Array.isArray(rows)) {
+            renderStorageRowsChunked(rows, scopeKey, { refreshToken: token })
+              .catch(error => warn('write-through storage repaint failed', error));
+          }
+        })
+        .catch(error => warn('write-through GUI summary repaint failed', error));
+    }, 60);
+    return true;
+  };
+
+  const syncGuiCachesAfterManifestSave = (manifest = {}, scope = {}, previousManifest = {}) => {
+    const scopeKey = text(manifest.scopeKey || scope.scopeKey || '');
+    if (!scopeKey) return false;
+    const currentScopeKey = text(Runtime.currentScope?.scopeKey || '');
+    if (scopeKey === currentScopeKey) {
+      Runtime.guiCurrentStatsCache = { at: Date.now(), value: guiCurrentValueFromManifest(manifest, scope) };
+      Runtime.guiPerf.summaryWriteThroughs += 1;
+    }
+    if (Runtime.guiStorageStatsCache?.rows) {
+      const nextRow = guiStorageRowFromManifest(manifest, scope);
+      const rows = Runtime.guiStorageStatsCache.rows.slice();
+      const index = rows.findIndex(item => text(item?.scopeKey || '') === scopeKey);
+      if (index >= 0) rows[index] = { ...rows[index], ...nextRow };
+      else if (manifest.archiveOwner !== true && !scopeKey.startsWith(FLASHBACK_ARCHIVE_SCOPE_PREFIX)) rows.unshift(nextRow);
+      rows.sort((a, b) => Number(new Date(b.updatedAt).getTime() || b.seenAt || 0) - Number(new Date(a.updatedAt).getTime() || a.seenAt || 0));
+      Runtime.guiStorageStatsCache = { at: Date.now(), rows, mode: Runtime.guiStorageStatsCache.mode || 'fast' };
+    }
+    const previousCommitId = text(previousManifest?.commitId || '');
+    const nextCommitId = text(manifest?.commitId || '');
+    if (previousCommitId !== nextCommitId || Number(previousManifest?.count || 0) !== Number(manifest?.count || 0)) {
+      Runtime.guiManualEditorDataCache = null;
+    }
+    scheduleGuiWriteThroughRepaint();
+    return true;
   };
 
   const recordSortKey = (record) => `${record.sourceType || ''}:${record.createdAt || ''}:${record.id || ''}`;
@@ -8475,6 +9113,16 @@
       : (cloneMeta.mode === 'same_chat_persona_recovery' ? 'same_chat_persona_recovery' : 'chat_copy_live');
     const sessionHandoff = cloneMode === 'session_handoff';
     const sameChatPersonaRecovery = cloneMode === 'same_chat_persona_recovery';
+    if (sessionHandoff) {
+      return {
+        ok: false,
+        skipped: true,
+        reason: 'session_handoff_requires_immutable_archive',
+        sourcePreserved: true,
+        sourceCompactionAllowed: false,
+        handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT
+      };
+    }
     const targetCommitId = stableHash(`${toScope.scopeKey}|clone|${fromScopeMeta.scopeKey}|${Date.now()}|${Math.random()}`);
     const result = await withScopeWriteLock(toScope.scopeKey, async () => {
       const targetManifest = await loadScopeManifest(toScope);
@@ -8727,6 +9375,19 @@
   const ensureScopeStorageReady = async (scope, settings, options = {}) => {
     await rememberScope(scope);
     const manifest = await loadScopeManifest(scope);
+    const legacyCompactedSource = !!normalizeFlashbackArchiveRef(manifest.archiveRef)
+      && Math.max(0, Number(manifest.shardCount || 0) || 0) === 0
+      && !!text(manifest.archiveCompactedAt || '').trim()
+      && manifest.copyAdoptedComplete !== true
+      && text(manifest.copyAdoptionMode || '') !== 'shared_archive';
+    if (legacyCompactedSource) {
+      const restored = await restoreLegacyCompactedSourceScope(scope, { settings })
+        .catch(error => { warn('legacy compacted source scope-ready recovery failed', error); return null; });
+      if (restored?.restored) {
+        const restoredManifest = await loadScopeManifest(scope);
+        return { scope, adopted: false, restoredLegacyCompaction: true, restore: restored, manifest: restoredManifest, fastPath: true };
+      }
+    }
     if (manifest.manifestCorrupt === true) {
       return { scope, adopted: false, manifest, fastPath: true, corrupt: true };
     }
@@ -8749,17 +9410,27 @@
     ];
     const source = await findCloneSource(scope, registry, { previousScope: Runtime.previousScope, extraScopes });
     if (source?.source) {
+      if (scope?.bridgeHandoffValid === true) {
+        const handoff = await adoptSessionHandoff({
+          targetChatId: scope.bridgeHandoffTargetChatId || scope.chatId,
+          transferId: scope.bridgeHandoffTransferId,
+          sourceScopeKey: scope.bridgeHandoffSourceScopeKey || source.source.scopeKey,
+          expectedRecords: Math.max(0, Number(scope.bridgeHandoffExpectedRecords || source.source.count || 0) || 0),
+          requestPermission: false
+        });
+        if (handoff?.ok) {
+          scheduleExternalRetirement(scope, { reason: 'immutable_handoff_adopt' });
+          return { scope, adopted: true, handoff, reason: 'immutable_session_handoff' };
+        }
+        return { scope, adopted: false, handoff, reason: handoff?.reason || 'immutable_session_handoff_pending' };
+      }
       const cloneMode = source.reason === 'same_chat_persona_scope_recovery'
         ? 'same_chat_persona_recovery'
-        : (scope?.bridgeHandoffValid === true ? 'session_handoff' : 'chat_copy_live');
+        : 'chat_copy_live';
       const cloned = await cloneScopeStorage(source.source, scope, settings, {
         reason: source.reason,
         mode: cloneMode,
-        weight: source.weight,
-        transferId: cloneMode === 'session_handoff' ? scope.bridgeHandoffTransferId : '',
-        sourceChatId: cloneMode === 'session_handoff' ? scope.bridgeHandoffSourceChatId : '',
-        targetChatId: cloneMode === 'session_handoff' ? scope.bridgeHandoffTargetChatId : '',
-        expectedRecordCount: cloneMode === 'session_handoff' ? scope.bridgeHandoffExpectedRecords : 0
+        weight: source.weight
       });
       if (cloned.ok) {
         const afterClone = await loadScopeRecords(scope.scopeKey);
@@ -8870,6 +9541,157 @@
         source: 'memory_bridge_target'
       }
     };
+  };
+
+  const emptyFlashbackHandoffLedger = () => ({
+    schema: FLASHBACK_HANDOFF_LEDGER_SCHEMA,
+    version: 2,
+    updatedAt: nowIso(),
+    receipts: []
+  });
+
+  const normalizeFlashbackHandoffLedger = raw => {
+    const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+    const base = emptyFlashbackHandoffLedger();
+    if (!parsed || typeof parsed !== 'object') return base;
+    const receipts = (Array.isArray(parsed.receipts) ? parsed.receipts : [])
+      .filter(item => item && typeof item === 'object' && text(item.transferId || '').trim())
+      .map(item => ({
+        schema: 'flashback_memory.handoff_receipt.v2',
+        transferId: compact(item.transferId || '', 160),
+        sourceScopeKey: compact(item.sourceScopeKey || '', 260),
+        targetScopeKey: compact(item.targetScopeKey || '', 260),
+        sourceChatId: compact(item.sourceChatId || '', 200),
+        targetChatId: compact(item.targetChatId || '', 200),
+        archiveRef: normalizeFlashbackArchiveRef(item.archiveRef),
+        expectedRecords: Math.max(0, Number(item.expectedRecords || 0) || 0),
+        records: Math.max(0, Number(item.records || 0) || 0),
+        sourceFingerprintBefore: compact(item.sourceFingerprintBefore || '', 160),
+        sourceFingerprintAfter: compact(item.sourceFingerprintAfter || '', 160),
+        sourcePreserved: item.sourcePreserved === true,
+        verified: item.verified === true,
+        durable: item.durable === true,
+        createdAt: text(item.createdAt || ''),
+        updatedAt: text(item.updatedAt || item.createdAt || '')
+      }))
+      .slice(-FLASHBACK_HANDOFF_LEDGER_MAX_RECEIPTS);
+    return { ...base, updatedAt: text(parsed.updatedAt || base.updatedAt), receipts };
+  };
+
+  const readFlashbackHandoffLedger = async () => normalizeFlashbackHandoffLedger(
+    await RisuCompat.getItem(STORAGE.handoffLedger).catch(() => null)
+  );
+
+  const writeFlashbackHandoffReceipt = async receipt => await withScopeWriteLock('flashback_handoff_ledger_v2', async () => {
+    const ledger = await readFlashbackHandoffLedger();
+    const transferId = text(receipt?.transferId || '').trim();
+    if (!transferId) throw new Error('flashback_handoff_receipt_transfer_id_missing');
+    const now = nowIso();
+    const previous = ledger.receipts.find(item => item.transferId === transferId) || null;
+    const normalized = normalizeFlashbackHandoffLedger({
+      ...ledger,
+      updatedAt: now,
+      receipts: [
+        ...ledger.receipts.filter(item => item.transferId !== transferId),
+        {
+          ...(previous || {}),
+          ...(receipt || {}),
+          transferId,
+          createdAt: previous?.createdAt || receipt?.createdAt || now,
+          updatedAt: now
+        }
+      ]
+    });
+    await requireStorageWrite(STORAGE.handoffLedger, safeStringify(normalized), 'handoff receipt save');
+    return normalized.receipts.find(item => item.transferId === transferId) || null;
+  });
+
+  const findFlashbackHandoffReceipt = async transferId => {
+    const id = text(transferId || '').trim();
+    if (!id) return null;
+    const ledger = await readFlashbackHandoffLedger();
+    return ledger.receipts.find(item => item.transferId === id) || null;
+  };
+
+  const flashbackSourceIntegritySnapshot = async scopeKey => {
+    const key = text(scopeKey || '').trim();
+    if (!key) throw new Error('flashback_source_integrity_scope_missing');
+    const manifest = await loadScopeManifest(key);
+    assertNoForeignScopeCollision(manifest, 'source integrity snapshot');
+    const rawManifest = await RisuCompat.getItem(scopeKeys.manifest(key));
+    const shardHashes = [];
+    const vectorStorageKeys = new Set();
+    let missingShards = 0;
+    let corruptShards = 0;
+    for (let i = 0; i < Math.max(0, Number(manifest.shardCount || 0) || 0); i += 1) {
+      const shardKey = scopeShardKeyForManifest(key, manifest, i);
+      let raw = await RisuCompat.getItem(shardKey);
+      if ((raw == null || raw === '') && manifest.commitId) raw = await RisuCompat.getItem(scopeKeys.shard(key, i));
+      if (raw == null || raw === '') {
+        missingShards += 1;
+        shardHashes.push({ shardIndex: i, key: shardKey, present: false, hash: '' });
+        continue;
+      }
+      const decoded = await decodeFlashbackShardEnvelope(raw);
+      const parsed = decoded.parsed;
+      const records = parsed && typeof parsed === 'object' && !Array.isArray(parsed) && Array.isArray(parsed.records)
+        ? parsed.records
+        : (Array.isArray(parsed) ? parsed : []);
+      if (!Array.isArray(records)) corruptShards += 1;
+      for (const record of records || []) {
+        const ref = normalizeFlashbackVectorRef(record?.vectorRef);
+        if (ref?.storageKey) vectorStorageKeys.add(ref.storageKey);
+      }
+      shardHashes.push({
+        shardIndex: i,
+        key: shardKey,
+        present: true,
+        hash: stableHash(typeof raw === 'string' ? raw : safeStringify(raw)),
+        checksum: text(parsed?.checksum || ''),
+        vectorStorageKey: text(parsed?.vectorStorageKey || '')
+      });
+    }
+    const vectorSidecars = [];
+    let missingVectorSidecars = 0;
+    for (const storageKey of Array.from(vectorStorageKeys).sort()) {
+      const raw = await RisuCompat.localGetItem(storageKey);
+      const present = raw != null && raw !== '';
+      if (!present) missingVectorSidecars += 1;
+      vectorSidecars.push({
+        storageKey,
+        present,
+        hash: present ? stableHash(typeof raw === 'string' ? raw : safeStringify(raw)) : ''
+      });
+    }
+    const rawWorldline = await RisuCompat.getItem(scopeKeys.worldline(key)).catch(() => null);
+    const core = {
+      scopeKey: key,
+      manifestHash: stableHash(typeof rawManifest === 'string' ? rawManifest : safeStringify(rawManifest)),
+      commitId: text(manifest.commitId || ''),
+      count: Math.max(0, Number(manifest.count || 0) || 0),
+      shardCount: Math.max(0, Number(manifest.shardCount || 0) || 0),
+      archiveRef: normalizeFlashbackArchiveRef(manifest.archiveRef),
+      worldlineHash: stableHash(typeof rawWorldline === 'string' ? rawWorldline : safeStringify(rawWorldline)),
+      shardHashes,
+      vectorSidecars,
+      missingShards,
+      corruptShards,
+      missingVectorSidecars
+    };
+    return { ...core, fingerprint: stableHash(safeStringify(core)) };
+  };
+
+  const compareFlashbackSourceIntegrity = (before = {}, after = {}) => {
+    const changed = [];
+    if (text(before.fingerprint || '') !== text(after.fingerprint || '')) {
+      for (const key of ['manifestHash', 'commitId', 'count', 'shardCount', 'worldlineHash', 'missingShards', 'corruptShards', 'missingVectorSidecars']) {
+        if (safeStringify(before[key]) !== safeStringify(after[key])) changed.push(key);
+      }
+      if (safeStringify(before.archiveRef) !== safeStringify(after.archiveRef)) changed.push('archiveRef');
+      if (safeStringify(before.shardHashes) !== safeStringify(after.shardHashes)) changed.push('shards');
+      if (safeStringify(before.vectorSidecars) !== safeStringify(after.vectorSidecars)) changed.push('vectorSidecars');
+    }
+    return { identical: changed.length === 0 && text(before.fingerprint || '') === text(after.fingerprint || ''), changed };
   };
 
   const ensureFlashbackArchiveForHandoff = async (sourceScope, sourceLoaded, settings) => {
@@ -8990,10 +9812,18 @@
     });
   };
 
-  const archiveAndCompactFlashbackSourceScope = async (sourceScopeKey, expectedRecords, settings) => {
+  const createImmutableFlashbackHandoffArchive = async (sourceScopeKey, expectedRecords, settings) => {
     return await withScopeWriteLock(sourceScopeKey, async () => {
+      const sourceIntegrityBefore = await flashbackSourceIntegritySnapshot(sourceScopeKey);
+      if (sourceIntegrityBefore.missingShards || sourceIntegrityBefore.corruptShards) {
+        const error = new Error('flashback_handoff_source_storage_incomplete');
+        error.code = 'FLASHBACK_HANDOFF_SOURCE_STORAGE_INCOMPLETE';
+        error.missingShards = sourceIntegrityBefore.missingShards;
+        error.corruptShards = sourceIntegrityBefore.corruptShards;
+        throw error;
+      }
       const local = await loadScopeRecordsRaw(sourceScopeKey);
-      assertCompleteScopeLoad(local, 'session handoff source archive lock verification');
+      assertCompleteScopeLoad(local, 'session handoff immutable source verification');
       const sourceManifest = local.manifest || {};
       const existingRef = normalizeFlashbackArchiveRef(sourceManifest.archiveRef);
       const parentSummary = existingRef ? await loadFlashbackArchiveManifestSummary(existingRef) : null;
@@ -9014,6 +9844,9 @@
         error.expectedRecords = Number(expectedRecords || 0);
         throw error;
       }
+
+      // The archive is a copy/reference layer only. No source manifest, shard,
+      // vector sidecar, or worldline mutation is permitted in this function.
       const archive = await ensureFlashbackArchiveForHandoff(sourceScopeKey, local, settings);
       if (archive.recordCount !== logicalRecordCount) {
         const error = new Error('flashback_archive_record_count_mismatch');
@@ -9022,34 +9855,59 @@
         error.expectedRecords = logicalRecordCount;
         throw error;
       }
-      const sourceMeta = { ...sourceManifest, scopeKey: sourceScopeKey };
-      await saveScopeManifest({
-        ...sourceManifest,
-        archiveRef: archive.archiveRef,
-        archiveLinkedAt: nowIso(),
-        archiveCompactedAt: nowIso(),
-        archiveCompactedRecords: local.records.length
-      }, sourceMeta);
-      if (local.records.length > 0 || Number(local.manifest.shardCount || 0) > 0) {
-        await saveScopeRecords(sourceMeta, [], settings, sourceMeta);
-      }
-      const compactedLocal = await loadScopeRecordsRaw(sourceScopeKey);
-      assertCompleteScopeLoad(compactedLocal, 'session handoff source compacted local verification');
-      const compactedSummary = await loadFlashbackArchiveManifestSummary(compactedLocal.manifest.archiveRef);
-      const compactedMemberIds = normalizeFlashbackArchiveMemberIds([
-        ...(compactedSummary?.memberIds || []),
-        ...compactedLocal.records.filter(isRetainedMemoryRecord).map(flashbackArchiveRecordIdentity)
-      ]);
-      if (compactedSummary.verified !== true || compactedMemberIds.length !== logicalRecordCount) {
-        const error = new Error('flashback_archive_compaction_verification_failed');
-        error.code = 'FLASHBACK_ARCHIVE_COMPACTION_VERIFICATION_FAILED';
-        error.records = compactedMemberIds.length;
+      const archiveVerification = await loadFlashbackArchiveChain(archive.archiveRef);
+      const archiveMemberIds = normalizeFlashbackArchiveMemberIds(
+        (archiveVerification.recordsList || []).map(flashbackArchiveRecordIdentity)
+      );
+      if (archiveVerification.verified !== true
+        || archiveVerification.records !== logicalRecordCount
+        || archiveMemberIds.length !== logicalMemberIds.length
+        || archiveMemberIds.some((value, index) => value !== logicalMemberIds[index])) {
+        const error = new Error('flashback_immutable_archive_verification_failed');
+        error.code = 'FLASHBACK_IMMUTABLE_ARCHIVE_VERIFICATION_FAILED';
+        error.records = archiveVerification.records;
         error.expectedRecords = logicalRecordCount;
         throw error;
       }
-      return { ...archive, recordCount: logicalRecordCount, compactedLocalRecords: local.records.length };
+      const archiveVectorMissing = (archiveVerification.recordsList || [])
+        .filter(isRetainedMemoryRecord)
+        .filter(record => !Array.isArray(record.vector) || !record.vector.length)
+        .length;
+      if (archiveVectorMissing > 0) {
+        const error = new Error(`immutable handoff archive has ${archiveVectorMissing} record(s) without readable vectors`);
+        error.code = 'FLASHBACK_IMMUTABLE_ARCHIVE_VECTOR_INCOMPLETE';
+        error.missingVectors = archiveVectorMissing;
+        throw error;
+      }
+      const sourceIntegrityAfter = await flashbackSourceIntegritySnapshot(sourceScopeKey);
+      const sourceIntegrity = compareFlashbackSourceIntegrity(sourceIntegrityBefore, sourceIntegrityAfter);
+      if (!sourceIntegrity.identical) {
+        const error = new Error(`source mutation detected during handoff: ${sourceIntegrity.changed.join(', ') || 'unknown'}`);
+        error.code = 'SOURCE_MUTATION_DETECTED';
+        error.changed = sourceIntegrity.changed;
+        error.before = sourceIntegrityBefore.fingerprint;
+        error.after = sourceIntegrityAfter.fingerprint;
+        throw error;
+      }
+      return {
+        ...archive,
+        recordCount: logicalRecordCount,
+        sourcePreserved: true,
+        sourceCompacted: false,
+        compactedLocalRecords: 0,
+        sourceIntegrityBefore,
+        sourceIntegrityAfter,
+        sourceFingerprint: sourceIntegrityAfter.fingerprint,
+        archiveVectorMissing
+      };
     });
   };
+
+  // Legacy public/test name is deliberately retained as a safe alias. No caller,
+  // including older RE:TRACE builds, can compact or empty the source through it.
+  const archiveAndCompactFlashbackSourceScope = async (sourceScopeKey, expectedRecords, settings) => (
+    await createImmutableFlashbackHandoffArchive(sourceScopeKey, expectedRecords, settings)
+  );
 
   const loadFlashbackArchiveChain = async archiveRefValue => {
     const head = normalizeFlashbackArchiveRef(archiveRefValue);
@@ -9171,6 +10029,237 @@
     return { verified, reason: verified ? 'archive_manifest_chain_verified' : 'archive_manifest_chain_mismatch', records, stats, memberIds, digest, layers, archiveRef: head };
   };
 
+  const restoredLegacyCompactionRecord = (record = {}, scopeKey = '', settings = DEFAULTS) => {
+    const source = { ...(record || {}) };
+    let vector = Array.isArray(source.vector) ? source.vector.map(Number).filter(Number.isFinite) : [];
+    const recoveredWithHash = !vector.length;
+    if (recoveredWithHash) vector = hashEmbedding(source.text || '', settings.hashDimensions || DEFAULTS.hashDimensions);
+    const restored = {
+      ...source,
+      id: text(source.id || '').trim() || `fb_restore_${flashbackArchiveRecordIdentity(source)}`,
+      scopeKey: text(scopeKey || ''),
+      turnIndex: Math.max(0, Number(source.turnIndex || source.historicalTurnIndex || source.pairIndex || 0) || 0),
+      pairIndex: Math.max(0, Number(source.pairIndex || source.historicalTurnIndex || source.turnIndex || 0) || 0),
+      vector,
+      dim: vector.length,
+      provider: recoveredWithHash ? 'hash' : text(source.provider || source.embeddingProvider || ''),
+      model: recoveredWithHash ? `hash-${settings.hashDimensions || DEFAULTS.hashDimensions}` : text(source.model || source.embeddingModel || ''),
+      embeddingProvider: recoveredWithHash ? 'hash' : text(source.embeddingProvider || source.provider || ''),
+      embeddingModel: recoveredWithHash ? `hash-${settings.hashDimensions || DEFAULTS.hashDimensions}` : text(source.embeddingModel || source.model || ''),
+      embeddingDimensions: vector.length,
+      embeddingProfileId: recoveredWithHash
+        ? embeddingProfileId(settings, vector.length, 'hash', `hash-${settings.hashDimensions || DEFAULTS.hashDimensions}`)
+        : text(source.embeddingProfileId || ''),
+      inheritedSessionHistory: false,
+      permanentSessionHistory: false,
+      historicalProtection: '',
+      permanentHistoryId: '',
+      inheritedFromScopeKey: '',
+      inheritedViaScopeKey: '',
+      clonedFromScopeKey: '',
+      archiveReferenceOnly: false,
+      archiveId: '',
+      archiveSourceScopeKey: '',
+      logicalScopeKey: text(scopeKey || ''),
+      orphanExempt: false,
+      retentionProtected: false,
+      deletionProtected: false,
+      lifecycleStatus: 'active',
+      retiredAt: '',
+      turnNodeId: '',
+      logicalTurnId: '',
+      variantId: '',
+      parentTurnNodeId: '',
+      vectorPayloadMissing: false,
+      vectorPayloadLocal: false,
+      vectorStorageMode: '',
+      recoveryHashFallback: recoveredWithHash,
+      recoveryRemoteUpgradePending: recoveredWithHash && normalizeProvider(settings.embeddingProvider) !== 'hash',
+      updatedAt: nowIso()
+    };
+    delete restored.vectorRef;
+    delete restored.archiveCanonicalId;
+    return restored;
+  };
+
+  const restoreLegacyCompactedSourceScope = async (scopeOverride = null, options = {}) => {
+    const settings = options.settings || await loadSettings(true);
+    const scope = scopeOverride?.scopeKey
+      ? scopeOverride
+      : (scopeOverride ? { scopeKey: text(scopeOverride) } : await resolveCurrentScope(false));
+    if (!scope?.scopeKey) return { restored: false, reason: 'no_scope' };
+    const core = await withScopeWriteLock(scope.scopeKey, async () => {
+      const raw = await loadScopeRecordsRaw(scope.scopeKey);
+      assertCompleteScopeLoad(raw, 'legacy compacted source recovery');
+      const manifest = raw.manifest || {};
+      const archiveRef = normalizeFlashbackArchiveRef(manifest.archiveRef);
+      const legacyCompacted = !!archiveRef
+        && raw.records.length === 0
+        && Math.max(0, Number(manifest.shardCount || 0) || 0) === 0
+        && !!text(manifest.archiveCompactedAt || '').trim()
+        && manifest.copyAdoptedComplete !== true
+        && text(manifest.copyAdoptionMode || '') !== 'shared_archive';
+      if (!legacyCompacted) return { restored: false, reason: 'not_legacy_compacted_source', scopeKey: scope.scopeKey };
+      const archive = await loadFlashbackArchiveChain(archiveRef);
+      if (archive.verified !== true) {
+        const error = new Error(`legacy compacted source archive verification failed: ${archive.reason || 'unknown'}`);
+        error.code = 'FLASHBACK_LEGACY_COMPACTION_ARCHIVE_INVALID';
+        throw error;
+      }
+      const sourceRecords = (archive.recordsList || []).filter(isResponseMemoryRecord);
+      if (!sourceRecords.length && archive.records > 0) {
+        const error = new Error('legacy compacted source archive contains no restorable response records');
+        error.code = 'FLASHBACK_LEGACY_COMPACTION_NO_RESPONSE_RECORDS';
+        throw error;
+      }
+      const restoredRecords = sourceRecords.map(record => restoredLegacyCompactionRecord(record, scope.scopeKey, settings));
+      const hashFallbackRecords = restoredRecords.filter(record => record.recoveryHashFallback === true).length;
+      const saved = await saveScopeRecords({ ...manifest, ...scope, scopeKey: scope.scopeKey }, restoredRecords, settings, { ...manifest, ...scope, scopeKey: scope.scopeKey });
+      const savedRaw = await loadScopeRecordsRaw(scope.scopeKey);
+      assertCompleteScopeLoad(savedRaw, 'legacy compacted source recovery readback');
+      if (savedRaw.records.filter(isResponseMemoryRecord).length !== restoredRecords.length) {
+        const error = new Error('legacy compacted source recovery record count mismatch');
+        error.code = 'FLASHBACK_LEGACY_COMPACTION_RESTORE_COUNT_MISMATCH';
+        throw error;
+      }
+      const restoredAt = nowIso();
+      const finalManifest = await saveScopeManifest({
+        ...saved.manifest,
+        archiveRef: null,
+        archiveLinkedAt: '',
+        archiveCompactedAt: '',
+        archiveCompactedRecords: 0,
+        legacyCompactionRestoredAt: restoredAt,
+        legacyCompactionRestoreVersion: FLASHBACK_LEGACY_COMPACTION_RESTORE_VERSION,
+        legacyCompactionRestoreRecords: restoredRecords.length,
+        legacyCompactionRestoreHashFallbackRecords: hashFallbackRecords,
+        legacyCompactionArchiveRef: flashbackArchiveRefPointer(archiveRef)
+      }, { ...scope, scopeKey: scope.scopeKey });
+      const finalRaw = await loadScopeRecordsRaw(scope.scopeKey);
+      assertCompleteScopeLoad(finalRaw, 'legacy compacted source recovery final verification');
+      if (normalizeFlashbackArchiveRef(finalRaw.manifest.archiveRef)
+        || finalRaw.records.filter(isResponseMemoryRecord).length !== restoredRecords.length) {
+        const error = new Error('legacy compacted source final verification failed');
+        error.code = 'FLASHBACK_LEGACY_COMPACTION_RESTORE_VERIFY_FAILED';
+        throw error;
+      }
+      return {
+        restored: true,
+        reason: 'legacy_compacted_source_restored',
+        scopeKey: scope.scopeKey,
+        records: restoredRecords.length,
+        hashFallbackRecords,
+        archiveId: archiveRef.archiveId,
+        archiveScopeKey: archiveRef.archiveScopeKey,
+        archivePreserved: true,
+        manifest: finalManifest
+      };
+    });
+    Runtime.lastLegacyCompactionRestore = { at: Date.now(), ...core };
+    if (core.restored) {
+      pushActivityLog('legacy_compaction_restored', '이전 비파괴 규칙 적용 전 압축으로 비워진 원본 기억을 아카이브에서 복구했습니다.', {
+        scopeKey: core.scopeKey,
+        stored: core.records,
+        reason: core.reason
+      }, 'success');
+      scheduleGuiWriteThroughRepaint();
+      if (options.finalize !== false) scheduleLegacyRestoreFinalization(scope, settings, core, { delayMs: 120 });
+    }
+    return core;
+  };
+
+  const runLegacyCompactionRestoreFinalization = async (scope, settings, restoreResult = {}, options = {}) => {
+    const scopeKey = text(scope?.scopeKey || restoreResult?.scopeKey || '');
+    if (!scopeKey) return { finalized: false, reason: 'no_scope' };
+    let snapshot = options.snapshot || null;
+    if (!snapshot) snapshot = await loadRisuSnapshot(false).catch(() => null);
+    let worldline = null;
+    const snapshotScope = snapshot ? resolveScopeFromSnapshot(snapshot) : null;
+    if (snapshot && snapshotScope?.scopeKey === scopeKey) {
+      const live = liveChatReadState(snapshot.chat || {});
+      if (live.known && live.normalized.length) {
+        const liveState = liveChatStateFromNormalized(live.normalized);
+        worldline = await synchronizeFlashbackTurnWorldline(scope, liveState, settings, {
+          allowRetirement: false,
+          forceReconcile: true,
+          skipEpisodeRebuild: true,
+          reason: 'legacy_compaction_restore_finalize'
+        });
+        if (Number(worldline?.restoredRecords || 0) > 0) {
+          pushActivityLog('worldline_startup_restored', '기존 retired 보관소에서 현재 대화와 정확히 일치하는 기억을 복구했습니다.', {
+            scopeKey,
+            stored: Number(worldline.restoredRecords || 0) || 0,
+            reason: 'legacy_compaction_restore_finalize'
+          }, 'success');
+        }
+      }
+    }
+    const legacyMigration = await scheduleLegacyGlobalMigration(scope, settings);
+    const episode = await maybeRebuildEpisodeIndex(scope, settings, null, {
+      force: true,
+      reason: 'legacy_compaction_restore_finalize'
+    }).catch(error => {
+      warn('legacy compaction final episode rebuild failed', error);
+      return { rebuilt: false, reason: 'episode_rebuild_failed', error: formatErrorMessage(error, 300) };
+    });
+    const hashFallbackRecords = Math.max(
+      0,
+      Number(restoreResult?.hashFallbackRecords || Runtime.lastLegacyCompactionRestore?.hashFallbackRecords || 0) || 0
+    );
+    let progressiveScheduled = false;
+    if (hashFallbackRecords > 0 && normalizeProvider(settings.embeddingProvider) !== 'hash') {
+      progressiveScheduled = scheduleProgressiveReembedRetry(scope, settings, {
+        delayMs: 600,
+        attempt: 0,
+        reason: 'legacy_compaction_restore_finalize'
+      });
+    }
+    scheduleGuiWriteThroughRepaint();
+    const result = {
+      finalized: true,
+      reason: 'legacy_compaction_restore_finalized',
+      scopeKey,
+      worldline,
+      legacyMigration,
+      episode,
+      progressiveScheduled,
+      hashFallbackRecords
+    };
+    Runtime.lastLegacyCompactionFinalize = { at: Date.now(), ...result };
+    pushActivityLog('legacy_compaction_restore_finalized', '원본 기억 복구 후 세계선과 파생 인덱스 정리를 순차 완료했습니다.', {
+      scopeKey,
+      stored: Number(restoreResult?.records || 0) || 0,
+      progressiveScheduled
+    }, 'success');
+    return result;
+  };
+
+  const finalizeLegacyCompactionRestore = async (scope, settings, restoreResult = {}, options = {}) => {
+    const scopeKey = text(scope?.scopeKey || restoreResult?.scopeKey || '');
+    if (!scopeKey) return { finalized: false, reason: 'no_scope' };
+    const existing = Runtime.legacyRestoreFinalizeInFlight.get(scopeKey);
+    if (existing) return await existing;
+    const task = runLegacyCompactionRestoreFinalization(scope, settings, restoreResult, options)
+      .finally(() => Runtime.legacyRestoreFinalizeInFlight.delete(scopeKey));
+    Runtime.legacyRestoreFinalizeInFlight.set(scopeKey, task);
+    return await task;
+  };
+
+  const scheduleLegacyRestoreFinalization = (scope, settings, restoreResult = {}, options = {}) => {
+    const scopeKey = text(scope?.scopeKey || restoreResult?.scopeKey || '');
+    if (!scopeKey || Runtime.legacyRestoreFinalizeInFlight.has(scopeKey)) return false;
+    const delayMs = clampInt(options.delayMs, 0, 30000, 120);
+    const task = (async () => {
+      if (delayMs > 0) await delay(delayMs);
+      return await runLegacyCompactionRestoreFinalization(scope, settings, restoreResult, options);
+    })().catch(error => {
+      warn('legacy compaction restore finalization failed', error);
+      return { finalized: false, reason: 'finalization_failed', error: formatErrorMessage(error, 300) };
+    }).finally(() => Runtime.legacyRestoreFinalizeInFlight.delete(scopeKey));
+    Runtime.legacyRestoreFinalizeInFlight.set(scopeKey, task);
+    return true;
+  };
+
   const handoffRecordIdentity = (record = {}) => stableHash(safeStringify([
     text(record.id || ''),
     text(record.hash || ''),
@@ -9219,21 +10308,26 @@
       ? Math.max(0, Number(options.expectedRecords || 0) || 0)
       : null;
     const base = {
-      schema: 'flashback_memory.session_handoff_adoption.v3',
+      schema: FLASHBACK_HANDOFF_RECEIPT_SCHEMA,
       version: PLUGIN_VERSION,
       archiveContract: FLASHBACK_ARCHIVE_REF_SCHEMA,
+      handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT,
+      sourceMutationAllowed: false,
+      sourceCompactionAllowed: false,
       available: true,
       ok: false,
       adopted: false,
       verified: false,
       durable: false,
+      sourcePreserved: false,
       targetChatId: expectedTargetChatId,
       transferId: expectedTransferId,
       sourceScopeKey: requestedSourceScopeKey,
       targetScopeKey: '',
       records: 0,
       expectedRecords: requestedExpectedRecords ?? 0,
-      physicalCopies: 0
+      physicalCopies: 0,
+      compactedSourceRecords: 0
     };
     if (!expectedTargetChatId || !expectedTransferId) return { ...base, reason: 'handoff_identity_incomplete' };
     try {
@@ -9261,6 +10355,52 @@
       }
       const sourceScopeKey = requestedSourceScopeKey || markerSourceScopeKey;
       if (!sourceScopeKey || sourceScopeKey === targetScope.scopeKey) return { ...targetBase, sourceScopeKey, reason: 'source_scope_invalid' };
+
+      // Idempotent retry: a completed receipt never re-archives or touches source.
+      const existingReceipt = await findFlashbackHandoffReceipt(expectedTransferId).catch(() => null);
+      if (existingReceipt?.durable === true
+        && existingReceipt?.verified === true
+        && existingReceipt?.sourcePreserved === true
+        && existingReceipt.sourceScopeKey === sourceScopeKey
+        && existingReceipt.targetScopeKey === targetScope.scopeKey
+        && existingReceipt.archiveRef) {
+        const [targetManifest, archiveVerification] = await Promise.all([
+          loadScopeManifest(targetScope),
+          loadFlashbackArchiveManifestSummary(existingReceipt.archiveRef)
+        ]);
+        const sameArchive = normalizeFlashbackArchiveRef(targetManifest.archiveRef)?.archiveId === existingReceipt.archiveRef.archiveId;
+        const durable = archiveVerification.verified === true
+          && archiveVerification.records === Number(existingReceipt.records || existingReceipt.expectedRecords || 0)
+          && sameArchive
+          && targetManifest.copyAdoptedComplete === true
+          && text(targetManifest.copyTransferId || '') === expectedTransferId;
+        if (durable) {
+          const reused = {
+            ...targetBase,
+            ok: true,
+            adopted: false,
+            verified: true,
+            durable: true,
+            sourcePreserved: true,
+            sourceScopeKey,
+            sourceChatId: existingReceipt.sourceChatId || markerState.sourceChatId,
+            records: archiveVerification.records,
+            expectedRecords: existingReceipt.expectedRecords,
+            archiveId: existingReceipt.archiveRef.archiveId,
+            archiveScopeKey: existingReceipt.archiveRef.archiveScopeKey,
+            archiveGeneration: existingReceipt.archiveRef.generation,
+            archiveDigest: existingReceipt.archiveRef.digest,
+            archiveRecordCount: existingReceipt.archiveRef.recordCount,
+            sourceFingerprintBefore: existingReceipt.sourceFingerprintBefore,
+            sourceFingerprintAfter: existingReceipt.sourceFingerprintAfter,
+            receiptReused: true,
+            reason: 'session_handoff_receipt_reused'
+          };
+          Runtime.lastHandoff = { at: Date.now(), ...reused };
+          return reused;
+        }
+      }
+
       const sourceLocal = await loadScopeRecordsRaw(sourceScopeKey);
       assertCompleteScopeLoad(sourceLocal, 'session handoff source verification');
       const sourceManifest = sourceLocal.manifest || {};
@@ -9285,7 +10425,9 @@
       if (!sourceChatMatches || !actorMatches) {
         return { ...targetBase, sourceScopeKey, records: sourceRecordCount, expectedRecords, reason: !sourceChatMatches ? 'source_chat_mismatch' : 'source_actor_mismatch' };
       }
+
       if (expectedRecords <= 0) {
+        const sourceIntegrityBefore = await flashbackSourceIntegritySnapshot(sourceScopeKey);
         const targetManifest = await loadScopeManifest(targetScope);
         if (Number(targetManifest.count || 0) <= 0 && Number(targetManifest.shardCount || 0) <= 0) {
           await saveScopeManifest({
@@ -9294,15 +10436,53 @@
             copyAdoptedCompleteAt: nowIso(),
             copyAdoptionMode: 'shared_archive',
             copyTransferId: expectedTransferId,
-            copyTransferSchema: MEMORY_SESSION_BRIDGE_SCHEMA,
+            copyTransferSchema: text(marker.schema || MEMORY_SESSION_BRIDGE_SCHEMA),
             copySourceChatId: markerState.sourceChatId,
             copyTargetChatId: expectedTargetChatId,
-            copyExpectedRecordCount: 0
+            copyExpectedRecordCount: 0,
+            handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT,
+            sourcePreservationRequired: true
           }, targetScope);
         }
-        return { ...targetBase, ok: true, verified: true, durable: true, sourceScopeKey, records: 0, expectedRecords: 0, reason: 'session_handoff_empty' };
+        const sourceIntegrityAfter = await flashbackSourceIntegritySnapshot(sourceScopeKey);
+        const sourceIntegrity = compareFlashbackSourceIntegrity(sourceIntegrityBefore, sourceIntegrityAfter);
+        if (!sourceIntegrity.identical) {
+          const error = new Error(`source mutation detected during empty handoff: ${sourceIntegrity.changed.join(', ')}`);
+          error.code = 'SOURCE_MUTATION_DETECTED';
+          throw error;
+        }
+        const emptyResult = {
+          ...targetBase,
+          ok: true,
+          verified: true,
+          durable: true,
+          sourcePreserved: true,
+          sourceScopeKey,
+          records: 0,
+          expectedRecords: 0,
+          sourceFingerprintBefore: sourceIntegrityBefore.fingerprint,
+          sourceFingerprintAfter: sourceIntegrityAfter.fingerprint,
+          reason: 'session_handoff_empty'
+        };
+        await writeFlashbackHandoffReceipt({
+          transferId: expectedTransferId,
+          sourceScopeKey,
+          targetScopeKey: targetScope.scopeKey,
+          sourceChatId: markerState.sourceChatId,
+          targetChatId: expectedTargetChatId,
+          expectedRecords: 0,
+          records: 0,
+          sourceFingerprintBefore: sourceIntegrityBefore.fingerprint,
+          sourceFingerprintAfter: sourceIntegrityAfter.fingerprint,
+          sourcePreserved: true,
+          verified: true,
+          durable: true
+        }).catch(error => warn('empty handoff receipt save failed', error));
+        Runtime.lastHandoff = { at: Date.now(), ...emptyResult };
+        return emptyResult;
       }
-      const archive = await archiveAndCompactFlashbackSourceScope(sourceScopeKey, expectedRecords, settings);
+
+      const archive = await createImmutableFlashbackHandoffArchive(sourceScopeKey, expectedRecords, settings);
       if (archive.recordCount !== expectedRecords) {
         return { ...targetBase, sourceScopeKey, records: archive.recordCount, expectedRecords, reason: 'archive_record_count_mismatch' };
       }
@@ -9330,10 +10510,13 @@
           copiedFromChatId: markerState.sourceChatId,
           copiedAt: nowIso(),
           copyTransferId: expectedTransferId,
-          copyTransferSchema: MEMORY_SESSION_BRIDGE_SCHEMA,
+          copyTransferSchema: text(marker.schema || MEMORY_SESSION_BRIDGE_SCHEMA),
           copySourceChatId: markerState.sourceChatId,
           copyTargetChatId: expectedTargetChatId,
-          copyExpectedRecordCount: expectedRecords
+          copyExpectedRecordCount: expectedRecords,
+          handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT,
+          sourcePreservationRequired: true,
+          sourceIntegrityFingerprint: archive.sourceFingerprint
         }, targetScope);
         adopted = true;
       }
@@ -9345,13 +10528,33 @@
         && durableManifest.copyAdoptionMode === 'shared_archive'
         && text(durableManifest.copiedFromScopeKey || '') === sourceScopeKey
         && text(durableManifest.copyTransferId || '') === expectedTransferId
-        && Number(durableManifest.copyExpectedRecordCount || 0) === expectedRecords;
+        && Number(durableManifest.copyExpectedRecordCount || 0) === expectedRecords
+        && text(durableManifest.handoffContract || '') === MEMORY_SESSION_HANDOFF_CONTRACT;
+      if (!durable) {
+        return { ...targetBase, sourceScopeKey, records: archiveVerification.records, expectedRecords, reason: 'session_archive_link_verification_failed' };
+      }
+
+      // Target is durable. Re-read source and prove this handoff did not alter it.
+      const sourceIntegrityAfterTarget = await flashbackSourceIntegritySnapshot(sourceScopeKey);
+      const sourceIntegrity = compareFlashbackSourceIntegrity(archive.sourceIntegrityBefore, sourceIntegrityAfterTarget);
+      if (!sourceIntegrity.identical) {
+        if (adopted) {
+          await saveScopeManifest(before, targetScope).catch(error => warn('handoff target rollback after source mutation detection failed', error));
+        }
+        const error = new Error(`source mutation detected during handoff: ${sourceIntegrity.changed.join(', ') || 'unknown'}`);
+        error.code = 'SOURCE_MUTATION_DETECTED';
+        error.changed = sourceIntegrity.changed;
+        throw error;
+      }
+
       const result = {
         ...targetBase,
-        ok: durable,
-        adopted: adopted && durable,
-        verified: durable,
-        durable,
+        ok: true,
+        adopted,
+        verified: true,
+        durable: true,
+        sourcePreserved: true,
+        sourceMutationDetected: false,
         sourceScopeKey,
         sourceChatId: markerState.sourceChatId,
         records: archiveVerification.records,
@@ -9361,24 +10564,54 @@
         archiveGeneration: archive.archiveRef.generation,
         archiveDigest: archive.archiveRef.digest,
         archiveRecordCount: archive.archiveRef.recordCount,
+        archiveVectorMissing: Math.max(0, Number(archive.archiveVectorMissing || 0) || 0),
         physicalCopies: 0,
-        compactedSourceRecords: Math.max(0, Number(archive.compactedLocalRecords || 0) || 0),
+        compactedSourceRecords: 0,
+        sourceFingerprintBefore: archive.sourceIntegrityBefore.fingerprint,
+        sourceFingerprintAfter: sourceIntegrityAfterTarget.fingerprint,
         copyAdoptionMode: text(durableManifest.copyAdoptionMode || ''),
         copyAdoptedComplete: durableManifest.copyAdoptedComplete === true,
-        reason: durable ? (adopted ? 'session_archive_link_adopted' : 'session_archive_link_already_adopted') : 'session_archive_link_verification_failed'
+        reason: adopted ? 'session_archive_link_adopted_non_destructive' : 'session_archive_link_already_adopted_non_destructive'
       };
-      if (result.adopted) pushActivityLog('session_handoff_adopted', 'Bridge session history was linked through the shared archive.', {
+      const receipt = await writeFlashbackHandoffReceipt({
+        transferId: expectedTransferId,
+        sourceScopeKey,
+        targetScopeKey: targetScope.scopeKey,
+        sourceChatId: markerState.sourceChatId,
+        targetChatId: expectedTargetChatId,
+        archiveRef: archive.archiveRef,
+        expectedRecords,
+        records: archiveVerification.records,
+        sourceFingerprintBefore: result.sourceFingerprintBefore,
+        sourceFingerprintAfter: result.sourceFingerprintAfter,
+        sourcePreserved: true,
+        verified: true,
+        durable: true
+      }).catch(error => {
+        warn('handoff receipt save failed', error);
+        return null;
+      });
+      result.receiptDurable = !!receipt;
+      Runtime.lastHandoff = { at: Date.now(), ...result };
+      if (result.adopted) pushActivityLog('session_handoff_adopted', 'Bridge session history was linked through a non-destructive immutable archive. The source was preserved.', {
         scopeKey: result.targetScopeKey,
         sourceScopeKey: result.sourceScopeKey,
         records: result.records,
         archiveId: result.archiveId,
         transferId: result.transferId,
         physicalCopies: 0,
-        compactedSourceRecords: result.compactedSourceRecords
+        compactedSourceRecords: 0
       }, 'success');
       return result;
     } catch (error) {
-      return { ...base, reason: text(error?.code || 'session_handoff_adoption_failed'), error: formatErrorMessage(error, 700) };
+      const failed = {
+        ...base,
+        sourcePreserved: error?.code !== 'SOURCE_MUTATION_DETECTED',
+        reason: text(error?.code || 'session_handoff_adoption_failed'),
+        error: formatErrorMessage(error, 700)
+      };
+      Runtime.lastHandoff = { at: Date.now(), ...failed };
+      return failed;
     }
   };
 
@@ -10106,6 +11339,7 @@
         purpose: 'document',
         contextGroupIds: missingIndexes.map(index => text(drafts[index]?.sourceHash || drafts[index]?.sourceId || `draft:${index}`)),
         concurrency: cfg.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        allowHashFallback: options.allowHashFallback !== false,
         onProgress: options.onProgress
       })
       : tagEmbeddingVectors([], false);
@@ -11064,8 +12298,7 @@
       generationTargetProtected: result.generationTargetProtected === true
     };
     if (result.changed && result.reason === 'worldline_records_reconciled') {
-      scheduleEpisodeIndexRebuild(scope, cfg, { reason: 'turn_worldline_reconcile', force: true });
-      invalidateGuiDataCache('all');
+      if (options.skipEpisodeRebuild !== true) scheduleEpisodeIndexRebuild(scope, cfg, { reason: 'turn_worldline_reconcile', force: true });
       if (Number(result.quarantinedRecords || 0) > 0) {
         pushActivityLog('worldline_quarantine', '분기 불일치 기억을 삭제하지 않고 안전 격리했습니다.', {
           scopeKey: scope.scopeKey,
@@ -11750,6 +12983,7 @@
     const scope = scopeOverride?.scopeKey ? scopeOverride : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(true));
     const records = await buildRecordsFromSources(sourceList, cfg, scope, {
       reuseRecords: options.reuseRecords,
+      allowHashFallback: options.allowHashFallback !== false,
       onProgress: options.onProgress
     });
     const embeddingStats = records.flashbackEmbeddingStats || {};
@@ -11846,6 +13080,7 @@
           skipGuiRefresh: true,
           replaceTurnPair: true,
           reuseRecords: loadedAfterSync.records,
+          allowHashFallback: options.allowHashFallback !== false,
           onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '동기화')
         })
         : { sources: 0, chunks: 0, inserted: 0, updated: 0, deduped: 0, total: loadedAfterSync.records.length, embeddingCost: null };
@@ -11941,6 +13176,7 @@
     const rebuildSettings = { ...settings, maxResponseItems: Number.MAX_SAFE_INTEGER };
     const records = await buildRecordsFromSources(sources, rebuildSettings, scope, {
       reuseRecords: previous.records,
+      allowHashFallback: options.allowHashFallback !== false,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '재구축')
     });
     if (!records.length) throw new Error('현재 채팅에서 재구축 가능한 응답 기억을 만들지 못했습니다.');
@@ -20094,6 +21330,30 @@
     };
   };
 
+  const flashbackRetraceCompatibility = () => ({
+    schema: RETRACE_PEER_COMPATIBILITY_SCHEMA,
+    protocolMajor: RETRACE_PEER_PROTOCOL_MAJOR,
+    protocolMinor: 0,
+    pluginId: PLUGIN_SLUG,
+    pluginVersion: PLUGIN_VERSION,
+    peerRole: 'episodic_memory',
+    features: {
+      inspect: true,
+      nextSessionHandoff: true,
+      sourceImmutableHandoff: true,
+      durableTargetReadback: true,
+      idempotentHandoff: true,
+      inheritedStateUsable: true
+    },
+    handoff: {
+      contract: MEMORY_SESSION_HANDOFF_CONTRACT,
+      receiptSchemas: [FLASHBACK_HANDOFF_RECEIPT_SCHEMA],
+      sourceMutationAllowed: false,
+      sourceCompactionAllowed: false,
+      physicalCopyRequired: false
+    }
+  });
+
   const inspectMemoryLedger = async (scopeOverride = null, options = {}) => {
     const snapshot = await debugRecordsSnapshot(scopeOverride, {
       ...options,
@@ -20104,7 +21364,7 @@
       readOnly: true,
       recordsIncluded: options?.includeRecords !== false,
       version: PLUGIN_VERSION,
-      capabilities: { archiveHandoffV1: true, summaryInspect: true, physicalRecordCopyOnHandoff: false },
+      capabilities: { archiveHandoffV1: true, summaryInspect: true, physicalRecordCopyOnHandoff: false, sourcePreservingHandoff: true, handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT, sourceCompactionOnHandoff: false, retraceCompatibility: flashbackRetraceCompatibility() },
       ...snapshot
     };
   };
@@ -20135,7 +21395,23 @@
       let result = null;
       let errorText = '';
       try {
-        if (action === 'inspect') {
+        if (action === 'ping' || action === 'capabilities') {
+          result = {
+            ...flashbackRetraceCompatibility(),
+            compatibility: flashbackRetraceCompatibility(),
+            capabilities: {
+              sourcePreservingHandoff: true,
+              handoffContract: MEMORY_SESSION_HANDOFF_CONTRACT,
+              sourceCompactionOnHandoff: false,
+              physicalRecordCopyOnHandoff: false,
+              archiveHandoffV1: true,
+              summaryInspect: true,
+              retraceCompatibility: flashbackRetraceCompatibility()
+            },
+            ownerPluginId: PLUGIN_SLUG,
+            authorizedRequester: sender
+          };
+        } else if (action === 'inspect') {
           const includeRecords = request.payload?.includeRecords === true;
           const inspected = await inspectMemoryLedger(null, {
             includeRecords,
@@ -20328,6 +21604,7 @@
       purpose: 'document',
       contextGroupIds: next.map((record, index) => text(record.sourceHash || record.sourceId || `record:${index}`)),
       concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+      allowHashFallback: false,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '전체 벡터 갱신')
     });
     const fallbackUsed = vectors.flashbackFallbackUsed === true;
@@ -20401,6 +21678,69 @@
     };
     refreshEmbeddingCostPanel().catch(error => warn('embedding cost panel refresh failed', error));
     return Runtime.lastImport;
+  };
+
+  const scheduleProgressiveReembedRetry = (scope, settings, options = {}) => {
+    const scopeKey = text(scope?.scopeKey || '');
+    if (!scopeKey || Runtime.unloaded) return false;
+    if (Runtime.progressiveReembedRetryByScope.has(scopeKey)) return false;
+    const attempt = clampInt(options.attempt, 0, 6, 0);
+    if (attempt >= 4) return false;
+    const delayMs = clampInt(
+      options.delayMs,
+      200,
+      60000,
+      Math.min(12000, 1200 * Math.pow(2, attempt))
+    );
+    const state = { attempt, reason: text(options.reason || 'concurrent_retry'), timer: null };
+    state.timer = scheduleTimer(() => {
+      Runtime.progressiveReembedRetryByScope.delete(scopeKey);
+      Promise.resolve().then(async () => {
+        // Do not spend a long remote embedding request while the scope is still
+        // changing. Require a short stable commit window before starting.
+        const before = await loadScopeManifest(scopeKey);
+        const beforeStamp = stableHash(safeStringify([
+          before.commitId || '',
+          Number(before.count || 0) || 0,
+          Number(before.turnWorldlineRevision || 0) || 0,
+          before.episodeSourceDigest || ''
+        ]));
+        await delay(1200);
+        const after = await loadScopeManifest(scopeKey);
+        const afterStamp = stableHash(safeStringify([
+          after.commitId || '',
+          Number(after.count || 0) || 0,
+          Number(after.turnWorldlineRevision || 0) || 0,
+          after.episodeSourceDigest || ''
+        ]));
+        if (beforeStamp !== afterStamp) {
+          scheduleProgressiveReembedRetry(scope, settings, {
+            ...options,
+            attempt,
+            delayMs: Math.min(12000, Math.max(1200, delayMs)),
+            reason: 'scope_not_stable_yet'
+          });
+          return;
+        }
+        const result = await progressivelyReembedRecords(scope, settings, {
+          retryOnConcurrent: false,
+          retryAttempt: attempt,
+          maxRecords: options.maxRecords,
+          maxChars: options.maxChars,
+          maxRequests: options.maxRequests
+        });
+        if (result?.reason === 'records_changed_concurrently') {
+          scheduleProgressiveReembedRetry(scope, settings, {
+            ...options,
+            attempt: attempt + 1,
+            delayMs: Math.min(30000, Math.max(1500, delayMs * 2)),
+            reason: 'records_changed_concurrently'
+          });
+        }
+      }).catch(error => warn('progressive re-embedding retry failed', error));
+    }, delayMs);
+    Runtime.progressiveReembedRetryByScope.set(scopeKey, state);
+    return true;
   };
 
   const progressivelyReembedRecords = async (scopeOverride = null, settingsOverride = null, options = {}) => {
@@ -20487,7 +21827,8 @@
     const vectors = await embedTexts(bounded.map(item => item.record.text), settings, {
       purpose: 'document',
       contextGroupIds: bounded.map(item => text(item.record.sourceHash || item.record.sourceId || `record:${item.index}`)),
-      concurrency: expectedProvider === 'hash' ? 1 : 1
+      concurrency: expectedProvider === 'hash' ? 1 : 1,
+      allowHashFallback: false
     });
     if (vectors.flashbackFallbackUsed === true && expectedProvider !== 'hash') {
       return finish({ scopeKey: scope.scopeKey, selected: bounded.length, reembedded: 0, pending: selected.length, reason: 'provider_failed_old_vectors_preserved', errorType: Runtime.lastEmbeddingDiagnostic?.errorType || 'UNKNOWN' });
@@ -20532,7 +21873,7 @@
       return { ...committed, changed, reason: '' };
     });
     if (saved.changed > 0) scheduleEpisodeIndexRebuild(scope, settings, { reason: 'progressive_reembed' });
-    return finish({
+    const result = finish({
       scopeKey: scope.scopeKey,
       selected: bounded.length,
       reembedded: saved.changed || 0,
@@ -20541,6 +21882,16 @@
       requestBudget: maxRequests,
       reason: saved.reason || 'progressive_batch_complete'
     });
+    if (result.reason === 'records_changed_concurrently' && options.retryOnConcurrent !== false) {
+      scheduleProgressiveReembedRetry(scope, settings, {
+        attempt: Math.max(0, Number(options.retryAttempt || 0) || 0) + 1,
+        reason: 'records_changed_concurrently',
+        maxRecords,
+        maxChars,
+        maxRequests
+      });
+    }
+    return result;
   };
 
   const arraysEqual = (left = [], right = []) => {
@@ -20802,6 +22153,7 @@ ${cleanedText}`, 80),
           ? batch.map((record, index) => text(record.sourceHash || record.sourceId || `record:${reembedIndexes[index]}`))
           : undefined,
         concurrency: settings.embeddingProvider === 'hash' ? 1 : REMOTE_EMBEDDING_CONCURRENCY,
+        allowHashFallback: false,
         onProgress: maintenanceEmbeddingProgressCallback(opts.maintenanceOperationId, '기억 정제')
       });
       const fallbackUsed = vectors.flashbackFallbackUsed === true;
@@ -20910,6 +22262,9 @@ ${cleanedText}`, 80),
     }
     if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.liveChunkSchemaMismatch || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageManifestCorrupt === true || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
       return { strategy: 'live_source_required', stages: [], blocked: true };
+    }
+    if (plan.embeddingCredentialMissing === true) {
+      return { strategy: 'credential_required', stages: [], blocked: true, reason: 'embedding_credential_missing' };
     }
     if (plan.requiresFullRebuild) {
       return {
@@ -21021,7 +22376,19 @@ ${cleanedText}`, 80),
     const episodeStale = settings.episodeIndexEnabled
       && (text(rawLoaded.manifest.episodeSourceDigest || '') !== text(baseDigest || '') || missingEpisodeIndexForEligibleTurns(responseRecords, episodeRecords, settings));
     const externalRecords = rawLoaded.records.filter(record => !isRetainedMemoryRecord(record)).length;
+    const estimatedEmbeddingChunks = requiresFullRebuild ? syncEstimate.chunks : syncEstimate.chunks + recordsNeedingEmbedding;
     const estimatedTokens = requiresFullRebuild ? syncEstimate.tokens : syncEstimate.tokens + repairTokens;
+    const embeddingWorkPending = requiresFullRebuild
+      || estimatedEmbeddingChunks > 0
+      || diff.missing.length > 0
+      || diff.changed.length > 0
+      || recordsNeedingEmbedding > 0;
+    // Reading first reconciles the plugin argument, save-synced backup, and
+    // device-local cache without rewriting provider/model settings.
+    await readEmbeddingKey().catch(error => warn('embedding credential reconciliation failed during maintenance inspection', error));
+    const credentialStatus = await inspectEmbeddingKeyPersistence({ includeArgument: true });
+    const embeddingCredentialRequired = settings.embeddingEnabled !== false && providerRequiresEmbeddingCredential(settings.embeddingProvider);
+    const embeddingCredentialMissing = embeddingCredentialRequired && embeddingWorkPending && !credentialStatus.keyPresent;
     const plan = {
       at: Date.now(),
       scopeKey: scope.scopeKey,
@@ -21059,9 +22426,21 @@ ${cleanedText}`, 80),
       requiresFullRebuild,
       recordsNeedingEmbedding,
       episodeStale,
-      estimatedEmbeddingChunks: requiresFullRebuild ? syncEstimate.chunks : syncEstimate.chunks + recordsNeedingEmbedding,
+      embeddingWorkPending,
+      estimatedEmbeddingChunks,
       estimatedEmbeddingTokens: estimatedTokens,
-      embeddingCost: estimateEmbeddingCostForTokens(estimatedTokens, settings)
+      embeddingCost: estimateEmbeddingCostForTokens(estimatedTokens, settings),
+      embeddingCredentialRequired,
+      embeddingCredentialMissing,
+      embeddingCredential: {
+        present: !!credentialStatus.keyPresent,
+        source: text(credentialStatus.effectiveSource || credentialStatus.source || 'none'),
+        durableAcrossUpdate: !!credentialStatus.durableAcrossUpdate,
+        argumentVerified: !!credentialStatus.argument?.verified,
+        syncedVerified: !!credentialStatus.synced?.verified,
+        localVerified: !!credentialStatus.local?.verified,
+        reason: text(credentialStatus.reason || '')
+      }
     };
     plan.healthy = !plan.missingTurns
       && !plan.changedTurns
@@ -21079,7 +22458,8 @@ ${cleanedText}`, 80),
       && !plan.shardIndexMismatch
       && !plan.sanitizerVersionMismatch
       && !plan.liveChunkSchemaMismatch
-      && !plan.episodeStale;
+      && !plan.episodeStale
+      && !plan.embeddingCredentialMissing;
     plan.automatic = automaticMaintenanceStrategyForPlan(plan);
     Object.defineProperty(plan, '_maintenanceContext', {
       value: { settings, snapshot, scope, rawLoaded },
@@ -21087,6 +22467,137 @@ ${cleanedText}`, 80),
       configurable: true
     });
     return plan;
+  };
+
+  const maintenanceEmbeddingWorkRequested = (mode = 'auto', plan = {}) => {
+    const normalizedMode = normalizeChoice(mode, ['auto', 'sync', 'rebuild', 'reembed'], 'auto');
+    if (normalizedMode === 'rebuild' || normalizedMode === 'reembed') return true;
+    if (normalizedMode === 'sync') return Number(plan.estimatedEmbeddingChunks || 0) > 0 || Number(plan.missingTurns || 0) > 0 || Number(plan.changedTurns || 0) > 0;
+    const stages = Array.isArray(plan.automatic?.stages) ? plan.automatic.stages : [];
+    return plan.requiresFullRebuild === true
+      || stages.some(stage => ['sync', 'reembed', 'rebuild'].includes(stage))
+      || Number(plan.estimatedEmbeddingChunks || 0) > 0;
+  };
+
+  const requireMaintenanceEmbeddingCredential = async (settings = DEFAULTS, plan = {}, mode = 'auto') => {
+    const cfg = normalizeSettings(settings || DEFAULTS);
+    const provider = normalizeProvider(cfg.embeddingProvider);
+    const workRequested = maintenanceEmbeddingWorkRequested(mode, plan);
+
+    if (!workRequested) {
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: !!Runtime.sessionEmbeddingKey,
+        tested: false,
+        skipped: true,
+        reason: 'no_embedding_work'
+      };
+    }
+
+    // Disabled embedding would otherwise enter createEmbeddingProviderAdapter's
+    // ordinary hash path. Maintenance is a replacement operation, so silently
+    // converting existing remote vectors to hash vectors is never allowed.
+    if (cfg.embeddingEnabled === false) {
+      const error = new Error('임베딩이 꺼져 있어 기억 벡터 유지보수를 실행할 수 없습니다. 기존 벡터는 변경하지 않았습니다.');
+      error.code = 'FLASHBACK_EMBEDDING_DISABLED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
+
+    if (provider === 'hash') {
+      return { required: false, present: true, tested: false, local: true, reason: 'hash_provider' };
+    }
+
+    const key = text(await readEmbeddingKey() || '').trim();
+    if (providerRequiresEmbeddingCredential(provider) && !key) {
+      const error = new Error(`현재 ${cfg.embeddingProvider} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`);
+      error.code = 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
+
+    // A one-item, no-retry, no-fallback probe runs before any shard, record, or
+    // episode mutation. This catches expired credentials and unreachable local/
+    // custom endpoints without launching a bulk re-embedding job.
+    const credentialFingerprint = stableHash(`${provider}\n${cfg.embeddingModel}\n${embeddingRequestSettingsFingerprint(cfg)}\n${stableHash(key)}`);
+    const cached = Runtime.lastMaintenanceEmbeddingPreflight;
+    if (cached?.ok === true
+      && cached.fingerprint === credentialFingerprint
+      && Date.now() - Number(cached.at || 0) < 5 * 60 * 1000) {
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: providerRequiresEmbeddingCredential(provider) ? !!key : true,
+        tested: true,
+        cached: true,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: Number(cached.dimensions || 0) || 0,
+        persistence: Runtime.embeddingKeyPersistence
+      };
+    }
+
+    const preflightSettings = normalizeSettings({
+      ...cfg,
+      embeddingMaxRetries: 0,
+      embeddingFallbackProvider: '',
+      fallbackHashEmbedding: false
+    });
+    const startedAt = Date.now();
+    try {
+      const probe = `Flashback maintenance embedding preflight ${Date.now()} ${stableHash(plan.scopeKey || 'scope')}`;
+      const vectors = await embedTexts([probe], preflightSettings, {
+        purpose: 'query',
+        allowHashFallback: false,
+        deadlineAt: startedAt + Math.min(12000, Math.max(3000, Number(cfg.embeddingTimeoutMs || DEFAULTS.embeddingTimeoutMs) || DEFAULTS.embeddingTimeoutMs))
+      });
+      const vector = Array.isArray(vectors?.[0]) ? vectors[0] : [];
+      if (!vector.length) throw new EmbeddingAdapterError('INVALID_RESPONSE', 'Embedding preflight returned an empty vector.');
+      Runtime.lastMaintenanceEmbeddingPreflight = Object.freeze({
+        at: Date.now(),
+        ok: true,
+        fingerprint: credentialFingerprint,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: vector.length,
+        elapsedMs: Date.now() - startedAt
+      });
+      return {
+        required: providerRequiresEmbeddingCredential(provider),
+        present: providerRequiresEmbeddingCredential(provider) ? !!key : true,
+        tested: true,
+        cached: false,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        dimensions: vector.length,
+        elapsedMs: Date.now() - startedAt,
+        persistence: Runtime.embeddingKeyPersistence
+      };
+    } catch (rawError) {
+      const classified = classifyEmbeddingError(rawError, { provider });
+      Runtime.lastMaintenanceEmbeddingPreflight = Object.freeze({
+        at: Date.now(),
+        ok: false,
+        fingerprint: credentialFingerprint,
+        provider,
+        model: text(cfg.embeddingModel || ''),
+        errorType: classified.type,
+        elapsedMs: Date.now() - startedAt
+      });
+      const authentication = classified.type === 'AUTH_ERROR';
+      const error = new Error(authentication
+        ? `${cfg.embeddingProvider} 임베딩 인증에 실패했습니다. 기존 벡터는 변경하지 않았습니다. API 키 또는 액세스 토큰을 다시 저장해 주세요.`
+        : `${cfg.embeddingProvider} 임베딩 사전 연결 확인에 실패했습니다. 기존 벡터는 변경하지 않았습니다: ${formatErrorMessage(classified, 420)}`);
+      error.code = authentication ? 'FLASHBACK_EMBEDDING_AUTH_REQUIRED' : 'FLASHBACK_EMBEDDING_PREFLIGHT_FAILED';
+      error.provider = provider;
+      error.model = text(cfg.embeddingModel || '');
+      error.errorType = classified.type;
+      error.scopeKey = text(plan.scopeKey || '');
+      throw error;
+    }
   };
 
   const maintenanceOperationTotals = (operation = {}) => {
@@ -21157,10 +22668,11 @@ ${cleanedText}`, 80),
     const planContext = before?._maintenanceContext && typeof before._maintenanceContext === 'object'
       ? before._maintenanceContext
       : {};
-    const settings = planContext.settings || sharedSettings || undefined;
+    const settings = normalizeSettings(planContext.settings || sharedSettings || await loadSettings(true));
     const snapshot = planContext.snapshot || sharedSnapshot || undefined;
     const scope = planContext.scope?.scopeKey ? planContext.scope : sharedScope;
-    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync' };
+    const embeddingPreflight = await requireMaintenanceEmbeddingCredential(settings, before, normalizedMode);
+    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync', allowHashFallback: false };
     await persistMaintenanceJournal({
       operationId,
       status: 'running',
@@ -21187,14 +22699,17 @@ ${cleanedText}`, 80),
       operation = await rebuildCurrentChatMemory(rebuildOptions);
       } else if (normalizedMode === 'reembed') {
         await persistMaintenanceJournal({ operationId, status: 'running', stage: 'reembed', scopeKey: before.scopeKey || '', strategy: 'reembed', stages: ['reembed'] });
-        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId });
+        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId, allowHashFallback: false });
     } else {
       const automatic = before.automatic || automaticMaintenanceStrategyForPlan(before);
       if (automatic.blocked) {
-        const error = before.storageForeignScopeKey
-          ? new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.')
-          : new Error('구형 정제기로 저장된 기억을 복구하려면 원문이 남아 있는 현재 채팅을 먼저 열어야 합니다.');
-        error.code = before.storageForeignScopeKey ? 'FLASHBACK_STORAGE_SCOPE_COLLISION' : 'FLASHBACK_LIVE_SOURCE_REQUIRED';
+        const credentialBlocked = automatic.strategy === 'credential_required' || before.embeddingCredentialMissing === true;
+        const error = credentialBlocked
+          ? new Error(`현재 ${settings?.embeddingProvider || '원격'} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`)
+          : (before.storageForeignScopeKey
+            ? new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.')
+            : new Error('구형 정제기로 저장된 기억을 복구하려면 원문이 남아 있는 현재 채팅을 먼저 열어야 합니다.'));
+        error.code = credentialBlocked ? 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED' : (before.storageForeignScopeKey ? 'FLASHBACK_STORAGE_SCOPE_COLLISION' : 'FLASHBACK_LIVE_SOURCE_REQUIRED');
         error.scopeKey = before.scopeKey || '';
         if (before.storageForeignScopeKey) error.foreignScopeKey = before.storageForeignScopeKey;
         throw error;
@@ -21248,6 +22763,7 @@ ${cleanedText}`, 80),
             forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch,
             forceIndexRebuild: before.shardIndexMismatch === true,
             reembedChanged: true,
+            allowHashFallback: false,
             maintenanceOperationId: operationId
           });
         }
@@ -21279,6 +22795,7 @@ ${cleanedText}`, 80),
       scopeKey: after.scopeKey || before.scopeKey,
       before,
       after,
+      embeddingPreflight,
       operation,
       healthy: after.healthy === true
     };
@@ -21379,7 +22896,8 @@ ${cleanedText}`, 80),
       targeted_repair: '상태별 선택 복구',
       full_rebuild: '현재 채팅 전체 재구축',
       live_source_required: '현재 채팅 원문 필요',
-      scope_collision: '저장 범위 충돌 — 자동 변경 차단'
+      scope_collision: '저장 범위 충돌 — 자동 변경 차단',
+      credential_required: '임베딩 API 키 필요 — 기존 벡터 보존'
     };
     const stageLabels = {
       sync: '누락·변경 동기화',
@@ -21401,12 +22919,15 @@ ${cleanedText}`, 80),
     `리콜 샤드 인덱스 v${formatNumber(plan.shardIndexVersion)} / v${formatNumber(plan.shardIndexExpectedVersion || FLASHBACK_SHARD_INDEX_VERSION)} · ${plan.shardIndexMismatch ? '재구축 필요' : '정상'}`,
     `저장 무결성: 매니페스트 ${plan.storageManifestCorrupt ? '손상' : '정상'} · 누락 샤드 ${formatNumber(plan.storageMissingShards)} · 손상 샤드 ${formatNumber(plan.storageCorruptShards)} · 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'} · 범위 충돌 ${plan.storageForeignScopeKey ? '예' : '아니오'}`,
     `벡터 복구 ${formatNumber(plan.recordsNeedingEmbedding)} · 프로바이더 불일치 ${formatNumber(plan.providerMismatch)}`,
+    `임베딩 키 ${plan.embeddingCredentialRequired ? (plan.embeddingCredential?.present ? `확인됨 · ${plan.embeddingCredential?.durableAcrossUpdate ? '업데이트 보존 경로 있음' : '현재 기기 전용'}` : (plan.embeddingWorkPending ? '없음 · 원격 복구 차단' : '없음 · 현재 기억 데이터는 유지')) : '필요 없음'}`,
     `에피소드 인덱스 ${plan.episodeStale ? '갱신 필요' : '정상'}`,
     `자동 복구 경로: ${maintenanceStrategyText(plan.automatic)}`,
     `예상 임베딩 ${formatNumber(plan.estimatedEmbeddingChunks)}개 / ${formatNumber(plan.estimatedEmbeddingTokens)} tokens / ${formatCostSummary(plan.embeddingCost)}`,
     plan.healthy
       ? '판정: 현재 데이터가 정상입니다.'
-      : (plan.storageForeignScopeKey ? '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.' : '판정: 자동 점검·복구로 정리할 항목이 있습니다.')
+      : (plan.embeddingCredentialMissing
+        ? '판정: 임베딩 키가 없어 기존 벡터를 보존하고 자동 복구를 차단했습니다.'
+        : (plan.storageForeignScopeKey ? '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.' : '판정: 자동 점검·복구로 정리할 항목이 있습니다.'))
   ].join('\n');
 
   const maintenanceResultText = (result = {}) => [
@@ -21478,54 +22999,135 @@ ${cleanedText}`, 80),
     finally { if (Runtime.guiCurrentStatsInFlight === task) Runtime.guiCurrentStatsInFlight = null; }
   };
 
+  const scheduleGuiStorageMetadataHydration = (metas = [], options = {}) => {
+    const candidates = (Array.isArray(metas) ? metas : [])
+      .filter(meta => meta?.scopeKey && meta.guiSummaryComplete !== true && Number(meta.guiSummaryVersion || 0) < 1)
+      .slice(0, clampInt(options.maxRows, 1, 96, 32));
+    if (!candidates.length) return false;
+    const startedAt = Date.now();
+    Runtime.guiPerf.storageBackgroundHydrations += 1;
+    const concurrency = Math.min(2, candidates.length);
+    let cursor = 0;
+    const workers = Array.from({ length: concurrency }, async () => {
+      while (cursor < candidates.length && !Runtime.unloaded) {
+        const meta = candidates[cursor++];
+        const scopeKey = text(meta.scopeKey || '');
+        if (!scopeKey) continue;
+        let task = Runtime.guiStorageHydrationInFlight.get(scopeKey);
+        if (!task) {
+          task = (async () => {
+            const manifest = await loadScopeManifest(scopeKey);
+            const row = guiStorageRowFromManifest(manifest, meta);
+            const stats = row.stats || guiStatsFromRegistryMeta(row);
+            const responseStats = stats.byType?.response || {};
+            const episodeStats = stats.byType?.episode_index || {};
+            await rememberScope({ ...meta, ...manifest, scopeKey }, {
+              guiSummaryVersion: 1,
+              count: row.count,
+              tokenTotal: Number(stats.tokenTotal || 0) || 0,
+              responseCount: Number(responseStats.records || 0) || 0,
+              responseTokens: Number(responseStats.tokens || 0) || 0,
+              episodeCount: Number(episodeStats.records || 0) || 0,
+              episodeTokens: Number(episodeStats.tokens || 0) || 0,
+              shardCount: row.shardCount,
+              commitId: row.commitId,
+              updatedAt: Date.parse(manifest.updatedAt || '') || Date.now()
+            }).catch(error => warn('GUI registry metadata hydration persist failed', error));
+            return row;
+          })().finally(() => Runtime.guiStorageHydrationInFlight.delete(scopeKey));
+          Runtime.guiStorageHydrationInFlight.set(scopeKey, task);
+        }
+        const row = await task.catch(error => { warn('GUI storage metadata hydration failed', error); return null; });
+        if (!row) continue;
+        Runtime.guiPerf.storageBackgroundHydrationRows += 1;
+        if (Runtime.guiStorageStatsCache?.rows) {
+          const rows = Runtime.guiStorageStatsCache.rows.slice();
+          const index = rows.findIndex(item => text(item?.scopeKey || '') === scopeKey);
+          if (index >= 0) rows[index] = { ...rows[index], ...row };
+          else rows.push(row);
+          rows.sort((a, b) => Number(new Date(b.updatedAt).getTime() || b.seenAt || 0) - Number(new Date(a.updatedAt).getTime() || a.seenAt || 0));
+          Runtime.guiStorageStatsCache = { at: Date.now(), rows, mode: Runtime.guiStorageStatsCache.mode || 'fast' };
+        }
+      }
+    });
+    Promise.allSettled(workers).then(() => {
+      Runtime.guiPerf.lastStorageHydrationMs = Math.max(0, Date.now() - startedAt);
+      if (!isGuiRenderActive() || Runtime.guiTab !== 'storage') return;
+      const rows = Runtime.guiStorageStatsCache?.rows;
+      const scopeKey = Runtime.guiCurrentStatsCache?.value?.scope?.scopeKey || Runtime.currentScope?.scopeKey || '';
+      if (Array.isArray(rows)) {
+        renderStorageRowsChunked(rows, scopeKey, { refreshToken: Runtime.guiRefreshToken })
+          .catch(error => warn('background hydrated storage repaint failed', error));
+      }
+    }).catch(() => {});
+    return true;
+  };
+
   const listScopeStorageStats = async (options = {}) => {
     const ttlMs = clampInt(options.ttlMs, 0, 120000, 30000);
+    const guiFast = options.guiFast === true;
     const cached = Runtime.guiStorageStatsCache;
-    if (options.force !== true && cached?.rows && Date.now() - Number(cached.at || 0) <= ttlMs) {
+    const cacheCompatible = guiFast || cached?.mode === 'deep';
+    if (options.force !== true && cacheCompatible && cached?.rows && Date.now() - Number(cached.at || 0) <= ttlMs) {
       Runtime.guiPerf.storageCacheHits += 1;
+      if (guiFast) scheduleGuiStorageMetadataHydration(cached.rows);
       return cached.rows;
     }
-    if (options.force !== true && Runtime.guiStorageStatsInFlight) return await Runtime.guiStorageStatsInFlight;
+    const inFlightCompatible = guiFast || Runtime.guiStorageStatsInFlightMode === 'deep';
+    if (options.force !== true && inFlightCompatible && Runtime.guiStorageStatsInFlight) return await Runtime.guiStorageStatsInFlight;
     const shouldCancel = typeof options.shouldCancel === 'function' ? options.shouldCancel : () => false;
     const task = (async () => {
       Runtime.guiPerf.storageLoads += 1;
+      const startedAt = Date.now();
       const registry = await readRegistry();
       const metas = (registry.scopes || []).filter(meta => meta?.scopeKey);
-      // V3 calls cross an iframe boundary. A small worker pool is faster and
-      // keeps the host responsive in PocketRisu while remaining compatible
-      // with the upstream in-memory implementation.
+      if (guiFast) {
+        Runtime.guiPerf.storageRegistryFastLoads += 1;
+        let rows = metas.map(guiStorageRowFromRegistryMeta);
+        const current = Runtime.guiCurrentStatsCache?.value || null;
+        if (current?.scope?.scopeKey && current?.manifest) {
+          const currentRow = guiStorageRowFromManifest(current.manifest, current.scope);
+          const index = rows.findIndex(item => text(item?.scopeKey || '') === current.scope.scopeKey);
+          if (index >= 0) rows[index] = { ...rows[index], ...currentRow };
+          else rows.unshift(currentRow);
+        }
+        rows.sort((a, b) => Number(new Date(b.updatedAt).getTime() || b.seenAt || 0) - Number(new Date(a.updatedAt).getTime() || a.seenAt || 0));
+        if (!shouldCancel()) Runtime.guiStorageStatsCache = { at: Date.now(), rows, mode: 'fast' };
+        Runtime.guiPerf.lastStorageFastMs = Math.max(0, Date.now() - startedAt);
+        scheduleGuiStorageMetadataHydration(metas);
+        return rows;
+      }
+      // Public/API callers retain the exact deep-inspection behavior. The GUI
+      // opts into registry-first mode explicitly so performance does not change
+      // the semantics of storage inspection APIs.
       const concurrency = clampInt(options.concurrency, 1, 8, 3);
       const out = new Array(metas.length);
       let cursor = 0;
       const workerCount = Math.min(concurrency, metas.length);
       const workers = Array.from({ length: workerCount }, async () => {
         while (cursor < metas.length && !shouldCancel()) {
-          const index = cursor;
-          cursor += 1;
+          const index = cursor++;
           const meta = metas[index];
           if (!meta?.scopeKey) continue;
           const manifest = await loadScopeManifest(meta.scopeKey);
           if (shouldCancel()) return;
-          const stats = normalizeStatsForDisplay(manifest.stats && typeof manifest.stats === 'object' ? manifest.stats : statsForRecords([]));
-          out[index] = {
-            ...meta,
-            manifest,
-            stats,
-            count: manifest.count || stats.recordTotal || meta.count || 0,
-            shardCount: manifest.shardCount || 0,
-            updatedAt: manifest.updatedAt || meta.updatedAt || meta.seenAt || 0,
-            copiedFromScopeKey: manifest.copiedFromScopeKey || meta.copiedFromScopeKey || ''
-          };
+          out[index] = guiStorageRowFromManifest(manifest, meta);
         }
       });
       await Promise.all(workers);
       const rows = out.filter(Boolean).sort((a, b) => Number(new Date(b.updatedAt).getTime() || b.seenAt || 0) - Number(new Date(a.updatedAt).getTime() || a.seenAt || 0));
-      if (!shouldCancel()) Runtime.guiStorageStatsCache = { at: Date.now(), rows };
+      if (!shouldCancel()) Runtime.guiStorageStatsCache = { at: Date.now(), rows, mode: 'deep' };
       return rows;
     })();
     Runtime.guiStorageStatsInFlight = task;
+    Runtime.guiStorageStatsInFlightMode = guiFast ? 'fast' : 'deep';
     try { return await task; }
-    finally { if (Runtime.guiStorageStatsInFlight === task) Runtime.guiStorageStatsInFlight = null; }
+    finally {
+      if (Runtime.guiStorageStatsInFlight === task) {
+        Runtime.guiStorageStatsInFlight = null;
+        Runtime.guiStorageStatsInFlightMode = '';
+      }
+    }
   };
 
   const sourceTypeOptions = [
@@ -21670,6 +23272,7 @@ ${cleanedText}`, 80),
   };
 
   const listManualEditorRecords = async (options = {}) => {
+    const startedAt = Date.now();
     const state = ensureManualEditorState();
     const scope = options.scope?.scopeKey ? options.scope : (options.scope ? { scopeKey: options.scope } : await resolveCurrentScopeForGui());
     const manifest = await loadScopeManifest(scope.scopeKey);
@@ -21686,28 +23289,53 @@ ${cleanedText}`, 80),
       return { ...Runtime.guiManualEditorDataCache.value, pendingDeleteKeys: ensureManualEditorState().pendingDeleteKeys.slice() };
     }
     let summaries = [];
-    let total = 0;
+    const groupTotal = Math.max(0, Number(groups.find(group => group.type === sourceType)?.records || 0) || 0);
+    let total = needle ? 0 : groupTotal;
     const trimLimit = Math.max(limit, MANUAL_EDITOR_PAGE_SIZE);
-    const shardIndexes = manualEditorShardIndexes(manifest, sourceType);
+    let shardIndexes = manualEditorShardIndexes(manifest, sourceType);
+    const directionalPaging = !needle && (sort === 'newest' || sort === 'oldest');
+    if (directionalPaging && sort === 'newest') shardIndexes = shardIndexes.slice().reverse();
     Runtime.guiPerf.manualShardSkips += Math.max(0, Number(manifest.shardCount || 0) - shardIndexes.length);
-    let cursor = 0;
-    const concurrency = Math.min(4, shardIndexes.length);
-    const workers = Array.from({ length: concurrency }, async () => {
-      while (cursor < shardIndexes.length && !shouldCancel()) {
-        const index = shardIndexes[cursor];
-        cursor += 1;
+
+    if (directionalPaging) {
+      let scannedShards = 0;
+      for (const index of shardIndexes) {
+        if (shouldCancel()) break;
         const shard = await readScopeShardRecords(scope.scopeKey, index, manifest);
         Runtime.guiPerf.manualShardReads += 1;
-        if (shouldCancel()) return;
+        scannedShards += 1;
+        if (shouldCancel()) break;
         for (const record of shard.records || []) {
-          if (!manualEditorRecordMatches(record, sourceType, needle)) continue;
-          total += 1;
+          if (!manualEditorRecordMatches(record, sourceType, '')) continue;
           summaries.push(summarizeManualEditorRecord(record));
         }
-        if (summaries.length > trimLimit * 3) summaries = sortManualEditorRecords(summaries, sort).slice(0, trimLimit * 2);
+        if (summaries.length >= trimLimit) {
+          Runtime.guiPerf.manualDirectionalEarlyStops += Math.max(0, shardIndexes.length - scannedShards);
+          break;
+        }
       }
-    });
-    await Promise.all(workers);
+    } else {
+      total = 0;
+      let cursor = 0;
+      const concurrency = Math.min(4, shardIndexes.length);
+      const workers = Array.from({ length: concurrency }, async () => {
+        while (cursor < shardIndexes.length && !shouldCancel()) {
+          const index = shardIndexes[cursor++];
+          const shard = await readScopeShardRecords(scope.scopeKey, index, manifest);
+          Runtime.guiPerf.manualShardReads += 1;
+          if (shouldCancel()) return;
+          for (const record of shard.records || []) {
+            if (!manualEditorRecordMatches(record, sourceType, needle)) continue;
+            total += 1;
+            summaries.push(summarizeManualEditorRecord(record));
+          }
+          if (summaries.length > trimLimit * 3) summaries = sortManualEditorRecords(summaries, sort).slice(0, trimLimit * 2);
+        }
+      });
+      await Promise.all(workers);
+    }
+
+    Runtime.guiPerf.lastManualEditorMs = Math.max(0, Date.now() - startedAt);
     if (shouldCancel()) return { cancelled: true, scope, manifest, groups, sourceType, sourceLabel: sourceTypeLabel(sourceType), search, sort, limit, total, records: summaries, pendingDeleteKeys: ensureManualEditorState().pendingDeleteKeys.slice() };
     const sorted = sortManualEditorRecords(summaries, sort).slice(0, limit);
     const value = {
@@ -21802,18 +23430,67 @@ ${cleanedText}`, 80),
 
   const renderStorageTypeCells = (stats) => COUNT_TYPES.map(([type]) => `<td>${formatNumber(stats?.byType?.[type]?.tokens || 0)}</td>`).join('');
 
+  const storageScopeSelection = () => {
+    if (!(Runtime.guiStorageSelectedScopeKeys instanceof Set)) Runtime.guiStorageSelectedScopeKeys = new Set();
+    return Runtime.guiStorageSelectedScopeKeys;
+  };
+
+  const selectableStorageScopeKeys = (scopeStats = [], currentScopeKey = '') => (Array.isArray(scopeStats) ? scopeStats : [])
+    .map(item => text(item?.scopeKey || '').trim())
+    .filter(scopeKey => scopeKey && scopeKey !== currentScopeKey);
+
+  const syncStorageSelectionUi = (scopeStats = null, currentScopeKey = '') => {
+    const rows = Array.isArray(scopeStats)
+      ? scopeStats
+      : (Array.isArray(Runtime.guiStorageStatsCache?.rows) ? Runtime.guiStorageStatsCache.rows : []);
+    const activeScopeKey = text(currentScopeKey || Runtime.guiCurrentStatsCache?.value?.scope?.scopeKey || Runtime.currentScope?.scopeKey || '').trim();
+    const selectable = selectableStorageScopeKeys(rows, activeScopeKey);
+    const selectableSet = new Set(selectable);
+    const selected = storageScopeSelection();
+    for (const scopeKey of Array.from(selected)) {
+      if (!selectableSet.has(scopeKey)) selected.delete(scopeKey);
+    }
+    for (const checkbox of guiQueryAll('input[data-select-scope]')) {
+      const scopeKey = text(checkbox.getAttribute?.('data-select-scope') || '').trim();
+      if (!scopeKey) continue;
+      const canSelect = scopeKey !== activeScopeKey && selectableSet.has(scopeKey);
+      checkbox.disabled = !canSelect;
+      checkbox.checked = canSelect && selected.has(scopeKey);
+    }
+    const selectedCount = Array.from(selected).filter(scopeKey => selectableSet.has(scopeKey)).length;
+    const countNode = getGuiNode('selectedScopeCount');
+    if (countNode) countNode.textContent = `선택 ${formatNumber(selectedCount)}개`;
+    const deleteBtn = getGuiNode('deleteSelectedScopesBtn');
+    if (deleteBtn) deleteBtn.disabled = selectedCount < 1 || Runtime.guiBusyDepth > 0;
+    const allBox = getGuiNode('selectAllScopes');
+    if (allBox) {
+      const allSelected = selectable.length > 0 && selectable.every(scopeKey => selected.has(scopeKey));
+      const someSelected = selectable.some(scopeKey => selected.has(scopeKey));
+      allBox.disabled = selectable.length < 1 || Runtime.guiBusyDepth > 0;
+      allBox.checked = allSelected;
+      allBox.indeterminate = someSelected && !allSelected;
+      allBox.title = selectable.length ? `현재 스코프를 제외한 ${formatNumber(selectable.length)}개 선택` : '선택 가능한 다른 스코프가 없습니다.';
+    }
+    return { selectedCount, selectableCount: selectable.length, selected: Array.from(selected) };
+  };
+
   const renderStorageRows = (scopeStats, currentScopeKey) => {
+    const selected = storageScopeSelection();
     const rows = (Array.isArray(scopeStats) ? scopeStats : []).map(item => {
-      const isCurrent = item.scopeKey === currentScopeKey;
+      const scopeKey = text(item.scopeKey || '').trim();
+      const isCurrent = scopeKey === currentScopeKey;
       const copied = item.copiedFromScopeKey ? `<div class="muted tiny">copied from ${escapeHtml(item.copiedFromScopeKey.slice(0, 36))}</div>` : '';
-      return `<tr class="${isCurrent ? 'current-row' : ''}">
-        <td>${isCurrent ? '<span class="badge badge-on">현재</span>' : ''}</td>
+      const selector = scopeKey
+        ? `<input class="storage-scope-select" type="checkbox" data-select-scope="${escapeHtml(scopeKey)}" ${!isCurrent && selected.has(scopeKey) ? 'checked' : ''} ${isCurrent ? 'disabled' : ''} aria-label="${escapeHtml(isCurrent ? '현재 스코프는 선택 삭제에서 제외됩니다.' : '스코프 선택')}" />`
+        : '';
+      return `<tr class="${isCurrent ? 'current-row' : ''}" data-storage-scope-row="${escapeHtml(scopeKey)}">
+        <td><div class="storage-scope-selector">${selector}${isCurrent ? '<span class="badge badge-on">현재</span>' : ''}</div></td>
         <td><strong>${escapeHtml(item.characterName || 'Unknown')}</strong><div class="muted tiny">${escapeHtml(item.chatTitle || item.chatId || '')}</div><div class="muted tiny">${escapeHtml(item.personaName || '')}</div>${copied}</td>
         <td>${formatNumber(item.stats?.tokenTotal || 0)}</td>
         <td>${formatNumber(item.count || 0)}</td>
         <td>${formatNumber(item.shardCount || 0)}</td>
         <td class="muted tiny">${escapeHtml(item.updatedAt ? new Date(item.updatedAt).toLocaleString() : '-')}</td>
-        <td><button class="btn btn-danger small" data-delete-scope="${escapeHtml(item.scopeKey)}">삭제</button></td>
+        <td><button class="btn btn-danger small" data-delete-scope="${escapeHtml(scopeKey)}">삭제</button></td>
       </tr>`;
     }).join('');
     return rows || '<tr><td colspan="7" class="muted">저장된 스코프가 없습니다.</td></tr>';
@@ -21835,6 +23512,7 @@ ${cleanedText}`, 80),
     if (cancelled()) return { ok: false, cancelled: true };
     if (!rows.length) {
       node.innerHTML = '<tr><td colspan="7" class="muted">저장된 스코프가 없습니다.</td></tr>';
+      syncStorageSelectionUi(rows, currentScopeKey);
       return { ok: true, cancelled: false };
     }
     node.innerHTML = `<tr><td colspan="7" class="muted">저장소 목록을 그리는 중... 0 / ${formatNumber(rows.length)}</td></tr>`;
@@ -21847,6 +23525,7 @@ ${cleanedText}`, 80),
       else node.insertAdjacentHTML?.('beforeend', html);
       if (i + batchSize < rows.length) await nextRenderFrame();
     }
+    syncStorageSelectionUi(rows, currentScopeKey);
     return { ok: true, cancelled: false };
   };
 
@@ -22128,7 +23807,7 @@ ${cleanedText}`, 80),
           <div class="field"><label>Provider</label><select id="embeddingProvider">${providerOptions}</select></div>
           <div class="field"><label>모델</label><input id="embeddingModel" list="embeddingModelSuggestions" value="${escapeHtml(settings.embeddingModel)}" /><datalist id="embeddingModelSuggestions">${recommendedModels}</datalist></div>
           <div class="field"><label>Base URL / 서버 주소</label><input id="embeddingUrl" value="${escapeHtml(settings.embeddingUrl)}" placeholder="비워두면 기본값" /></div>
-          <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="입력 후 저장하면 로컬 저장소에 유지됩니다" /></div>
+          <div class="field"><label>API Key / Access Token</label><input id="embeddingKey" type="password" placeholder="입력 후 저장하면 설정·동기화 백업·로컬에 보관됩니다" /></div>
           <div class="field"><label>벡터 차원 (0=자동)</label><input id="embeddingDimensions" type="number" min="0" max="65536" value="${settings.embeddingDimensions}" /></div>
           <div class="field"><label>요청 제한시간(ms)</label><input id="embeddingTimeoutMs" type="number" min="3000" max="180000" value="${settings.embeddingTimeoutMs}" /></div>
           <div class="field"><label>배치 크기</label><input id="embeddingBatchSize" type="number" min="1" max="128" value="${settings.embeddingBatchSize}" /></div>
@@ -22260,12 +23939,14 @@ ${cleanedText}`, 80),
     return `<section class="panel" data-panel="storage">
       <div class="actions storage-actions">
         <button id="refreshStorageBtn" class="btn">새로고침</button>
+        <span id="selectedScopeCount" class="muted tiny">선택 0개</span>
+        <button id="deleteSelectedScopesBtn" class="btn btn-danger" disabled>선택 삭제</button>
         <button id="deleteCurrentScopeBtn" class="btn btn-danger">현재 스코프 삭제</button>
       </div>
       <div id="manualEditorPanel" class="card manual-editor-card">${renderManualEditorPanelHtml(null)}</div>
       <div class="card table-card storage-table-card">
-        <div class="storage-table-head"><strong>스코프 스토리지 관리</strong><span>현재/다른 챗 스코프의 저장소를 확인하고 삭제합니다.</span></div>
-        <div class="storage-table-scroll"><table class="data-table"><thead><tr><th></th><th>캐릭터 / 채팅</th><th>토큰</th><th>chunks</th><th>shards</th><th>업데이트</th><th></th></tr></thead><tbody id="storageRows"><tr><td colspan="7" class="muted">${escapeHtml(initialText)}</td></tr></tbody></table></div>
+        <div class="storage-table-head"><strong>스코프 스토리지 관리</strong><span>현재 스코프는 선택 삭제에서 제외되며 위의 전용 버튼으로만 삭제합니다.</span></div>
+        <div class="storage-table-scroll"><table class="data-table"><thead><tr><th><input id="selectAllScopes" class="storage-scope-select" type="checkbox" aria-label="현재 스코프를 제외한 모든 스코프 선택" /></th><th>캐릭터 / 채팅</th><th>토큰</th><th>chunks</th><th>shards</th><th>업데이트</th><th></th></tr></thead><tbody id="storageRows"><tr><td colspan="7" class="muted">${escapeHtml(initialText)}</td></tr></tbody></table></div>
       </div>
     </section>`;
   };
@@ -22422,6 +24103,10 @@ ${cleanedText}`, 80),
   .storage-table-head strong{font-size:11px;color:var(--text);white-space:nowrap}
   .storage-table-head span{font-size:10px;color:var(--text3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
   .storage-table-scroll{flex:1 1 auto;min-height:0;overflow:auto;scrollbar-gutter:stable}
+  .storage-actions #selectedScopeCount{margin-left:auto;align-self:center}
+  .storage-scope-selector{display:flex;align-items:center;gap:6px;min-width:54px}
+  .storage-scope-select{width:14px;height:14px;accent-color:var(--accent);cursor:pointer}
+  .storage-scope-select:disabled{cursor:not-allowed;opacity:.45}
   .data-table{width:100%;border-collapse:collapse;font-size:11px;min-width:680px}
   .data-table th{color:var(--text3);font-weight:600;text-align:left;padding:6px 8px;border-bottom:1px solid var(--border);font-size:10px;text-transform:uppercase;letter-spacing:.05em;background:var(--surface)}
   .data-table td{padding:7px 8px;border-bottom:1px solid var(--border);color:var(--text2);vertical-align:top}
@@ -22553,7 +24238,7 @@ ${cleanedText}`, 80),
       <button class="tab nav-item ${activeTab === 'import' ? 'active' : ''}" data-tab="import" type="button">기억 유지보수</button>
       <button class="tab nav-item ${activeTab === 'activity' ? 'active' : ''}" data-tab="activity" type="button">작업 로그<span id="activityLogCountNav" class="nav-count">${formatNumber(Runtime.activityLog.length)}</span></button>
       <button class="tab nav-item ${activeTab === 'advanced' ? 'active' : ''}" data-tab="advanced" type="button">고급 설정</button>
-      <button class="tab nav-item ${activeTab === 'storage' ? 'active' : ''}" data-tab="storage" type="button">스토리지<span class="nav-count">${formatNumber(current.manifest.shardCount || 0)}</span></button>
+      <button class="tab nav-item ${activeTab === 'storage' ? 'active' : ''}" data-tab="storage" type="button">스토리지<span id="storageShardCountNav" class="nav-count">${formatNumber(current.manifest.shardCount || 0)}</span></button>
       <div class="nav-section">분포</div>
       <div id="miniCounts" class="card mini-counts">${renderCountCards(current.stats)}</div>
       <div class="sidebar-footer">
@@ -22569,7 +24254,7 @@ ${cleanedText}`, 80),
         <div class="status-sep"></div>
         <div class="status-item"><span id="busyStatus">대기 중</span></div>
         <div class="status-sep"></div>
-        <div class="status-item">shard ${formatNumber(current.manifest.shardCount || 0)} / ${formatNumber(current.manifest.shardSize || DEFAULTS.shardSize)}</div>
+        <div class="status-item">shard <span id="statusShardCount">${formatNumber(current.manifest.shardCount || 0)}</span> / <span id="statusShardSize">${formatNumber(current.manifest.shardSize || DEFAULTS.shardSize)}</span></div>
       </div>
       <div id="lastRecallPanel" class="last-recall-panel">${renderLastRecallPanel(Runtime.lastRecall, current.scope.scopeKey)}</div>
       ${buildProviderTab(settings, current.stats).replace('class="panel active"', `class="panel ${activeTab === 'provider' ? 'active' : ''}"`)}
@@ -22819,8 +24504,12 @@ ${cleanedText}`, 80),
       // control to RisuAI and reopen the GUI later.
       btn.disabled = busy && !['closeBtn', 'exportDebugLogBtn'].includes(btn.id);
     }
+    for (const checkbox of guiQueryAll('.storage-scope-select')) {
+      if (busy) checkbox.disabled = true;
+    }
     const status = getGuiNode('busyStatus');
     if (status) status.textContent = busy ? `${Runtime.guiBusyLabel || '작업 중'}...` : '대기 중';
+    if (!busy && guiVisible && guiMounted) syncStorageSelectionUi();
   };
 
   const setBusy = (busy, label = '') => {
@@ -23062,9 +24751,10 @@ ${cleanedText}`, 80),
   };
 
   const updateGuiSummary = async (options = {}) => {
+    const startedAt = Date.now();
     const refreshToken = Number(options.refreshToken || 0) || 0;
     const settings = await loadSettings();
-    const current = await currentScopeStats();
+    const current = await currentScopeStats({ force: options.force === true });
     if (refreshToken && refreshToken !== Runtime.guiRefreshToken) return null;
     if (!isGuiRenderActive()) return null;
     Runtime.guiPerf.summaryRefreshes += 1;
@@ -23072,6 +24762,11 @@ ${cleanedText}`, 80),
     setNodeText('currentScopeText', `${current.scope.characterName} / ${current.scope.chatTitle} / ${current.scope.personaName}`);
     setNodeText('metricTokenTotal', formatNumber(current.stats.tokenTotal));
     setNodeText('metricChunkTotal', formatNumber(current.records.length));
+    const currentShardCount = Math.max(0, Number(current.manifest?.shardCount || 0) || 0);
+    const currentShardSize = Math.max(1, Number(current.manifest?.shardSize || DEFAULTS.shardSize) || DEFAULTS.shardSize);
+    setNodeText('storageShardCountNav', formatNumber(currentShardCount));
+    setNodeText('statusShardCount', formatNumber(currentShardCount));
+    setNodeText('statusShardSize', formatNumber(currentShardSize));
     setNodeText('metricEmbeddingCost', formatCostSummary(currentCost));
     setNodeHtml('metricEmbedding', `${escapeHtml(settings.embeddingProvider)}<br><span class="muted">${escapeHtml(settings.embeddingModel)}</span>`);
     setNodeText('metricMode', settings.mode);
@@ -23079,6 +24774,7 @@ ${cleanedText}`, 80),
     setNodeHtml('embeddingCostPanel', renderEmbeddingCostPanelBody(settings, current.stats));
     setNodeHtml('lastRecallPanel', renderLastRecallPanel(Runtime.lastRecall, current.scope.scopeKey));
     renderLastActionLogs();
+    Runtime.guiPerf.lastSummaryMs = Math.max(0, Date.now() - startedAt);
     return { settings, current };
   };
 
@@ -23086,6 +24782,16 @@ ${cleanedText}`, 80),
     const node = getGuiNode('storageRows');
     if (!node || node.dataset?.vrmDeleteDelegated === '1') return;
     if (node.dataset) node.dataset.vrmDeleteDelegated = '1';
+    node.addEventListener('change', event => {
+      const checkbox = event?.target?.closest?.('input[data-select-scope]');
+      if (!checkbox || !node.contains?.(checkbox) || checkbox.disabled) return;
+      const scopeKey = text(checkbox.getAttribute('data-select-scope') || '').trim();
+      if (!scopeKey || scopeKey === text(Runtime.currentScope?.scopeKey || '')) return;
+      const selected = storageScopeSelection();
+      if (checkbox.checked) selected.add(scopeKey);
+      else selected.delete(scopeKey);
+      syncStorageSelectionUi();
+    });
     node.addEventListener('click', async (event) => {
       const btn = event?.target?.closest?.('button[data-delete-scope]');
       if (!btn || !node.contains?.(btn)) return;
@@ -23093,16 +24799,62 @@ ${cleanedText}`, 80),
       if (!scopeKey) return;
       if (!await guiConfirm(`선택한 챗 스코프의 ${PLUGIN_NAME} 데이터를 삭제할까요?`)) return;
       setBusy(true, '스코프 삭제');
-      try { await deleteScopeStorage(scopeKey); await refreshUi('storage', { storage: true }); }
+      try {
+        const result = await deleteScopeStorage(scopeKey);
+        if (result?.deleted) storageScopeSelection().delete(scopeKey);
+        await refreshUi('storage', { storage: true, forceData: true });
+        syncStorageSelectionUi();
+      }
       catch (error) { await guiError('삭제 실패', error); }
       finally { setBusy(false); }
     });
   };
 
+  const deleteSelectedScopeStorages = async (scopeKeys = [], options = {}) => {
+    const currentScopeKey = text(options.currentScopeKey || Runtime.currentScope?.scopeKey || '').trim();
+    const uniqueKeys = Array.from(new Set((scopeKeys || []).map(scopeKey => text(scopeKey).trim()).filter(Boolean)))
+      .filter(scopeKey => scopeKey !== currentScopeKey);
+    const result = { requested: uniqueKeys.length, deleted: 0, protected: 0, failed: 0, skippedCurrent: Math.max(0, new Set((scopeKeys || []).map(scopeKey => text(scopeKey).trim()).filter(Boolean)).size - uniqueKeys.length), deletedScopeKeys: [], protectedScopeKeys: [], failures: [] };
+    for (let index = 0; index < uniqueKeys.length; index += 1) {
+      const scopeKey = uniqueKeys[index];
+      Runtime.guiBusyLabel = `선택 스코프 삭제 ${index + 1}/${uniqueKeys.length}`;
+      applyBusyState();
+      try {
+        const deletion = await deleteScopeStorage(scopeKey);
+        if (deletion?.deleted) {
+          result.deleted += 1;
+          result.deletedScopeKeys.push(scopeKey);
+          storageScopeSelection().delete(scopeKey);
+        } else if (deletion?.protected) {
+          result.protected += 1;
+          result.protectedScopeKeys.push(scopeKey);
+        } else {
+          result.failed += 1;
+          result.failures.push({ scopeKey, reason: deletion?.reason || 'not_deleted' });
+        }
+      } catch (error) {
+        result.failed += 1;
+        result.failures.push({ scopeKey, reason: formatErrorMessage(error, 300) });
+      }
+      if ((index + 1) % 3 === 0 && index + 1 < uniqueKeys.length) await nextRenderFrame().catch(() => {});
+    }
+    Runtime.lastStorageAction = {
+      at: Date.now(),
+      batchScopeDelete: true,
+      requested: result.requested,
+      deleted: result.deleted,
+      protected: result.protected,
+      failed: result.failed,
+      skippedCurrent: result.skippedCurrent
+    };
+    invalidateGuiDataCache('storage');
+    return result;
+  };
+
   const refreshStoragePanel = async (currentScopeKey = '', options = {}) => {
     const refreshToken = Number(options.refreshToken || 0) || 0;
     const cancelled = () => !guiVisible || (refreshToken && refreshToken !== Runtime.guiRefreshToken);
-    const rows = await listScopeStorageStats({ force: options.force === true, shouldCancel: cancelled }).catch(error => { warn('scope stats failed', error); return []; });
+    const rows = await listScopeStorageStats({ guiFast: true, force: options.force === true, shouldCancel: cancelled }).catch(error => { warn('scope stats failed', error); return []; });
     if (refreshToken && refreshToken !== Runtime.guiRefreshToken) return { rows, cancelled: true };
     const scopeKey = currentScopeKey || (await currentScopeStats()).scope.scopeKey;
     if (refreshToken && refreshToken !== Runtime.guiRefreshToken) return { rows, cancelled: true };
@@ -23113,6 +24865,7 @@ ${cleanedText}`, 80),
     if (!rendered.ok) {
       setNodeHtml('storageRows', renderStorageRows(rows, scopeKey));
       bindStorageDeleteEvents();
+      syncStorageSelectionUi(rows, scopeKey);
     }
     return { rows, cancelled: false };
   };
@@ -23291,7 +25044,11 @@ ${cleanedText}`, 80),
     Runtime.guiTab = 'storage';
     setActiveGuiTab('storage');
     await nextRenderFrame();
-    await refreshManualEditorPanel();
+    const token = Runtime.guiRefreshToken;
+    await Promise.all([
+      updateGuiSummary({ refreshToken: token }).catch(error => warn('manual editor summary refresh failed', error)),
+      refreshManualEditorPanel({ refreshToken: token })
+    ]);
   };
 
   const bindManualEditorEvents = (_root = null) => {
@@ -23475,7 +25232,7 @@ ${cleanedText}`, 80),
       if (Number(node?.value) > 8000) node.value = '8000';
     });
     getGuiNode('clearEmbeddingKeyBtn')?.addEventListener('click', async () => {
-      if (!await guiConfirm('로컬에 저장된 API 키 또는 액세스 토큰을 삭제할까요?')) return;
+      if (!await guiConfirm('저장된 API 키 또는 액세스 토큰을 모든 키 저장소에서 삭제할까요?')) return;
       setBusy(true, '임베딩 키 삭제');
       try {
         const keyPersistence = await saveEmbeddingKeyLocal('');
@@ -23572,7 +25329,7 @@ ${cleanedText}`, 80),
       catch (error) { await guiError('자동 복구 진단 실패', error); }
       finally { setBusy(false); }
       if (!plan) return;
-      if (plan.healthy) {
+      if (plan.healthy || plan.automatic?.blocked) {
         await guiAlert(maintenancePlanText(plan), '기억 유지보수');
         return;
       }
@@ -23607,12 +25364,49 @@ ${cleanedText}`, 80),
       } catch (error) { await guiError('고급 기억 유지보수 실패', error); }
       finally { setBusy(false); }
     });
+    getGuiNode('selectAllScopes')?.addEventListener('change', event => {
+      const rows = Array.isArray(Runtime.guiStorageStatsCache?.rows) ? Runtime.guiStorageStatsCache.rows : [];
+      const currentScopeKey = text(Runtime.guiCurrentStatsCache?.value?.scope?.scopeKey || Runtime.currentScope?.scopeKey || '').trim();
+      const selected = storageScopeSelection();
+      const keys = selectableStorageScopeKeys(rows, currentScopeKey);
+      if (event?.target?.checked) keys.forEach(scopeKey => selected.add(scopeKey));
+      else keys.forEach(scopeKey => selected.delete(scopeKey));
+      syncStorageSelectionUi(rows, currentScopeKey);
+    });
+    getGuiNode('deleteSelectedScopesBtn')?.addEventListener('click', async () => {
+      const currentScopeKey = text(Runtime.guiCurrentStatsCache?.value?.scope?.scopeKey || Runtime.currentScope?.scopeKey || '').trim();
+      const selectedKeys = Array.from(storageScopeSelection()).filter(scopeKey => scopeKey && scopeKey !== currentScopeKey);
+      if (!selectedKeys.length) {
+        syncStorageSelectionUi();
+        return;
+      }
+      if (!await guiConfirm(`현재 스코프를 제외한 선택 스코프 ${formatNumber(selectedKeys.length)}개의 ${PLUGIN_NAME} 데이터를 삭제할까요?\n\n각 스코프의 로컬 기억·샤드·벡터가 삭제되며 되돌릴 수 없습니다.`, '선택 스코프 삭제')) return;
+      setBusy(true, `선택 스코프 삭제 0/${selectedKeys.length}`);
+      try {
+        const result = await deleteSelectedScopeStorages(selectedKeys, { currentScopeKey });
+        setBusy(false);
+        await refreshUi('storage', { storage: true, forceData: true });
+        syncStorageSelectionUi();
+        const details = [
+          `요청 ${formatNumber(result.requested)}개`,
+          `삭제 ${formatNumber(result.deleted)}개`,
+          `보호되어 유지 ${formatNumber(result.protected)}개`,
+          `실패 ${formatNumber(result.failed)}개`
+        ];
+        if (result.failures.length) details.push(`실패 사유: ${result.failures.slice(0, 5).map(item => `${item.scopeKey.slice(0, 24)}…: ${item.reason}`).join(' / ')}`);
+        await guiAlert(details.join('\n'), '선택 스코프 삭제 완료');
+      } catch (error) {
+        await guiError('선택 스코프 삭제 실패', error);
+      } finally {
+        if (Runtime.guiBusyDepth > 0) setBusy(false);
+      }
+    });
     getGuiNode('refreshStorageBtn')?.addEventListener('click', () => runGuiRefresh('storage', { storage: true, forceData: true }));
     getGuiNode('deleteCurrentScopeBtn')?.addEventListener('click', async () => {
       const scope = await resolveCurrentScope(false);
       if (!await guiConfirm(`현재 챗 스코프의 ${PLUGIN_NAME} 데이터를 삭제할까요?`)) return;
       setBusy(true, '현재 스코프 삭제');
-      try { await deleteScopeStorage(scope.scopeKey); await refreshUi('storage', { storage: true }); }
+      try { await deleteScopeStorage(scope.scopeKey); await refreshUi('storage', { storage: true, forceData: true }); syncStorageSelectionUi(); }
       catch (error) { await guiError('삭제 실패', error); }
       finally { setBusy(false); }
     });
@@ -23800,6 +25594,7 @@ ${cleanedText}`, 80),
     const worldline = await debugWorldlineSnapshot(scope);
     const operationLogs = await flushOperationLogs();
     const embeddingKeyPersistence = await inspectEmbeddingKeyPersistence({ includeArgument: true });
+    const handoffLedger = await readFlashbackHandoffLedger().catch(() => emptyFlashbackHandoffLedger());
     return {
       plugin: { name: PLUGIN_NAME, id: PLUGIN_STORAGE_ID, version: PLUGIN_VERSION },
       settings: sanitizeEmbeddingSettingsForDiagnostics(settings),
@@ -23855,9 +25650,28 @@ ${cleanedText}`, 80),
       },
       lastImport: Runtime.lastImport,
       lastClone: Runtime.lastClone,
+      lastHandoff: Runtime.lastHandoff,
+      lastLegacyCompactionRestore: Runtime.lastLegacyCompactionRestore,
+      lastLegacyCompactionFinalize: Runtime.lastLegacyCompactionFinalize,
+      handoff: {
+        contract: MEMORY_SESSION_HANDOFF_CONTRACT,
+        sourceMutationAllowed: false,
+        sourceCompactionAllowed: false,
+        receiptCount: handoffLedger.receipts.length,
+        latestReceipt: handoffLedger.receipts[handoffLedger.receipts.length - 1] || null
+      },
       lastExternalRetirement: Runtime.lastExternalRetirement,
       lastEpisodeIndex: Runtime.lastEpisodeIndex,
       maintenanceJournal: Runtime.maintenanceJournal,
+      maintenanceEmbeddingPreflight: Runtime.lastMaintenanceEmbeddingPreflight ? {
+        at: Number(Runtime.lastMaintenanceEmbeddingPreflight.at || 0) || 0,
+        ok: Runtime.lastMaintenanceEmbeddingPreflight.ok === true,
+        provider: text(Runtime.lastMaintenanceEmbeddingPreflight.provider || ''),
+        model: text(Runtime.lastMaintenanceEmbeddingPreflight.model || ''),
+        dimensions: Number(Runtime.lastMaintenanceEmbeddingPreflight.dimensions || 0) || 0,
+        errorType: text(Runtime.lastMaintenanceEmbeddingPreflight.errorType || ''),
+        elapsedMs: Math.max(0, Number(Runtime.lastMaintenanceEmbeddingPreflight.elapsedMs || 0) || 0)
+      } : null,
       activityLog: activityLogSnapshot(),
       settingsMigration: Runtime.settingsMigration,
       argumentAudit: Runtime.argumentAudit,
@@ -23898,6 +25712,9 @@ ${cleanedText}`, 80),
         cache: {
           currentStats: !!Runtime.guiCurrentStatsCache,
           storageStats: !!Runtime.guiStorageStatsCache,
+          storageMode: Runtime.guiStorageStatsCache?.mode || '',
+          storageHydrationInFlight: Runtime.guiStorageHydrationInFlight.size,
+          summaryRepaintScheduled: Runtime.guiSummaryRepaintScheduled === true,
           manualEditor: !!Runtime.guiManualEditorDataCache
         }
       },
@@ -24003,14 +25820,18 @@ ${cleanedText}`, 80),
     }),
     loadSettings,
     saveSettings,
+    saveEmbeddingCredential,
+    inspectEmbeddingKeyPersistence,
     discoverOllamaModels,
     inspectOllamaModel,
     memory: Object.freeze({
       inspect: inspectMemoryLedger,
-      adoptSessionHandoff
+      adoptSessionHandoff,
+      restoreLegacyCompactedSource: restoreLegacyCompactedSourceScope
     }),
     inspectMemoryLedger,
     adoptSessionHandoff,
+    restoreLegacyCompactedSource: restoreLegacyCompactedSourceScope,
     inspectMemoryMaintenance,
     runMemoryMaintenance,
     ingestLiveChatColdStart,
@@ -24032,6 +25853,7 @@ ${cleanedText}`, 80),
       return await retireExternalRecordsForScope(scope.scopeKey, { reason: 'manual_api' });
     })(),
     deleteScopeStorage,
+    deleteSelectedScopeStorages,
     listScopeStorageStats,
     resolveCurrentScope,
     debugState,
@@ -24041,7 +25863,7 @@ ${cleanedText}`, 80),
     clearOperationLogs,
     getActivityLog: activityLogSnapshot,
     clearActivityLog,
-    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, inspectEmbeddingKeyPersistence, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, archiveAndCompactFlashbackSourceScope, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
+    _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, saveEmbeddingCredential, inspectEmbeddingKeyPersistence, setPluginArgumentValue, embeddingArgumentBackendState, embeddingSyncedBackendState, embeddingLocalBackendState, selectEmbeddingCredential, providerRequiresEmbeddingCredential, maintenanceEmbeddingWorkRequested, requireMaintenanceEmbeddingCredential, embedTexts, inspectLastEmbedFallback: () => Runtime.lastEmbedUsedFallback === true, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, createImmutableFlashbackHandoffArchive, archiveAndCompactFlashbackSourceScope, flashbackSourceIntegritySnapshot, compareFlashbackSourceIntegrity, restoreLegacyCompactedSourceScope, readFlashbackHandoffLedger, writeFlashbackHandoffReceipt, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
   publicApi._test.resolvePendingCaptureJournalMode = resolvePendingCaptureJournalMode;
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
@@ -24140,8 +25962,17 @@ ${cleanedText}`, 80),
       captureAfterRequest: Runtime.settings.captureAfterRequest,
       operationLogEnabled: Runtime.settings.operationLogEnabled
     });
-    await readEmbeddingKey().catch(error => warn('embedding key persistence load failed', error));
+    await readEmbeddingKey({ force: true }).catch(error => warn('embedding key persistence load failed', error));
     await inspectEmbeddingKeyPersistence({ includeArgument: true }).catch(error => warn('embedding key persistence inspection failed', error));
+    // Web hosts may remount pluginStorage shortly after a plugin update. Recheck
+    // twice so a delayed synchronized credential can repair argument/local mirrors
+    // before the next bulk embedding operation.
+    for (const retryDelay of [2200, 8000]) {
+      scheduleTimer(() => {
+        readEmbeddingKey({ force: true })
+          .catch(error => warn('delayed embedding credential reconciliation failed', error));
+      }, retryDelay);
+    }
     if (!Runtime.settings.operationLogEnabled) {
       Runtime.operationLogCache = null;
       await RisuCompat.removeItem(STORAGE.operationLog).catch(() => false);
@@ -24173,20 +26004,36 @@ ${cleanedText}`, 80),
       Promise.resolve().then(async () => {
         const snapshot = await loadRisuSnapshot(false);
         const scope = applyCurrentScope(resolveScopeFromSnapshot(snapshot));
-        const live = liveChatReadState(snapshot.chat || {});
-        if (live.known && live.normalized.length) {
-          const liveState = liveChatStateFromNormalized(live.normalized);
-          const restored = await synchronizeFlashbackTurnWorldline(scope, liveState, Runtime.settings, {
-            allowRetirement: false,
-            forceReconcile: true,
-            reason: 'startup_restore_only'
-          });
-          if (Number(restored?.restoredRecords || 0) > 0) {
-            pushActivityLog('worldline_startup_restored', '기존 retired 보관소에서 현재 대화와 정확히 일치하는 기억을 복구했습니다.', {
-              scopeKey: scope.scopeKey,
-              stored: Number(restored.restoredRecords || 0) || 0,
-              reason: 'startup_exact_restore_only'
-            }, 'success');
+        const legacyRestore = await restoreLegacyCompactedSourceScope(scope, {
+          settings: Runtime.settings,
+          finalize: false
+        }).catch(error => {
+          warn('legacy compacted source automatic recovery failed', error);
+          return null;
+        });
+        if (legacyRestore?.restored) {
+          await finalizeLegacyCompactionRestore(scope, Runtime.settings, legacyRestore, { snapshot });
+        } else {
+          const pendingFinalize = Runtime.legacyRestoreFinalizeInFlight.get(scope.scopeKey);
+          if (pendingFinalize) {
+            await pendingFinalize;
+          } else {
+            const live = liveChatReadState(snapshot.chat || {});
+            if (live.known && live.normalized.length) {
+              const liveState = liveChatStateFromNormalized(live.normalized);
+              const restored = await synchronizeFlashbackTurnWorldline(scope, liveState, Runtime.settings, {
+                allowRetirement: false,
+                forceReconcile: true,
+                reason: 'startup_restore_only'
+              });
+              if (Number(restored?.restoredRecords || 0) > 0) {
+                pushActivityLog('worldline_startup_restored', '기존 retired 보관소에서 현재 대화와 정확히 일치하는 기억을 복구했습니다.', {
+                  scopeKey: scope.scopeKey,
+                  stored: Number(restored.restoredRecords || 0) || 0,
+                  reason: 'startup_exact_restore_only'
+                }, 'success');
+              }
+            }
           }
         }
         await scheduleLegacyGlobalMigration(scope, Runtime.settings);
@@ -24241,6 +26088,10 @@ ${cleanedText}`, 80),
         Runtime.scopeRegistryRetryTasks.clear();
         Runtime.externalRetirementInFlight.clear();
         Runtime.legacyMigrationInFlight = null;
+        Runtime.legacyRestoreFinalizeInFlight.clear();
+        Runtime.progressiveReembedRetryByScope.clear();
+        Runtime.guiStorageHydrationInFlight.clear();
+        Runtime.guiSummaryRepaintScheduled = false;
         Runtime.guiScopeReadyByKey.clear();
         Runtime.guiCurrentStatsCache = null;
         Runtime.guiStorageStatsCache = null;
