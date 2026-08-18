@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.11
+//@display-name ⚡ FLASHBACK Memory v0.11.12
 //@api 3.0
-//@version 0.11.11
+//@version 0.11.12
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,16 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.12
+ *
+ * v0.11.12 shortens the foreground path of the manual embedding connection
+ * test without changing recall, capture, provider request, persistence, or
+ * progressive re-embedding behavior. Unchanged settings are no longer written
+ * again, an already verified durable session credential is reused instead of
+ * being redundantly persisted three times, query/document capability checks
+ * remain intact, test probes are cache-isolated, and the expensive full GUI
+ * summary refresh is deferred through the existing background repaint path.
+ *
  * ⚡ FLASHBACK Memory v0.11.11
  *
  * v0.11.11 completes the automatic-maintenance safety model. Corrupt active
@@ -651,7 +661,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.11';
+  const PLUGIN_VERSION = '0.11.12';
   const EMBEDDING_KEY_ARGUMENT = 'embedding_key';
   const EMBEDDING_CREDENTIAL_SCHEMA = 'flashback_memory.embedding_credential.v3';
   const EMBEDDING_CREDENTIAL_VERSION = 3;
@@ -3981,6 +3991,20 @@
     return normalized;
   };
 
+  // The connection-test button should not turn an unchanged settings snapshot
+  // into a synchronous PluginStorage write. Actual changes still go through the
+  // authoritative saveSettings path, including validation, protected argument
+  // handling, embedding-generation invalidation, and operation-log semantics.
+  const saveSettingsForEmbeddingTest = async (draft = {}) => {
+    const requested = normalizeSettings(draft || {});
+    const currentSource = Runtime.settings || await loadSettings();
+    const current = normalizeSettings(currentSource || DEFAULTS);
+    if (safeStringify(requested, '') === safeStringify(current, '')) {
+      return { settings: current, saved: false, reason: 'unchanged' };
+    }
+    return { settings: await saveSettings(requested), saved: true, reason: 'changed' };
+  };
+
   const storedEmbeddingCredentialMeta = (value) => {
     let parsed = value;
     if (typeof value === 'string' && value.trim()) parsed = tryJsonParse(value, value);
@@ -4460,6 +4484,40 @@
   };
 
   const saveEmbeddingCredential = saveEmbeddingKeyLocal;
+
+  const embeddingCredentialReadyForTest = (status = Runtime.embeddingKeyPersistence, key = '') => {
+    const clean = text(key || '').trim();
+    return !!(clean
+      && text(Runtime.sessionEmbeddingKey || '').trim() === clean
+      && status?.keyPresent
+      && status?.verified
+      && status?.durableAcrossUpdate
+      && status?.conflict !== true);
+  };
+
+  // Keep the three-copy durability contract intact, but avoid rewriting all
+  // three stores on every connection test when the same session key is already
+  // known to be durably verified. New, missing, stale, or conflicting keys still
+  // use the full save-and-readback path before a remote test can begin.
+  const prepareEmbeddingCredentialForTest = async (inputKey = '') => {
+    const typed = text(inputKey || '').trim();
+    const session = text(Runtime.sessionEmbeddingKey || '').trim();
+    const candidate = typed || session;
+    if (!candidate) {
+      return { status: await inspectEmbeddingKeyPersistence(), saved: false, reason: 'no_session_key' };
+    }
+    if (typed && typed !== session) {
+      return { status: await saveEmbeddingKeyLocal(typed), saved: true, reason: 'new_key' };
+    }
+    if (embeddingCredentialReadyForTest(Runtime.embeddingKeyPersistence, candidate)) {
+      return { status: Runtime.embeddingKeyPersistence, saved: false, reason: 'verified_session_reused' };
+    }
+    const inspected = await inspectEmbeddingKeyPersistence();
+    if (embeddingCredentialReadyForTest(inspected, candidate)) {
+      return { status: inspected, saved: false, reason: 'verified_after_inspection' };
+    }
+    return { status: await saveEmbeddingKeyLocal(candidate), saved: true, reason: 'durability_repaired' };
+  };
 
   const embeddingKeyPersistenceStatusText = () => {
     const status = Runtime.embeddingKeyPersistence || {};
@@ -5931,24 +5989,45 @@
         const modelMetadata = provider === 'ollama'
           ? await inspectOllamaModel(cfg, { ...(options || {}), force: true, deadlineAt })
           : null;
-        const queryStartedAt = Date.now();
-        const result = await embedResult(['Embedding connection test.'], { ...(options || {}), purpose: 'query', deadlineAt });
-        const queryElapsedMs = Date.now() - queryStartedAt;
+        // Use a per-run nonce so a repeated manual test cannot be satisfied by
+        // the normal query/document embedding caches. The resulting probe entries
+        // are removed immediately afterwards, keeping production caches untouched.
+        const probeNonce = stableHash(`${Date.now()}\n${Math.random()}\n${provider}\n${cfg.embeddingModel}`);
+        const queryInput = `Embedding connection test. [${probeNonce}]`;
+        const documentInputs = capabilities.batch === false
+          ? [`Flashback document embedding connection test. [${probeNonce}]`]
+          : [`Flashback document embedding connection test A. [${probeNonce}]`, `Flashback document embedding connection test B. [${probeNonce}]`];
+        const removeProbeCacheEntries = (inputs, purpose) => {
+          const cache = purpose === 'query' ? Runtime.queryEmbeddingCache : Runtime.documentEmbeddingCache;
+          const profileFamily = embeddingProfileId(cfg, cfg.embeddingDimensions || 0);
+          for (const input of inputs) {
+            const prepared = prepareEmbeddingInput(input, purpose, cfg);
+            if (!prepared) continue;
+            const cacheKey = stableHash(`${profileFamily}\n${purpose}\n${EMBEDDING_PREPROCESSING_VERSION}\n${stableHash(prepared)}`);
+            cache.delete(cacheKey);
+          }
+        };
+        let result = null;
         let documentTest = null;
-        if (capabilities.queryDocument === true) {
-          const documentStartedAt = Date.now();
-          const documentInputs = capabilities.batch === false
-            ? ['Flashback document embedding connection test.']
-            : ['Flashback document embedding connection test A.', 'Flashback document embedding connection test B.'];
-          const documentResult = await embedResult(documentInputs, { ...(options || {}), purpose: 'document', deadlineAt });
-          documentTest = {
-            ok: true,
-            dimensions: documentResult.dimensions,
-            elapsedMs: Date.now() - documentStartedAt,
-            batchSize: documentInputs.length
-          };
+        try {
+          const queryStartedAt = Date.now();
+          result = await embedResult([queryInput], { ...(options || {}), purpose: 'query', deadlineAt });
+          const queryElapsedMs = Date.now() - queryStartedAt;
+          if (capabilities.queryDocument === true) {
+            const documentStartedAt = Date.now();
+            const documentResult = await embedResult(documentInputs, { ...(options || {}), purpose: 'document', deadlineAt });
+            documentTest = {
+              ok: true,
+              dimensions: documentResult.dimensions,
+              elapsedMs: Date.now() - documentStartedAt,
+              batchSize: documentInputs.length
+            };
+          }
+          return { ok: true, provider: result.provider, model: result.model, dimensions: result.dimensions, elapsedMs: queryElapsedMs, totalElapsedMs: Date.now() - startedAt, errorType: '', documentTest, modelMetadata, cacheIsolated: true };
+        } finally {
+          removeProbeCacheEntries([queryInput], 'query');
+          if (capabilities.queryDocument === true) removeProbeCacheEntries(documentInputs, 'document');
         }
-        return { ok: true, provider: result.provider, model: result.model, dimensions: result.dimensions, elapsedMs: queryElapsedMs, totalElapsedMs: Date.now() - startedAt, errorType: '', documentTest, modelMetadata };
       },
       resolveDimensions: result => Number(result?.dimensions || cfg.embeddingDimensions || 0) || 0,
       normalizeResponse: (data, purpose = 'document') => handler?.parse?.(data, cfg, purpose) || data,
@@ -26537,28 +26616,59 @@ ${cleanedText}`, 80),
     getGuiNode('testEmbedBtn')?.addEventListener('click', async () => {
       setEmbeddingTestStatus('testing', '임베딩 호출 중...');
       setBusy(true, '임베딩 테스트');
+      const testStartedAt = Date.now();
       try {
-        const settings = await saveSettings(readSettingsFromUi());
-        const key = getGuiNode('embeddingKey')?.value || '';
-        const keyPersistence = key.trim()
-          ? await saveEmbeddingKeyLocal(key)
-          : (Runtime.sessionEmbeddingKey
-            ? await saveEmbeddingKeyLocal(Runtime.sessionEmbeddingKey)
-            : await inspectEmbeddingKeyPersistence());
+        const settingsStartedAt = Date.now();
+        const settingsPreparation = await saveSettingsForEmbeddingTest(readSettingsFromUi());
+        const settings = settingsPreparation.settings;
+        const settingsElapsedMs = Date.now() - settingsStartedAt;
+        const keyStartedAt = Date.now();
+        const credentialPreparation = await prepareEmbeddingCredentialForTest(getGuiNode('embeddingKey')?.value || '');
+        const keyPersistence = credentialPreparation.status;
+        const credentialElapsedMs = Date.now() - keyStartedAt;
         const testSettings = normalizeSettings({ ...settings, embeddingMaxRetries: 0 });
         const result = await createEmbeddingProviderAdapter(testSettings).testConnection();
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: true, provider: result.provider, model: result.model, dim: result.dimensions, elapsedMs: result.elapsedMs, documentTest: result.documentTest || null, embeddingKeyPersistence: keyPersistence };
+        const foregroundElapsedMs = Date.now() - testStartedAt;
+        Runtime.lastStorageAction = {
+          at: Date.now(),
+          embeddingTest: true,
+          success: true,
+          provider: result.provider,
+          model: result.model,
+          dim: result.dimensions,
+          elapsedMs: result.elapsedMs,
+          totalElapsedMs: result.totalElapsedMs,
+          foregroundElapsedMs,
+          preparation: {
+            settingsSaved: settingsPreparation.saved,
+            settingsReason: settingsPreparation.reason,
+            settingsElapsedMs,
+            credentialSaved: credentialPreparation.saved,
+            credentialReason: credentialPreparation.reason,
+            credentialElapsedMs
+          },
+          cacheIsolated: result.cacheIsolated === true,
+          documentTest: result.documentTest || null,
+          embeddingKeyPersistence: keyPersistence
+        };
         const documentSuffix = result.documentTest?.ok ? ` · 문서 배치 ${formatNumber(result.documentTest.elapsedMs)}ms` : '';
-        setEmbeddingTestStatus('success', `연결 성공 · ${result.provider} / ${result.model} · ${formatNumber(result.dimensions)}차원 · ${formatNumber(result.elapsedMs)}ms${documentSuffix}`);
+        const totalSuffix = result.documentTest?.ok ? ` · 전체 ${formatNumber(result.totalElapsedMs)}ms` : '';
+        setEmbeddingTestStatus('success', `연결 성공 · ${result.provider} / ${result.model} · ${formatNumber(result.dimensions)}차원 · ${formatNumber(result.elapsedMs)}ms${documentSuffix}${totalSuffix}`);
+        renderLastActionLogs();
+        syncMountedSettingsUi(settings);
         scheduleTimer(() => {
           progressivelyReembedRecords(null, settings).then(progress => {
             pushActivityLog('progressive_reembed', '임베딩 프로필 점진 갱신을 실행했습니다.', progress);
           }).catch(error => warn('progressive re-embedding failed', classifyEmbeddingError(error)));
         }, 250);
-        await refreshUi('provider');
+        // A full summary refresh can involve slow host/storage reads. Keep it for
+        // eventual GUI consistency, but never make the connection-test button wait
+        // for it after the provider checks have already succeeded.
+        scheduleGuiWriteThroughRepaint();
       } catch (error) {
         const message = formatErrorMessage(error);
-        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: false, error: message };
+        Runtime.lastStorageAction = { at: Date.now(), embeddingTest: true, success: false, error: message, foregroundElapsedMs: Date.now() - testStartedAt };
+        renderLastActionLogs();
         setEmbeddingTestStatus('failure', `호출 실패 · ${message}`);
         await guiError('임베딩 테스트 실패', error);
       }
