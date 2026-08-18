@@ -1,7 +1,7 @@
 //@name flashback_memory
-//@display-name ⚡ FLASHBACK Memory v0.11.9
+//@display-name ⚡ FLASHBACK Memory v0.11.11
 //@api 3.0
-//@version 0.11.9
+//@version 0.11.11
 //@allowed-ipc flashback_hayaku_bridge
 //@update-url https://raw.githubusercontent.com/rusinus12-droid/Flashback-Memory/refs/heads/main/Flashback%20Memory.js
 //@arg mode string off|normal; blank uses normal
@@ -78,6 +78,32 @@
 //@arg episode_parent_size string Scene episodes grouped into one higher-level session index; blank uses 6
 
 /*
+ * ⚡ FLASHBACK Memory v0.11.11
+ *
+ * v0.11.11 completes the automatic-maintenance safety model. Corrupt active
+ * manifests and damaged immutable archive chains are now explicit fail-closed
+ * strategies instead of being advertised as automatically rebuildable. Archive
+ * maintenance inspection verifies every immutable layer manifest, active shard
+ * envelope, member catalog, checksum, and local vector sidecar without hydrating
+ * dense vectors into per-record arrays. Safety blocks run before any embedding
+ * credential probe. Full-chat rebuild estimates and execution reuse compatible
+ * existing vectors, report total/reused/new counts separately, and require remote
+ * credentials only when an actual new embedding is predicted. Confirmed plans are
+ * re-inspected immediately before mutation, and re-embedding/cleanup never rewrites
+ * immutable archive-reference records.
+ *
+ * ⚡ FLASHBACK Memory v0.11.10
+ *
+ * v0.11.10 repairs the automatic-maintenance deadlock around missing active storage shards.
+ * Authoritative full-chat rebuild may now use an incomplete old commit only as salvage
+ * input while rebuilding every current-session U+A record from the live chat. Readable
+ * permanent predecessor history and immutable archive references are preserved; rebuild
+ * remains fail-closed if a missing shard may contain unrecoverable permanent history.
+ * The old storage lineage is fingerprinted while embeddings are prepared, replacement
+ * commit shards are read back before the manifest can switch, and the worldline is not
+ * reset until the replacement commit is durable. Ordinary cleanup/re-embedding paths
+ * still reject incomplete storage and cannot silently canonize a partial shard set.
+ *
  * ⚡ FLASHBACK Memory v0.11.9
  *
  * v0.11.9 makes the native FLASHBACK GUI archive-aware after immutable RE:TRACE session handoff: current-scope totals, type/token statistics, storage rows, and status badges include the verified shared archive while local shard counts remain physically accurate. The archive remains read-only and is never copied back into the target scope.
@@ -625,7 +651,7 @@
   const PLUGIN_STORAGE_ID = 'vector_rag_memory';
   const PLUGIN_SLUG = 'flashback_memory';
   const PLUGIN_NAME = '⚡ FLASHBACK Memory';
-  const PLUGIN_VERSION = '0.11.9';
+  const PLUGIN_VERSION = '0.11.11';
   const EMBEDDING_KEY_ARGUMENT = 'embedding_key';
   const EMBEDDING_CREDENTIAL_SCHEMA = 'flashback_memory.embedding_credential.v3';
   const EMBEDDING_CREDENTIAL_VERSION = 3;
@@ -6594,6 +6620,80 @@
     };
   };
 
+  const flashbackArchivePointerIdentity = value => {
+    const pointer = flashbackArchiveRefPointer(value);
+    if (!pointer) return null;
+    return {
+      archiveId: pointer.archiveId,
+      archiveScopeKey: pointer.archiveScopeKey,
+      generation: pointer.generation,
+      depth: pointer.depth,
+      deltaCount: pointer.deltaCount,
+      recordCount: pointer.recordCount,
+      digest: pointer.digest
+    };
+  };
+
+  const sameFlashbackArchivePointer = (leftValue, rightValue) => {
+    const left = flashbackArchivePointerIdentity(leftValue);
+    const right = flashbackArchivePointerIdentity(rightValue);
+    if (!left || !right) return !left && !right;
+    return safeStringify(left) === safeStringify(right);
+  };
+
+  const verifiedFlashbackArchiveParent = (cursorValue = {}, manifest = {}) => {
+    const cursor = normalizeFlashbackArchiveRef(cursorValue);
+    if (!cursor) return { verified: false, reason: 'archive_ref_invalid', parentRef: null };
+    const cursorParent = flashbackArchiveRefPointer(cursor.parentRef);
+    const manifestParentRawPresent = !!(manifest && typeof manifest === 'object' && !Array.isArray(manifest)
+      && Object.prototype.hasOwnProperty.call(manifest, 'parentArchiveRef')
+      && manifest.parentArchiveRef != null);
+    const manifestParent = flashbackArchiveRefPointer(manifest?.parentArchiveRef);
+
+    // The head/reference pointer is authoritative when it carries a parent.  The
+    // immutable layer manifest must repeat the exact same pointer; otherwise a
+    // missing or substituted parent could silently shorten or redirect the chain.
+    if (cursorParent && !manifestParent) {
+      return { verified: false, reason: manifestParentRawPresent ? 'archive_parent_ref_invalid' : 'archive_parent_ref_missing', parentRef: null };
+    }
+    if (cursorParent && manifestParent && !sameFlashbackArchivePointer(cursorParent, manifestParent)) {
+      return { verified: false, reason: 'archive_parent_ref_mismatch', parentRef: null };
+    }
+    if (!cursorParent && manifestParentRawPresent && !manifestParent) {
+      return { verified: false, reason: 'archive_parent_ref_invalid', parentRef: null };
+    }
+
+    const parentRef = cursorParent || manifestParent;
+    const currentDepth = Math.max(1, Number(cursor.depth || 1) || 1);
+    const currentGeneration = Math.max(1, Number(cursor.generation || 1) || 1);
+    const currentDeltaCount = Math.max(0, Number(cursor.deltaCount || 0) || 0);
+    const currentRecordCount = Math.max(0, Number(cursor.recordCount || 0) || 0);
+
+    if (!parentRef) {
+      if (currentDepth !== 1 || currentGeneration !== 1 || currentRecordCount !== currentDeltaCount) {
+        return { verified: false, reason: 'archive_parent_ref_required', parentRef: null };
+      }
+      return { verified: true, reason: 'archive_root_verified', parentRef: null };
+    }
+
+    const parentDepth = Math.max(1, Number(parentRef.depth || 1) || 1);
+    const parentGeneration = Math.max(1, Number(parentRef.generation || 1) || 1);
+    const parentRecordCount = Math.max(0, Number(parentRef.recordCount || 0) || 0);
+    if (parentDepth + 1 !== currentDepth) {
+      return { verified: false, reason: 'archive_parent_depth_mismatch', parentRef: null };
+    }
+    if (parentGeneration + 1 !== currentGeneration) {
+      return { verified: false, reason: 'archive_parent_generation_mismatch', parentRef: null };
+    }
+    if (parentRecordCount + currentDeltaCount !== currentRecordCount) {
+      return { verified: false, reason: 'archive_parent_record_count_mismatch', parentRef: null };
+    }
+    if (parentRecordCount > 0 && !text(parentRef.digest || '').trim()) {
+      return { verified: false, reason: 'archive_parent_digest_missing', parentRef: null };
+    }
+    return { verified: true, reason: 'archive_parent_verified', parentRef };
+  };
+
   const flashbackArchiveRecordIdentity = (record = {}) => text(record.permanentHistoryId || '').trim() || stableHash(safeStringify([
     text(record.sourceHash || ''),
     text(record.sourceId || ''),
@@ -6862,6 +6962,11 @@
     if (scope.scopeKey && parsed.scopeKey && text(parsed.scopeKey) !== text(scope.scopeKey)) {
       return { ...base, manifestCorrupt: true, manifestRawPresent: true, foreignScopeKey: text(parsed.scopeKey) };
     }
+    const archiveRefRawPresent = parsed.archiveRef !== null
+      && parsed.archiveRef !== undefined
+      && parsed.archiveRef !== ''
+      && parsed.archiveRef !== false;
+    const normalizedArchiveRef = normalizeFlashbackArchiveRef(parsed.archiveRef);
     return {
       ...base,
       ...parsed,
@@ -6882,7 +6987,9 @@
       shardCount: clampInt(parsed.shardCount ?? parsed.shards, 0, 100000, 0),
       shardSize: clampInt(parsed.shardSize, 1, 2000, DEFAULTS.shardSize),
       shardIndexVersion: clampInt(parsed.shardIndexVersion, 0, 10, 0),
-      archiveRef: normalizeFlashbackArchiveRef(parsed.archiveRef),
+      archiveRef: normalizedArchiveRef,
+      archiveRefRawPresent,
+      archiveRefInvalid: archiveRefRawPresent && !normalizedArchiveRef,
       archiveOwner: parsed.archiveOwner === true,
       archiveId: text(parsed.archiveId || ''),
       archiveGeneration: Math.max(0, Number(parsed.archiveGeneration || 0) || 0),
@@ -6958,7 +7065,13 @@
     // These v0.6 fields described removed external-source ingestion state. Do
     // not preserve them when an old manifest is rewritten during retirement.
     for (const legacyKey of ['staticSourceDigest', 'staticSourceCount', 'staticIngestedAt']) delete next[legacyKey];
-    for (const transientKey of ['manifestCorrupt', 'manifestRawPresent', 'foreignScopeKey', 'expectedCount', 'missingShards', 'corruptShards', 'recordCountMismatch']) delete next[transientKey];
+    if (existing.archiveRefInvalid === true && !normalizeFlashbackArchiveRef(next.archiveRef)) {
+      const error = new Error('scope manifest save aborted: the existing immutable archive reference is malformed. Explicit archive-reference recovery is required before any manifest rewrite.');
+      error.code = 'FLASHBACK_ARCHIVE_REF_INVALID';
+      error.scopeKey = text(next.scopeKey || '');
+      throw error;
+    }
+    for (const transientKey of ['manifestCorrupt', 'manifestRawPresent', 'foreignScopeKey', 'expectedCount', 'missingShards', 'corruptShards', 'missingShardIndexes', 'corruptShardIndexes', 'recordCountMismatch', 'archiveRefRawPresent', 'archiveRefInvalid']) delete next[transientKey];
     await requireStorageWrite(scopeKeys.manifest(next.scopeKey), safeStringify(next), 'scope manifest save');
     const registryScope = { ...scope, ...next };
     const displayStats = normalizeStatsForDisplay(next.stats && typeof next.stats === 'object' ? next.stats : statsForRecords([]));
@@ -7930,6 +8043,161 @@
     return Runtime.localVectorShardCache.get(cacheKey) || null;
   };
 
+  const flashbackBase64DecodedByteLength = value => {
+    const body = String(value || '').trim();
+    if (!body || body.length % 4 === 1) return -1;
+    const padding = body.endsWith('==') ? 2 : (body.endsWith('=') ? 1 : 0);
+    return Math.max(0, Math.floor(body.length * 3 / 4) - padding);
+  };
+
+  // Maintenance/archive integrity checks must verify local vector sidecars without
+  // inflating every Float32 payload into one JavaScript Array per record. Validate
+  // the durable JSON metadata, digest, byte envelope, and every record reference.
+  const inspectFlashbackVectorPayloadMetadata = async (records = [], context = {}, metrics = null) => {
+    const list = Array.isArray(records) ? records : [];
+    const groups = new Map();
+    const reasons = [];
+    let missingPayloads = 0;
+    let invalidPayloads = 0;
+    let inlineVectors = 0;
+    let invalidInlineVectors = 0;
+
+    for (const record of list) {
+      const vector = Array.isArray(record?.vector) ? record.vector : [];
+      const ref = normalizeFlashbackVectorRef(record?.vectorRef);
+      if (vector.length) {
+        inlineVectors += 1;
+        const declaredDim = Math.max(0, Number(record?.dim || record?.embeddingDimensions || vector.length) || 0);
+        const vectorValid = declaredDim === vector.length
+          && vector.every(value => typeof value === 'number' && Number.isFinite(value))
+          && vector.some(value => value !== 0);
+        if (!vectorValid) {
+          invalidInlineVectors += 1;
+          invalidPayloads += 1;
+          reasons.push({ reason: 'inline_vector_invalid', recordId: text(record?.id || record?.hash || ''), declaredDim, actualDim: vector.length });
+        }
+        continue;
+      }
+      if (!ref) {
+        missingPayloads += 1;
+        reasons.push({ reason: 'vector_payload_absent', recordId: text(record?.id || record?.hash || '') });
+        continue;
+      }
+      if (!groups.has(ref.storageKey)) groups.set(ref.storageKey, []);
+      groups.get(ref.storageKey).push({ record, ref });
+    }
+
+    for (const [storageKey, entries] of groups) {
+      let raw = null;
+      try { raw = await RisuCompat.localGetItem(storageKey); }
+      catch (error) {
+        missingPayloads += entries.length;
+        reasons.push({ reason: 'vector_sidecar_read_failed', storageKey, records: entries.length, error: formatErrorMessage(error, 300) });
+        continue;
+      }
+      const parsed = typeof raw === 'string' ? tryJsonParse(raw, null) : raw;
+      const data = text(parsed?.data || '');
+      const items = Array.isArray(parsed?.items) ? parsed.items : [];
+      const expectedDigest = parsed && typeof parsed === 'object'
+        ? stableHash(safeStringify({
+          scopeKey: parsed.scopeKey,
+          commitId: parsed.commitId,
+          shardIndex: parsed.shardIndex,
+          items: parsed.items,
+          data: parsed.data
+        }))
+        : '';
+      const byteLength = flashbackBase64DecodedByteLength(data);
+      const floatCount = byteLength >= 0 && byteLength % 4 === 0 ? byteLength / 4 : -1;
+      const normalizedItems = items.map(item => ({
+        recordId: text(item?.recordId || ''),
+        offset: Number(item?.offset),
+        length: Number(item?.length)
+      }));
+      const sortedItems = normalizedItems.slice().sort((a, b) => a.offset - b.offset || a.recordId.localeCompare(b.recordId));
+      const itemIds = new Set();
+      let expectedOffset = 0;
+      let itemLayoutValid = sortedItems.length > 0;
+      for (const item of sortedItems) {
+        const valid = !!item.recordId
+          && Number.isInteger(item.offset)
+          && Number.isInteger(item.length)
+          && item.offset >= 0
+          && item.length > 0
+          && item.offset === expectedOffset
+          && item.offset + item.length <= floatCount
+          && !itemIds.has(item.recordId);
+        if (!valid) itemLayoutValid = false;
+        itemIds.add(item.recordId);
+        expectedOffset = item.offset + item.length;
+      }
+      if (expectedOffset !== floatCount) itemLayoutValid = false;
+      const entryIds = new Set(entries.map(entry => text(entry?.ref?.recordId || entry?.record?.id || entry?.record?.hash || '')).filter(Boolean));
+      const itemMembershipValid = itemIds.size === entryIds.size
+        && Array.from(itemIds).every(recordId => entryIds.has(recordId));
+      const envelopeValid = !!parsed
+        && parsed.schema === FLASHBACK_VECTOR_SHARD_SCHEMA
+        && !!data
+        && text(parsed.scopeKey || '') === text(context.scopeKey || parsed.scopeKey || '')
+        && (!text(context.commitId || '') || text(parsed.commitId || '') === text(context.commitId || ''))
+        && (context.shardIndex == null || Number(parsed.shardIndex) === Number(context.shardIndex))
+        && text(parsed.digest || '') === expectedDigest
+        && Number(parsed.itemCount || 0) === items.length
+        && byteLength >= 0
+        && byteLength % 4 === 0
+        && Number(parsed.byteLength || byteLength) === byteLength
+        && Number(parsed.floatCount || floatCount) === floatCount
+        && itemLayoutValid
+        && itemMembershipValid;
+
+      if (!envelopeValid) {
+        invalidPayloads += 1;
+        missingPayloads += entries.length;
+        reasons.push({
+          reason: 'vector_sidecar_invalid',
+          storageKey,
+          records: entries.length,
+          itemLayoutValid,
+          itemMembershipValid,
+          expectedFloatCount: floatCount,
+          itemCount: items.length
+        });
+        continue;
+      }
+
+      const itemById = new Map(normalizedItems.map(item => [item.recordId, item]));
+      for (const entry of entries) {
+        const ref = entry.ref;
+        const recordId = text(ref.recordId || entry.record?.id || entry.record?.hash || '');
+        const item = itemById.get(recordId);
+        const refValid = !!item
+          && text(ref.digest || '') === text(parsed.digest || '')
+          && item.offset === Number(ref.offset)
+          && item.length === Number(ref.length)
+          && Number(ref.length) > 0
+          && Number(ref.offset) >= 0
+          && Number(ref.offset) + Number(ref.length) <= floatCount
+          && Math.max(0, Number(entry.record?.dim || entry.record?.embeddingDimensions || ref.length) || 0) === Number(ref.length);
+        if (!refValid) {
+          missingPayloads += 1;
+          reasons.push({ reason: 'vector_reference_invalid', storageKey, recordId });
+        }
+      }
+    }
+
+    bumpStorageMetric(metrics, 'localVectorReads', groups.size);
+    bumpStorageMetric(metrics, 'localVectorMissing', missingPayloads + invalidInlineVectors);
+    return {
+      verified: missingPayloads === 0 && invalidPayloads === 0,
+      payloadsChecked: groups.size,
+      inlineVectors,
+      invalidInlineVectors,
+      missingPayloads,
+      invalidPayloads,
+      reasons: reasons.slice(0, 40)
+    };
+  };
+
   const hydrateFlashbackVectorRecords = async (records = [], metrics = null) => {
     const list = Array.isArray(records) ? records : [];
     const refs = list.map(record => normalizeFlashbackVectorRef(record?.vectorRef)).filter(Boolean);
@@ -8112,6 +8380,18 @@
       && recordsPayload.every(record => record && typeof record === 'object' && !Array.isArray(record));
     if (!recordsPayload || !recordObjectsValid || !commitMatches || !scopeMatches || !shardMatches || !checksumMatches || !recordCountMatches) {
       return { missing: true, corrupt: true, records: [] };
+    }
+    if (options.verifyVectorPayloadMetadataOnly === true) {
+      const vectorAudit = await inspectFlashbackVectorPayloadMetadata(recordsPayload, { scopeKey, commitId, shardIndex }, metrics);
+      return {
+        missing: false,
+        corrupt: false,
+        records: recordsPayload,
+        cacheHit: false,
+        vectorPayloadMissing: Number(vectorAudit.missingPayloads || 0),
+        vectorPayloadInvalid: Number(vectorAudit.invalidPayloads || 0),
+        vectorPayloadAudit: vectorAudit
+      };
     }
     const hydrated = await hydrateFlashbackVectorRecords(recordsPayload, metrics);
     const hydratedRecords = hydrated.records;
@@ -8388,19 +8668,37 @@
     const records = [];
     let missingShards = 0;
     let corruptShards = 0;
+    const missingShardIndexes = [];
+    const corruptShardIndexes = [];
     if (manifest.shardCount > 0) {
       for (let i = 0; i < manifest.shardCount; i += 1) {
         const shard = await readScopeShardRecords(manifest.scopeKey, i, manifest);
         if (shard.missing) {
           missingShards += 1;
-          if (shard.corrupt) corruptShards += 1;
+          missingShardIndexes.push(i);
+          if (shard.corrupt) {
+            corruptShards += 1;
+            corruptShardIndexes.push(i);
+          }
           continue;
         }
         for (const record of shard.records) records.push(record);
       }
     }
     const recordCountMismatch = manifest.manifestCorrupt !== true && missingShards === 0 && records.length !== expectedCount;
-    return { manifest: { ...manifest, expectedCount, count: records.length, missingShards, corruptShards, recordCountMismatch }, records };
+    return {
+      manifest: {
+        ...manifest,
+        expectedCount,
+        count: records.length,
+        missingShards,
+        corruptShards,
+        missingShardIndexes,
+        corruptShardIndexes,
+        recordCountMismatch
+      },
+      records
+    };
   };
 
   const loadScopeRecords = async (scopeOrKey) => {
@@ -8458,6 +8756,12 @@
       error.scopeKey = text(loaded?.manifest?.scopeKey || '');
       throw error;
     }
+    if (loaded?.manifest?.archiveRefInvalid === true) {
+      const error = new Error(`${operation} aborted: the immutable archive reference is malformed. Explicit archive-reference recovery is required before any storage mutation.`);
+      error.code = 'FLASHBACK_ARCHIVE_REF_INVALID';
+      error.scopeKey = text(loaded?.manifest?.scopeKey || '');
+      throw error;
+    }
     if (loaded?.manifest?.recordCountMismatch === true) {
       const error = new Error(`${operation} aborted: the active manifest record count does not match stored shard contents. Run automatic maintenance with the authoritative live chat available.`);
       error.code = 'FLASHBACK_STORAGE_RECORD_COUNT_MISMATCH';
@@ -8477,7 +8781,153 @@
     throw error;
   };
 
-  const saveScopeRecords = async (scopeOrKey, records, settings = null, scopeMeta = {}) => {
+  const fullRebuildStorageState = (loaded = {}) => {
+    const manifest = loaded?.manifest && typeof loaded.manifest === 'object' ? loaded.manifest : {};
+    const records = Array.isArray(loaded?.records) ? loaded.records.filter(isRetainedMemoryRecord) : [];
+    const permanentRecords = records.filter(isPermanentSessionHistoryRecord);
+    const archiveRef = normalizeFlashbackArchiveRef(manifest.archiveRef);
+    const missingShardIndexes = Array.from(new Set((Array.isArray(manifest.missingShardIndexes) ? manifest.missingShardIndexes : [])
+      .map(value => Number(value)).filter(value => Number.isInteger(value) && value >= 0))).sort((a, b) => a - b);
+    const corruptShardIndexes = Array.from(new Set((Array.isArray(manifest.corruptShardIndexes) ? manifest.corruptShardIndexes : [])
+      .map(value => Number(value)).filter(value => Number.isInteger(value) && value >= 0))).sort((a, b) => a - b);
+    const expectedPermanentHistory = Math.max(0, Number(manifest.permanentSessionHistoryCount || 0) || 0);
+    const identity = {
+      scopeKey: text(manifest.scopeKey || ''),
+      manifestRawPresent: manifest.manifestRawPresent === true,
+      manifestCorrupt: manifest.manifestCorrupt === true,
+      commitId: text(manifest.commitId || ''),
+      expectedCount: Math.max(0, Number(manifest.expectedCount ?? manifest.count ?? 0) || 0),
+      loadedCount: records.length,
+      shardCount: Math.max(0, Number(manifest.shardCount || 0) || 0),
+      shardSize: Math.max(0, Number(manifest.shardSize || 0) || 0),
+      missingShardIndexes,
+      corruptShardIndexes,
+      recordCountMismatch: manifest.recordCountMismatch === true,
+      permanentSessionHistoryCount: expectedPermanentHistory,
+      readablePermanentHistoryCount: permanentRecords.length,
+      archiveRefRawPresent: manifest.archiveRefRawPresent === true,
+      archiveRefInvalid: manifest.archiveRefInvalid === true,
+      archiveRef: archiveRef ? {
+        archiveId: text(archiveRef.archiveId || ''),
+        archiveScopeKey: text(archiveRef.archiveScopeKey || ''),
+        recordCount: Math.max(0, Number(archiveRef.recordCount || 0) || 0),
+        digest: text(archiveRef.digest || ''),
+        generation: Math.max(0, Number(archiveRef.generation || 0) || 0)
+      } : null,
+      shardSummaries: (Array.isArray(manifest.shardSummaries) ? manifest.shardSummaries : []).map((summary, index) => ({
+        shardIndex: Number(summary?.shardIndex ?? index),
+        recordCount: Math.max(0, Number(summary?.recordCount || 0) || 0),
+        checksum: text(summary?.checksum || ''),
+        firstTurn: Math.max(0, Number(summary?.firstTurn || 0) || 0),
+        lastTurn: Math.max(0, Number(summary?.lastTurn || 0) || 0)
+      }))
+    };
+    return {
+      ...identity,
+      records,
+      permanentRecords,
+      archiveRef,
+      missingShards: Math.max(0, Number(manifest.missingShards || missingShardIndexes.length || 0) || 0),
+      corruptShards: Math.max(0, Number(manifest.corruptShards || corruptShardIndexes.length || 0) || 0),
+      incomplete: manifest.recordCountMismatch === true || Math.max(0, Number(manifest.missingShards || 0) || 0) > 0,
+      fingerprint: stableHash(safeStringify(identity))
+    };
+  };
+
+  const assessAuthoritativeFullRebuildSource = (loaded = {}, sources = [], operation = 'full chat rebuild') => {
+    assertNoForeignScopeCollision(loaded?.manifest, operation);
+    if (!Array.isArray(sources) || !sources.length) {
+      const error = new Error(`${operation} aborted: the authoritative live chat has no completed U+A sources.`);
+      error.code = 'FLASHBACK_REBUILD_LIVE_SOURCE_MISSING';
+      error.scopeKey = text(loaded?.manifest?.scopeKey || '');
+      throw error;
+    }
+    if (loaded?.manifest?.manifestCorrupt === true || loaded?.manifest?.archiveRefInvalid === true) {
+      // A corrupt manifest or malformed archive pointer may hide immutable history.
+      // Do not overwrite it automatically.
+      return assertCompleteScopeLoad(loaded, operation);
+    }
+    const state = fullRebuildStorageState(loaded);
+    if (!state.incomplete) {
+      assertCompleteScopeLoad(loaded, operation);
+      return { ...state, salvageMode: false, recoverable: true, unrecoverablePermanentHistory: 0 };
+    }
+    const unrecoverablePermanentHistory = Math.max(0, state.permanentSessionHistoryCount - state.readablePermanentHistoryCount);
+    if (unrecoverablePermanentHistory > 0) {
+      const error = new Error(`${operation} aborted: ${unrecoverablePermanentHistory} permanent predecessor-history record(s) may be inside missing storage shards. Current-session live chat cannot reconstruct them automatically.`);
+      error.code = 'FLASHBACK_REBUILD_PROTECTED_HISTORY_MISSING';
+      error.scopeKey = state.scopeKey;
+      error.expectedPermanentHistory = state.permanentSessionHistoryCount;
+      error.readablePermanentHistory = state.readablePermanentHistoryCount;
+      error.missingShards = state.missingShards;
+      error.missingShardIndexes = state.missingShardIndexes.slice();
+      throw error;
+    }
+    return {
+      ...state,
+      salvageMode: true,
+      recoverable: true,
+      unrecoverablePermanentHistory: 0
+    };
+  };
+
+  const mergeAuthoritativeRebuildRecords = (permanentRecords = [], rebuiltRecords = []) => {
+    const merged = new Map();
+    for (const record of [...(Array.isArray(permanentRecords) ? permanentRecords : []), ...(Array.isArray(rebuiltRecords) ? rebuiltRecords : [])]) {
+      if (!record || typeof record !== 'object') continue;
+      const identity = flashbackArchiveRecordIdentity(record);
+      if (!identity) continue;
+      const existing = merged.get(identity);
+      if (!existing) merged.set(identity, record);
+      else if (!isPermanentSessionHistoryRecord(existing) && isPermanentSessionHistoryRecord(record)) merged.set(identity, record);
+      else if (!isPermanentSessionHistoryRecord(existing) && !isPermanentSessionHistoryRecord(record)) merged.set(identity, record);
+    }
+    return Array.from(merged.values());
+  };
+
+  const verifyScopeCommitReadbackBeforeManifestSwap = async (scope = {}, manifest = {}, expectedCount = 0) => {
+    const shardCount = Math.max(0, Number(manifest.shardCount || 0) || 0);
+    const shards = await mapOrderedWithConcurrency(
+      Array.from({ length: shardCount }, (_, index) => index),
+      RECALL_SHARD_READ_CONCURRENCY,
+      index => readScopeShardRecords(scope.scopeKey, index, manifest, { useCache: false })
+    );
+    const missingShardIndexes = [];
+    const corruptShardIndexes = [];
+    let loadedCount = 0;
+    let vectorPayloadMissing = 0;
+    shards.forEach((shard, index) => {
+      if (shard?.missing) {
+        missingShardIndexes.push(index);
+        if (shard?.corrupt) corruptShardIndexes.push(index);
+        return;
+      }
+      loadedCount += Array.isArray(shard?.records) ? shard.records.length : 0;
+      vectorPayloadMissing += Math.max(0, Number(shard?.vectorPayloadMissing || 0) || 0);
+    });
+    if (missingShardIndexes.length || loadedCount !== Math.max(0, Number(expectedCount || 0) || 0) || vectorPayloadMissing > 0) {
+      const error = new Error(`replacement commit readback failed before manifest swap: missing shards ${missingShardIndexes.join(',') || 'none'}, loaded ${loadedCount}/${Math.max(0, Number(expectedCount || 0) || 0)}, missing vector payloads ${vectorPayloadMissing}`);
+      error.code = 'FLASHBACK_REBUILD_COMMIT_READBACK_FAILED';
+      error.scopeKey = text(scope.scopeKey || manifest.scopeKey || '');
+      error.commitId = text(manifest.commitId || '');
+      error.missingShardIndexes = missingShardIndexes;
+      error.corruptShardIndexes = corruptShardIndexes;
+      error.loadedCount = loadedCount;
+      error.expectedCount = Math.max(0, Number(expectedCount || 0) || 0);
+      error.vectorPayloadMissing = vectorPayloadMissing;
+      throw error;
+    }
+    return {
+      verified: true,
+      scopeKey: text(scope.scopeKey || manifest.scopeKey || ''),
+      commitId: text(manifest.commitId || ''),
+      shardCount,
+      loadedCount,
+      vectorPayloadMissing: 0
+    };
+  };
+
+  const saveScopeRecords = async (scopeOrKey, records, settings = null, scopeMeta = {}, saveOptions = {}) => {
     const saveStartedAt = Date.now();
     const cfg = settings || await loadSettings();
     const scope = typeof scopeOrKey === 'string' ? { ...scopeMeta, scopeKey: scopeOrKey } : { ...(scopeOrKey || {}), ...scopeMeta };
@@ -8644,6 +9094,16 @@
       archiveCompactedAt: text(oldManifest.archiveCompactedAt || ''),
       archiveCompactedRecords: Math.max(0, Number(oldManifest.archiveCompactedRecords || 0) || 0)
     };
+    let commitReadback = null;
+    if (saveOptions?.verifyCommitReadbackBeforeManifestSwap === true) {
+      try {
+        commitReadback = await verifyScopeCommitReadbackBeforeManifestSwap(scope, manifest, clean.length);
+      } catch (error) {
+        await removeCommitShardSet(scope.scopeKey, commitId, shardCount)
+          .catch(cleanupError => warn('failed replacement commit cleanup failed', cleanupError));
+        throw error;
+      }
+    }
     let savedManifest;
     try {
       savedManifest = await saveScopeManifest(manifest, scope);
@@ -8662,6 +9122,29 @@
       }
       throw error;
     }
+    let manifestReadbackVerified = false;
+    if (saveOptions?.verifyCommitReadbackBeforeManifestSwap === true) {
+      const persistedManifest = await loadScopeManifest(scope);
+      const manifestMatches = persistedManifest.manifestRawPresent === true
+        && persistedManifest.manifestCorrupt !== true
+        && text(persistedManifest.commitId || '') === commitId
+        && Number(persistedManifest.count || 0) === clean.length
+        && Number(persistedManifest.shardCount || 0) === shardCount;
+      if (!manifestMatches) {
+        const error = new Error('replacement manifest durable readback failed; old and new commit shards were retained for safe retry');
+        error.code = 'FLASHBACK_REBUILD_MANIFEST_READBACK_FAILED';
+        error.scopeKey = scope.scopeKey;
+        error.expectedCommitId = commitId;
+        error.actualCommitId = text(persistedManifest.commitId || '');
+        error.expectedCount = clean.length;
+        error.actualCount = Math.max(0, Number(persistedManifest.count || 0) || 0);
+        error.expectedShardCount = shardCount;
+        error.actualShardCount = Math.max(0, Number(persistedManifest.shardCount || 0) || 0);
+        throw error;
+      }
+      savedManifest = persistedManifest;
+      manifestReadbackVerified = true;
+    }
     await cleanupExtraScopeShards(scope.scopeKey, shardCount, oldManifest);
     await cleanupListedScopeShardOrphans(scope.scopeKey, commitId).catch(error => warn('listed shard cleanup failed', error));
     return {
@@ -8675,7 +9158,15 @@
         vectorSidecars: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarCount || 0), 0),
         vectorSidecarBytes: shardWriteResults.reduce((sum, result) => sum + Number(result?.vectorTier?.sidecarBytes || 0), 0),
         vectorInlineFallbacks: shardWriteResults.filter(result => result?.vectorTier && !result.vectorTier.ok && result.vectorTier.reason !== 'no_vectors').length,
-        concurrency: Math.min(STORAGE_SHARD_WRITE_CONCURRENCY, Math.max(1, shardCount))
+        concurrency: Math.min(STORAGE_SHARD_WRITE_CONCURRENCY, Math.max(1, shardCount)),
+        commitReadbackVerified: commitReadback?.verified === true,
+        manifestReadbackVerified,
+        commitReadback: commitReadback ? {
+          commitId: commitReadback.commitId,
+          shardCount: commitReadback.shardCount,
+          loadedCount: commitReadback.loadedCount,
+          vectorPayloadMissing: commitReadback.vectorPayloadMissing
+        } : null
       }
     };
   };
@@ -10074,11 +10565,19 @@
       const records = loaded.records.filter(isRetainedMemoryRecord);
       missingShards += Math.max(0, Number(loaded.manifest?.missingShards || 0) || 0);
       corruptShards += Math.max(0, Number(loaded.manifest?.corruptShards || 0) || 0);
-      if (loaded.manifest.archiveOwner !== true || text(loaded.manifest.archiveId || '') !== cursor.archiveId) {
+      if (loaded.manifest.archiveOwner !== true
+        || text(loaded.manifest.archiveId || '') !== cursor.archiveId
+        || Number(loaded.manifest.archiveGeneration || cursor.generation || 0) !== Number(cursor.generation || 0)
+        || Math.max(0, Number(loaded.manifest.archiveRecordCount ?? loaded.manifest.count ?? 0) || 0) !== Math.max(0, Number(cursor.recordCount || 0) || 0)
+        || text(loaded.manifest.archiveDigest || cursor.digest || '') !== text(cursor.digest || '')) {
         return { verified: false, reason: 'archive_layer_identity_mismatch', records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
       }
+      const parentVerification = verifiedFlashbackArchiveParent(cursor, loaded.manifest);
+      if (parentVerification.verified !== true) {
+        return { verified: false, reason: parentVerification.reason, records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
+      }
       layers.push({ ref: cursor, manifest: loaded.manifest, records });
-      cursor = normalizeFlashbackArchiveRef(cursor.parentRef || loaded.manifest.parentArchiveRef);
+      cursor = parentVerification.parentRef ? normalizeFlashbackArchiveRef(parentVerification.parentRef) : null;
     }
     if (cursor) return { verified: false, reason: 'archive_depth_exceeded', records: 0, recordsList: [], layers, missingShards, corruptShards, archiveRef: head };
     const recordsList = mergeFlashbackArchiveRecords(...layers.slice().reverse().map(layer => layer.records));
@@ -10141,8 +10640,13 @@
       if (manifest.archiveOwner !== true
         || text(manifest.archiveId || '') !== cursor.archiveId
         || Number(manifest.archiveGeneration || cursor.generation || 0) !== Number(cursor.generation || 0)
+        || Math.max(0, Number(manifest.archiveRecordCount ?? manifest.count ?? 0) || 0) !== Math.max(0, Number(cursor.recordCount || 0) || 0)
         || text(manifest.archiveDigest || cursor.digest || '') !== text(cursor.digest || '')) {
         return { verified: false, reason: 'archive_layer_identity_mismatch', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
+      }
+      const parentVerification = verifiedFlashbackArchiveParent(cursor, manifest);
+      if (parentVerification.verified !== true) {
+        return { verified: false, reason: parentVerification.reason, records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
       }
       const deltaCount = Math.max(0, Number(manifest.archiveDeltaCount ?? manifest.count ?? cursor.deltaCount ?? 0) || 0);
       const deltaMemberIds = normalizeFlashbackArchiveMemberIds(manifest.archiveDeltaMemberIds || []);
@@ -10164,7 +10668,7 @@
       }
       if (duplicate) return { verified: false, reason: 'archive_member_duplicate', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
       layers.push({ ref: cursor, manifest, deltaCount, memberIds: deltaMemberIds, stats: manifest.stats || {} });
-      cursor = normalizeFlashbackArchiveRef(cursor.parentRef || manifest.parentArchiveRef);
+      cursor = parentVerification.parentRef ? normalizeFlashbackArchiveRef(parentVerification.parentRef) : null;
     }
     if (cursor) return { verified: false, reason: 'archive_depth_exceeded', records: 0, stats: statsForRecords([]), memberIds: [], digest: '', layers, archiveRef: head };
     const memberIds = normalizeFlashbackArchiveMemberIds(Array.from(memberSet));
@@ -10176,6 +10680,212 @@
       && layers.length === Math.max(1, Number(head.depth || layers.length) || layers.length)
       && digest === text(head.digest || '');
     return { verified, reason: verified ? 'archive_manifest_chain_verified' : 'archive_manifest_chain_mismatch', records, stats, memberIds, digest, layers, archiveRef: head };
+  };
+
+  // Automatic maintenance must cover the immutable predecessor archive as well as
+  // the current local scope. This audit is read-only: it validates each layer's
+  // manifest/member catalog and every active shard envelope, but checks local vector
+  // sidecars by metadata/digest only instead of hydrating dense vectors per record.
+  const inspectFlashbackArchiveIntegrityForMaintenance = async archiveRefValue => {
+    const head = normalizeFlashbackArchiveRef(archiveRefValue);
+    if (!head) {
+      const absent = {
+        present: false,
+        checked: true,
+        verified: true,
+        reason: 'archive_absent',
+        records: 0,
+        layers: 0,
+        digest: '',
+        missingShards: 0,
+        corruptShards: 0,
+        missingVectorPayloads: 0,
+        invalidVectorPayloads: 0,
+        recordCountMismatch: false,
+        memberCatalogMismatch: false,
+        layerResults: [],
+        archiveRef: null
+      };
+      return { ...absent, fingerprint: stableHash(safeStringify(absent)) };
+    }
+
+    let summary;
+    try {
+      summary = await loadFlashbackArchiveManifestSummary(head);
+    } catch (error) {
+      const failed = {
+        present: true,
+        checked: true,
+        verified: false,
+        reason: 'archive_manifest_inspection_failed',
+        error: formatErrorMessage(error, 500),
+        records: 0,
+        layers: 0,
+        digest: '',
+        missingShards: 0,
+        corruptShards: 0,
+        missingVectorPayloads: 0,
+        invalidVectorPayloads: 0,
+        recordCountMismatch: true,
+        memberCatalogMismatch: true,
+        layerResults: [],
+        archiveRef: flashbackArchiveRefPointer(head)
+      };
+      return { ...failed, fingerprint: stableHash(safeStringify(failed)) };
+    }
+
+    if (summary?.verified !== true) {
+      const failed = {
+        present: true,
+        checked: true,
+        verified: false,
+        reason: text(summary?.reason || 'archive_manifest_chain_mismatch'),
+        records: Math.max(0, Number(summary?.records || 0) || 0),
+        layers: Array.isArray(summary?.layers) ? summary.layers.length : 0,
+        digest: text(summary?.digest || ''),
+        missingShards: 0,
+        corruptShards: 0,
+        missingVectorPayloads: 0,
+        invalidVectorPayloads: 0,
+        recordCountMismatch: true,
+        memberCatalogMismatch: true,
+        layerResults: [],
+        archiveRef: flashbackArchiveRefPointer(head)
+      };
+      return { ...failed, fingerprint: stableHash(safeStringify(failed)) };
+    }
+
+    const layerResults = [];
+    const aggregateMemberIds = [];
+    let missingShards = 0;
+    let corruptShards = 0;
+    let missingVectorPayloads = 0;
+    let invalidVectorPayloads = 0;
+    let recordCountMismatch = false;
+    let memberCatalogMismatch = false;
+
+    for (const layer of (Array.isArray(summary.layers) ? summary.layers : [])) {
+      const manifest = layer?.manifest && typeof layer.manifest === 'object'
+        ? layer.manifest
+        : await loadScopeManifest(layer?.ref?.archiveScopeKey || '');
+      const scopeKey = text(layer?.ref?.archiveScopeKey || manifest.scopeKey || '');
+      const shardCount = Math.max(0, Number(manifest.shardCount || 0) || 0);
+      const shards = await mapOrderedWithConcurrency(
+        Array.from({ length: shardCount }, (_, index) => index),
+        RECALL_SHARD_READ_CONCURRENCY,
+        async index => {
+          try {
+            return await readScopeShardRecords(scopeKey, index, manifest, {
+              useCache: false,
+              verifyVectorPayloadMetadataOnly: true
+            });
+          } catch (error) {
+            return { missing: true, corrupt: true, records: [], vectorPayloadMissing: 0, vectorPayloadInvalid: 0, error: formatErrorMessage(error, 400) };
+          }
+        }
+      );
+      const layerRecords = [];
+      const layerMissing = [];
+      const layerCorrupt = [];
+      let layerVectorMissing = 0;
+      let layerVectorInvalid = 0;
+      for (let index = 0; index < shards.length; index += 1) {
+        const shard = shards[index];
+        if (!shard || shard.missing) {
+          layerMissing.push(index);
+          if (shard?.corrupt) layerCorrupt.push(index);
+          continue;
+        }
+        layerRecords.push(...(Array.isArray(shard.records) ? shard.records.filter(isRetainedMemoryRecord) : []));
+        layerVectorMissing += Math.max(0, Number(shard.vectorPayloadMissing || 0) || 0);
+        layerVectorInvalid += Math.max(0, Number(shard.vectorPayloadInvalid || 0) || 0);
+      }
+      const actualMemberIds = normalizeFlashbackArchiveMemberIds(layerRecords.map(flashbackArchiveRecordIdentity));
+      const expectedMemberIds = normalizeFlashbackArchiveMemberIds(manifest.archiveDeltaMemberIds || layer.memberIds || []);
+      const expectedCount = Math.max(0, Number(manifest.archiveDeltaCount ?? layer.deltaCount ?? manifest.count ?? 0) || 0);
+      const countMatches = layerRecords.length === expectedCount
+        && Math.max(0, Number(manifest.count || 0) || 0) === expectedCount;
+      const memberMatches = actualMemberIds.length === expectedMemberIds.length
+        && actualMemberIds.every((value, index) => value === expectedMemberIds[index]);
+      const layerVerified = layerMissing.length === 0
+        && layerCorrupt.length === 0
+        && layerVectorMissing === 0
+        && layerVectorInvalid === 0
+        && countMatches
+        && memberMatches;
+      missingShards += layerMissing.length;
+      corruptShards += layerCorrupt.length;
+      missingVectorPayloads += layerVectorMissing;
+      invalidVectorPayloads += layerVectorInvalid;
+      if (!countMatches) recordCountMismatch = true;
+      if (!memberMatches) memberCatalogMismatch = true;
+      aggregateMemberIds.push(...actualMemberIds);
+      layerResults.push({
+        archiveId: text(layer?.ref?.archiveId || manifest.archiveId || ''),
+        archiveScopeKey: scopeKey,
+        generation: Math.max(0, Number(layer?.ref?.generation || manifest.archiveGeneration || 0) || 0),
+        shardCount,
+        expectedRecords: expectedCount,
+        loadedRecords: layerRecords.length,
+        missingShardIndexes: layerMissing,
+        corruptShardIndexes: layerCorrupt,
+        missingVectorPayloads: layerVectorMissing,
+        invalidVectorPayloads: layerVectorInvalid,
+        memberCatalogMatches: memberMatches,
+        recordCountMatches: countMatches,
+        verified: layerVerified
+      });
+    }
+
+    const memberIds = normalizeFlashbackArchiveMemberIds(aggregateMemberIds);
+    const digest = flashbackArchiveMemberDigest(memberIds);
+    const headMatches = memberIds.length === Math.max(0, Number(head.recordCount || 0) || 0)
+      && digest === text(head.digest || '')
+      && layerResults.length === Math.max(1, Number(head.depth || layerResults.length) || layerResults.length);
+    if (!headMatches) {
+      recordCountMismatch = recordCountMismatch || memberIds.length !== Math.max(0, Number(head.recordCount || 0) || 0);
+      memberCatalogMismatch = memberCatalogMismatch || digest !== text(head.digest || '');
+    }
+    const verified = summary.verified === true
+      && headMatches
+      && layerResults.every(layer => layer.verified === true)
+      && missingShards === 0
+      && corruptShards === 0
+      && missingVectorPayloads === 0
+      && invalidVectorPayloads === 0
+      && !recordCountMismatch
+      && !memberCatalogMismatch;
+    const reason = verified
+      ? 'archive_integrity_verified'
+      : (missingShards > 0
+        ? 'archive_shards_missing'
+        : (corruptShards > 0
+          ? 'archive_shards_corrupt'
+          : (missingVectorPayloads > 0 || invalidVectorPayloads > 0
+            ? 'archive_vector_payload_incomplete'
+            : (recordCountMismatch
+              ? 'archive_record_count_mismatch'
+              : (memberCatalogMismatch ? 'archive_member_catalog_mismatch' : 'archive_integrity_mismatch')))));
+    const result = {
+      present: true,
+      checked: true,
+      verified,
+      reason,
+      records: memberIds.length,
+      expectedRecords: Math.max(0, Number(head.recordCount || 0) || 0),
+      layers: layerResults.length,
+      digest,
+      expectedDigest: text(head.digest || ''),
+      missingShards,
+      corruptShards,
+      missingVectorPayloads,
+      invalidVectorPayloads,
+      recordCountMismatch,
+      memberCatalogMismatch,
+      layerResults,
+      archiveRef: flashbackArchiveRefPointer(head)
+    };
+    return { ...result, fingerprint: stableHash(safeStringify(result)) };
   };
 
   const restoredLegacyCompactionRecord = (record = {}, scopeKey = '', settings = DEFAULTS) => {
@@ -13319,27 +14029,69 @@
     const initialLiveState = liveChatStateFromSnapshot(snapshot);
     const initialLiveHash = flashbackLiveWorldlineHash(scope.scopeKey, initialLiveState);
     const previous = await loadScopeRecordsRaw(scope.scopeKey);
-    assertCompleteScopeLoad(previous, 'full chat rebuild');
-    // Build and embed the replacement first. If embedding fails, the existing
-    // committed scope remains untouched.
+    const previousState = assessAuthoritativeFullRebuildSource(previous, sources, 'full chat rebuild');
+    const previousArchiveIntegrity = await inspectFlashbackArchiveIntegrityForMaintenance(previousState.archiveRef);
+    if (previousArchiveIntegrity.present && previousArchiveIntegrity.verified !== true) {
+      const error = new Error(`full chat rebuild aborted: immutable predecessor archive integrity failed: ${previousArchiveIntegrity.reason}`);
+      error.code = 'FLASHBACK_ARCHIVE_INTEGRITY_FAILED';
+      error.scopeKey = scope.scopeKey;
+      error.archiveReason = previousArchiveIntegrity.reason;
+      error.archiveMissingShards = previousArchiveIntegrity.missingShards;
+      error.archiveCorruptShards = previousArchiveIntegrity.corruptShards;
+      error.archiveMissingVectorPayloads = previousArchiveIntegrity.missingVectorPayloads;
+      throw error;
+    }
+
+    // Build the entire current-session replacement from the authoritative visible
+    // chat. Readable old records are reuse hints only; missing old shards are never
+    // promoted into the new canonical commit.
     const rebuildSettings = { ...settings, maxResponseItems: Number.MAX_SAFE_INTEGER };
     const records = await buildRecordsFromSources(sources, rebuildSettings, scope, {
-      reuseRecords: previous.records,
+      reuseRecords: previousState.records,
       allowHashFallback: options.allowHashFallback !== false,
       onProgress: maintenanceEmbeddingProgressCallback(options.maintenanceOperationId, '재구축')
     });
     if (!records.length) throw new Error('현재 채팅에서 재구축 가능한 응답 기억을 만들지 못했습니다.');
     const embeddingStats = records.flashbackEmbeddingStats || {};
     let protectedHistoryCount = 0;
+    let worldlineResetWarning = '';
+
     const saved = await withScopeWriteLock(scope.scopeKey, async () => {
       const latest = await loadScopeRecordsRaw(scope.scopeKey);
-      assertCompleteScopeLoad(latest, 'full chat rebuild commit');
       if (previous.manifest.manifestRawPresent === true && latest.manifest.manifestRawPresent !== true) {
         const error = new Error('full chat rebuild aborted: the scope was deleted while replacement vectors were being prepared');
         error.code = 'FLASHBACK_REBUILD_SCOPE_DELETED';
         throw error;
       }
-      if (!options.snapshot) {
+      const latestState = assessAuthoritativeFullRebuildSource(latest, sources, 'full chat rebuild commit');
+      if (latestState.fingerprint !== previousState.fingerprint) {
+        const error = new Error('full chat rebuild aborted: active storage changed while replacement vectors were being prepared');
+        error.code = 'FLASHBACK_REBUILD_STORAGE_CHANGED';
+        error.scopeKey = scope.scopeKey;
+        error.beforeCommitId = previousState.commitId;
+        error.afterCommitId = latestState.commitId;
+        error.beforeMissingShardIndexes = previousState.missingShardIndexes.slice();
+        error.afterMissingShardIndexes = latestState.missingShardIndexes.slice();
+        throw error;
+      }
+      const latestArchiveIntegrity = await inspectFlashbackArchiveIntegrityForMaintenance(latestState.archiveRef);
+      if (latestArchiveIntegrity.present && latestArchiveIntegrity.verified !== true) {
+        const error = new Error(`full chat rebuild aborted: immutable predecessor archive integrity failed before commit: ${latestArchiveIntegrity.reason}`);
+        error.code = 'FLASHBACK_ARCHIVE_INTEGRITY_FAILED';
+        error.scopeKey = scope.scopeKey;
+        error.archiveReason = latestArchiveIntegrity.reason;
+        throw error;
+      }
+      if (text(previousArchiveIntegrity.fingerprint || '') !== text(latestArchiveIntegrity.fingerprint || '')) {
+        const error = new Error('full chat rebuild aborted: immutable predecessor archive changed while replacement vectors were being prepared');
+        error.code = 'FLASHBACK_REBUILD_ARCHIVE_CHANGED';
+        error.scopeKey = scope.scopeKey;
+        error.beforeArchiveFingerprint = text(previousArchiveIntegrity.fingerprint || '');
+        error.afterArchiveFingerprint = text(latestArchiveIntegrity.fingerprint || '');
+        throw error;
+      }
+
+      if (options.skipLiveSourceRecheck !== true) {
         const latestSnapshot = await loadRisuSnapshot(false);
         const latestScope = resolveScopeFromSnapshot(latestSnapshot);
         const latestLiveHash = latestScope.scopeKey === scope.scopeKey
@@ -13351,22 +14103,74 @@
           throw error;
         }
       }
-      const protectedHistory = latest.records.filter(isPermanentSessionHistoryRecord);
+
+      const protectedHistory = latestState.permanentRecords;
       protectedHistoryCount = protectedHistory.length;
-      const replacementRecords = [...protectedHistory, ...records];
-      // A clean lineage is safe even if the following commit fails: the active
-      // live chat can reconstruct it, whereas stale retired branches must not be
-      // allowed to re-enter a successful rebuild.
-      await saveTurnWorldline(scope.scopeKey, emptyTurnWorldline(scope.scopeKey));
-      const committed = await saveScopeRecords(scope, replacementRecords, rebuildSettings, scope);
-      return committed;
+      const replacementRecords = mergeAuthoritativeRebuildRecords(protectedHistory, records);
+      const committed = await saveScopeRecords(
+        scope,
+        replacementRecords,
+        rebuildSettings,
+        scope,
+        { verifyCommitReadbackBeforeManifestSwap: true }
+      );
+
+      // The old worldline remains untouched until every replacement shard has been
+      // written, read back, and made active by the manifest. A reset failure cannot
+      // roll back the newly durable memories; the authoritative synchronization below
+      // retries the lineage write.
+      try {
+        await saveTurnWorldline(scope.scopeKey, emptyTurnWorldline(scope.scopeKey));
+      } catch (error) {
+        worldlineResetWarning = formatErrorMessage(error, 500);
+        warn('full chat rebuild worldline reset deferred to authoritative synchronization', error);
+      }
+      return {
+        ...committed,
+        salvage: {
+          enabled: previousState.salvageMode === true,
+          sourceCommitId: previousState.commitId,
+          sourceExpectedRecords: previousState.expectedCount,
+          readableSourceRecords: previousState.records.length,
+          missingShards: previousState.missingShards,
+          missingShardIndexes: previousState.missingShardIndexes.slice(),
+          corruptShardIndexes: previousState.corruptShardIndexes.slice(),
+          preservedPermanentHistory: protectedHistoryCount,
+          archiveRefPreserved: !!previousState.archiveRef
+        }
+      };
     });
-    await synchronizeFlashbackTurnWorldline(scope, initialLiveState, rebuildSettings);
+
+    const replacementDurable = await loadScopeRecordsRaw(scope.scopeKey);
+    assertCompleteScopeLoad(replacementDurable, 'full chat rebuild replacement verification');
+    if (text(replacementDurable.manifest.commitId || '') !== text(saved.manifest?.commitId || '')
+      || replacementDurable.records.length !== saved.records.length) {
+      const error = new Error('full chat rebuild replacement verification failed after manifest swap');
+      error.code = 'FLASHBACK_REBUILD_DURABLE_VERIFY_FAILED';
+      error.scopeKey = scope.scopeKey;
+      error.expectedCommitId = text(saved.manifest?.commitId || '');
+      error.actualCommitId = text(replacementDurable.manifest.commitId || '');
+      error.expectedCount = saved.records.length;
+      error.actualCount = replacementDurable.records.length;
+      throw error;
+    }
+    const worldline = await synchronizeFlashbackTurnWorldline(scope, initialLiveState, rebuildSettings);
+    const reconciledDurable = await loadScopeRecordsRaw(scope.scopeKey);
+    assertCompleteScopeLoad(reconciledDurable, 'full chat rebuild worldline verification');
+    const finalArchiveIntegrity = await inspectFlashbackArchiveIntegrityForMaintenance(reconciledDurable.manifest?.archiveRef);
+    if (finalArchiveIntegrity.present && finalArchiveIntegrity.verified !== true) {
+      const error = new Error(`full chat rebuild final archive verification failed: ${finalArchiveIntegrity.reason}`);
+      error.code = 'FLASHBACK_ARCHIVE_INTEGRITY_FAILED';
+      error.scopeKey = scope.scopeKey;
+      error.archiveReason = finalArchiveIntegrity.reason;
+      throw error;
+    }
     const episode = await maybeRebuildEpisodeIndex(scope, rebuildSettings, null, { force: true, reason: 'full_chat_rebuild' });
     Runtime.lastImport = {
       at: Date.now(),
       maintenanceMode: 'rebuild',
       fullChatRebuild: true,
+      authoritativeLiveRebuild: true,
       scopeKey: scope.scopeKey,
       liveChatChats: 1,
       liveChatTurns: sources.length,
@@ -13375,8 +14179,26 @@
       embeddedVectors: Number(embeddingStats.embeddedVectors || 0) || 0,
       embeddedBatches: Number(embeddingStats.embeddedBatches || 0) || 0,
       protectedHistoryRecords: protectedHistoryCount,
-      replacedRecords: previous.records.length,
-      total: saved.records.length,
+      replacedRecords: previousState.records.length,
+      recoveredMissingShards: previousState.salvageMode === true ? previousState.missingShards : 0,
+      recoveredMissingShardIndexes: previousState.salvageMode === true ? previousState.missingShardIndexes.slice() : [],
+      sourceCommitId: previousState.commitId,
+      replacementCommitId: text(saved.manifest?.commitId || ''),
+      replacementCommitReadbackVerified: saved.performance?.commitReadbackVerified === true
+        && saved.performance?.manifestReadbackVerified === true,
+      worldlineReconciled: worldline?.changed === true || worldline?.reason === 'worldline_current',
+      worldlineResult: worldline ? {
+        changed: worldline.changed === true,
+        reason: text(worldline.reason || ''),
+        liveHash: text(worldline.liveHash || '')
+      } : null,
+      finalActiveCommitId: text(reconciledDurable.manifest.commitId || ''),
+      archiveIntegrityVerified: finalArchiveIntegrity.verified === true,
+      archiveIntegrityReason: text(finalArchiveIntegrity.reason || ''),
+      archiveIntegrityLayers: Math.max(0, Number(finalArchiveIntegrity.layers || 0) || 0),
+      archiveIntegrityRecords: Math.max(0, Number(finalArchiveIntegrity.records || 0) || 0),
+      worldlineResetWarning,
+      total: reconciledDurable.records.length,
       episode,
       embeddingCost: estimateEmbeddingCostForTokens(Number(embeddingStats.embeddedTokens || 0) || 0, rebuildSettings)
     };
@@ -21741,8 +22563,9 @@
     const scope = scopeOverride?.scopeKey
       ? scopeOverride
       : (options.scope?.scopeKey ? options.scope : (scopeOverride ? { scopeKey: scopeOverride } : await resolveCurrentScope(false)));
-    const loaded = await loadScopeRecords(scope.scopeKey);
-    assertCompleteScopeLoad(loaded, 'full re-embedding');
+    const loadedRaw = await loadScopeRecordsRaw(scope.scopeKey);
+    assertCompleteScopeLoad(loadedRaw, 'full re-embedding');
+    const loaded = { manifest: loadedRaw.manifest, records: loadedRaw.records.filter(isRetainedMemoryRecord) };
     const { records } = loaded;
     if (!records.length) return { reembedded: 0, total: 0, scopeKey: scope.scopeKey };
     const baseRecords = records.filter(record => !(record.autoEpisode || record.sourceType === 'episode_index'));
@@ -21784,8 +22607,9 @@
       });
     }
     const saved = await withScopeWriteLock(scope.scopeKey, async () => {
-      const latest = await loadScopeRecords(scope.scopeKey);
-      assertCompleteScopeLoad(latest, 'full re-embedding commit');
+      const latestRaw = await loadScopeRecordsRaw(scope.scopeKey);
+      assertCompleteScopeLoad(latestRaw, 'full re-embedding commit');
+      const latest = { manifest: latestRaw.manifest, records: latestRaw.records.filter(isRetainedMemoryRecord) };
       if (latest.manifest.manifestRawPresent !== true) {
         return { records: latest.records, changed: 0, removedEpisodeIndexes: 0, skipped: true, reason: 'scope_deleted' };
       }
@@ -22211,9 +23035,9 @@ ${cleanedText}`, 80),
         ? { removed: externalRecords.length, retired: externalRecords.length > 0, reason: 'dry_run' }
         : await retireExternalRecordsForScope(scope.scopeKey, { reason: 'maintenance_cleanup', settings }))
       : { removed: 0, retired: false, reason: 'disabled' };
-    const loaded = opts.dryRun
-      ? { manifest: rawLoaded.manifest, records: rawLoaded.records.filter(isRetainedMemoryRecord) }
-      : await loadScopeRecords(scope.scopeKey);
+    const loadedRaw = opts.dryRun ? rawLoaded : await loadScopeRecordsRaw(scope.scopeKey);
+    assertCompleteScopeLoad(loadedRaw, 'memory cleanup source');
+    const loaded = { manifest: loadedRaw.manifest, records: loadedRaw.records.filter(isRetainedMemoryRecord) };
     const records = loaded.records || [];
     const result = {
       at: Date.now(),
@@ -22340,8 +23164,9 @@ ${cleanedText}`, 80),
     }
     const saved = requiresBaseSave
       ? await withScopeWriteLock(scope.scopeKey, async () => {
-        const latest = await loadScopeRecords(scope.scopeKey);
-        assertCompleteScopeLoad(latest, 'memory cleanup commit');
+        const latestRaw = await loadScopeRecordsRaw(scope.scopeKey);
+        assertCompleteScopeLoad(latestRaw, 'memory cleanup commit');
+        const latest = { manifest: latestRaw.manifest, records: latestRaw.records.filter(isRetainedMemoryRecord) };
         if (latest.manifest.manifestRawPresent !== true) {
           return { ...latest, changed: 0, removedEpisodeIndexes: 0, skipped: true, reason: 'scope_deleted' };
         }
@@ -22404,13 +23229,87 @@ ${cleanedText}`, 80),
     return { chunks, tokens, cost: estimateEmbeddingCostForTokens(tokens, settings) };
   };
 
+  // Estimate a full live-chat rebuild with the same identity/profile rules used
+  // by buildRecordsFromSources(). This separates total replacement chunks from the
+  // subset that actually needs a new remote embedding call.
+  const estimateFullRebuildVectorReuse = (sources = [], settings = Runtime.settings || DEFAULTS, readableRecords = []) => {
+    const cfg = settings || DEFAULTS;
+    const drafts = [];
+    for (const source of (Array.isArray(sources) ? sources : [])) {
+      if (!isResponseMemorySource(source)) continue;
+      const rawBody = text(source?.text ?? source?.content ?? '').replace(/\r\n/g, '\n').trim();
+      const body = source?.sanitizeMemory === false
+        ? sanitizeSourceText(rawBody)
+        : sanitizeAssistantForMemory(rawBody, { stripRolePrefix: false });
+      if (!body) continue;
+      const chunkDescriptors = splitTextIntoChunkDescriptors(body, cfg.chunkChars, cfg.chunkOverlap);
+      const sourceTurnIndex = Number.isFinite(Number(source.turnIndex ?? source.meta?.turnIndex)) ? Number(source.turnIndex ?? source.meta?.turnIndex) : 0;
+      const assistantMessagePosition = Number.isFinite(Number(source.assistantMessagePosition ?? source.meta?.assistantMessagePosition))
+        ? Number(source.assistantMessagePosition ?? source.meta?.assistantMessagePosition)
+        : sourceTurnIndex;
+      const pairIndex = Number.isFinite(Number(source.pairIndex ?? source.meta?.pairIndex))
+        ? Number(source.pairIndex ?? source.meta?.pairIndex)
+        : inferPairIndexFromAssistantPosition(assistantMessagePosition || sourceTurnIndex);
+      const turnIndex = pairIndex > 0 ? pairIndex : sourceTurnIndex;
+      const sourceHash = compact(source.sourceHash || source.meta?.sourceHash || stableHash(`${source.sourceType || ''}\n${source.sourceId || ''}\n${body}`), 120);
+      for (let chunkIndex = 0; chunkIndex < chunkDescriptors.length; chunkIndex += 1) {
+        const chunk = text(chunkDescriptors[chunkIndex]?.text || '');
+        if (!chunk) continue;
+        drafts.push({ sourceHash, pairIndex, turnIndex, chunkIndex, text: chunk });
+      }
+    }
+
+    const buckets = new Map();
+    for (const record of (Array.isArray(readableRecords) ? readableRecords : [])) {
+      if (!reusableVectorRecord(record, cfg)) continue;
+      const key = vectorReuseKey(record);
+      if (!buckets.has(key)) buckets.set(key, []);
+      buckets.get(key).push(record);
+    }
+    const reusable = new Array(drafts.length).fill(false);
+    const missing = [];
+    for (let index = 0; index < drafts.length; index += 1) {
+      const bucket = buckets.get(vectorReuseKey(drafts[index])) || [];
+      if (bucket.shift()) reusable[index] = true;
+      else missing.push(index);
+    }
+    if (normalizeProvider(cfg.embeddingProvider) === 'voyage_context' && missing.length) {
+      const dirtyGroups = new Set(missing.map(index => text(drafts[index]?.sourceHash || `draft:${index}`)));
+      for (let index = 0; index < drafts.length; index += 1) {
+        if (dirtyGroups.has(text(drafts[index]?.sourceHash || `draft:${index}`))) reusable[index] = false;
+      }
+    }
+    const newEmbeddingIndexes = [];
+    for (let index = 0; index < drafts.length; index += 1) if (!reusable[index]) newEmbeddingIndexes.push(index);
+    const newEmbeddingTokens = newEmbeddingIndexes.reduce((sum, index) => sum + estimateTokens(drafts[index]?.text || ''), 0);
+    return {
+      totalChunks: drafts.length,
+      reusableVectors: drafts.length - newEmbeddingIndexes.length,
+      newEmbeddingVectors: newEmbeddingIndexes.length,
+      newEmbeddingTokens,
+      cost: estimateEmbeddingCostForTokens(newEmbeddingTokens, cfg)
+    };
+  };
+
   const automaticMaintenanceStrategyForPlan = (plan = {}) => {
     if (plan.healthy) return { strategy: 'no_action', stages: [] };
     if (text(plan.storageForeignScopeKey || '').trim()) {
       return { strategy: 'scope_collision', stages: [], blocked: true, reason: 'storage_scope_collision' };
     }
-    if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.liveChunkSchemaMismatch || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageManifestCorrupt === true || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
+    // A corrupt manifest can hide the immutable archive pointer and permanent-history
+    // count. Do not advertise a live-chat rebuild that the safe rebuild assessor must
+    // later reject; require an explicit manifest recovery/export path instead.
+    if (plan.storageManifestCorrupt === true) {
+      return { strategy: 'manifest_corrupt_manual_recovery', stages: [], blocked: true, reason: 'manifest_metadata_untrusted' };
+    }
+    if (plan.archiveIntegrityPresent === true && plan.archiveIntegrityVerified !== true) {
+      return { strategy: 'archive_integrity_failed', stages: [], blocked: true, reason: text(plan.archiveIntegrityReason || 'archive_integrity_mismatch') };
+    }
+    if ((Number(plan.legacySanitizerRecords || 0) > 0 || Number(plan.liveChunkSchemaMismatch || 0) > 0 || Number(plan.storageMissingShards || 0) > 0 || plan.storageRecordCountMismatch === true) && !Number(plan.liveTurns || 0)) {
       return { strategy: 'live_source_required', stages: [], blocked: true };
+    }
+    if (Number(plan.unrecoverablePermanentHistory || 0) > 0) {
+      return { strategy: 'protected_history_missing', stages: [], blocked: true, reason: 'permanent_history_may_be_missing' };
     }
     if (plan.embeddingCredentialMissing === true) {
       return { strategy: 'credential_required', stages: [], blocked: true, reason: 'embedding_credential_missing' };
@@ -22455,11 +23354,34 @@ ${cleanedText}`, 80),
     const storageManifestCorrupt = rawLoaded.manifest?.manifestCorrupt === true;
     const storageForeignScopeKey = text(rawLoaded.manifest?.foreignScopeKey || '').trim();
     const storageRecordCountMismatch = rawLoaded.manifest?.recordCountMismatch === true;
+    const storageArchiveRefInvalid = rawLoaded.manifest?.archiveRefInvalid === true;
+    const archiveRef = storageManifestCorrupt || storageArchiveRefInvalid ? null : normalizeFlashbackArchiveRef(rawLoaded.manifest?.archiveRef);
+    const archiveIntegrity = storageManifestCorrupt
+      ? {
+        present: false, checked: false, verified: false, reason: 'active_manifest_corrupt_archive_pointer_untrusted',
+        records: 0, layers: 0, missingShards: 0, corruptShards: 0, missingVectorPayloads: 0, invalidVectorPayloads: 0,
+        recordCountMismatch: false, memberCatalogMismatch: false, layerResults: [], archiveRef: null, fingerprint: ''
+      }
+      : (storageArchiveRefInvalid
+        ? {
+          present: true, checked: true, verified: false, reason: 'archive_ref_invalid',
+          records: 0, layers: 0, missingShards: 0, corruptShards: 0, missingVectorPayloads: 0, invalidVectorPayloads: 0,
+          recordCountMismatch: true, memberCatalogMismatch: true, layerResults: [], archiveRef: null, fingerprint: stableHash('archive_ref_invalid')
+        }
+        : await inspectFlashbackArchiveIntegrityForMaintenance(archiveRef).catch(error => ({
+        present: !!archiveRef, checked: true, verified: false, reason: 'archive_integrity_inspection_failed',
+        error: formatErrorMessage(error, 500), records: 0, layers: 0, missingShards: 0, corruptShards: 0,
+        missingVectorPayloads: 0, invalidVectorPayloads: 0, recordCountMismatch: true, memberCatalogMismatch: true,
+        layerResults: [], archiveRef: archiveRef ? flashbackArchiveRefPointer(archiveRef) : null, fingerprint: ''
+      })));
     const shardIndexVersion = Math.max(0, Number(rawLoaded.manifest?.shardIndexVersion || 0) || 0);
     const shardIndexMismatch = shardIndexVersion < FLASHBACK_SHARD_INDEX_VERSION
       || (Array.isArray(rawLoaded.manifest?.shardSummaries)
         && rawLoaded.manifest.shardSummaries.length !== Math.max(0, Number(rawLoaded.manifest?.shardCount || 0) || 0));
     const records = rawLoaded.records.filter(isRetainedMemoryRecord);
+    const readablePermanentHistory = records.filter(isPermanentSessionHistoryRecord).length;
+    const expectedPermanentHistory = Math.max(0, Number(rawLoaded.manifest?.permanentSessionHistoryCount || 0) || 0);
+    const unrecoverablePermanentHistory = Math.max(0, expectedPermanentHistory - readablePermanentHistory);
     const responseRecords = records.filter(record => isResponseMemoryRecord(record) && !(record.autoEpisode || record.sourceType === 'episode_index'));
     const episodeRecords = records.filter(record => record.autoEpisode || record.sourceType === 'episode_index');
     const sources = collectLiveChatSourcesFromSnapshot(snapshot, normalizeColdStartOptions(settings, { scope: 'current', historyLimit: 0 }));
@@ -22518,20 +23440,28 @@ ${cleanedText}`, 80),
       }
     }
     const requiresFullRebuild = !storageForeignScopeKey
+      && !storageManifestCorrupt
       && sources.length > 0
-      && (legacySanitizerRecords > 0 || liveChunkSchemaMismatch > 0 || storageMissingShards > 0 || storageManifestCorrupt || storageRecordCountMismatch);
-    const syncEstimate = maintenanceSourceEmbeddingEstimate(requiresFullRebuild ? sources : diff.selected, settings);
+      && (legacySanitizerRecords > 0 || liveChunkSchemaMismatch > 0 || storageMissingShards > 0 || storageRecordCountMismatch);
+    // Compute the full-rebuild reuse plan even when the current automatic strategy
+    // is targeted/no-op, because the user may explicitly choose the advanced rebuild.
+    const rebuildEstimate = !storageManifestCorrupt && sources.length > 0
+      ? estimateFullRebuildVectorReuse(sources, settings, responseRecords)
+      : { totalChunks: 0, reusableVectors: 0, newEmbeddingVectors: 0, newEmbeddingTokens: 0, cost: estimateEmbeddingCostForTokens(0, settings) };
+    const syncEstimate = requiresFullRebuild || storageManifestCorrupt
+      ? null
+      : maintenanceSourceEmbeddingEstimate(diff.selected, settings);
     const baseDigest = episodeSourceDigestForRecords(responseRecords, settings);
     const episodeStale = settings.episodeIndexEnabled
       && (text(rawLoaded.manifest.episodeSourceDigest || '') !== text(baseDigest || '') || missingEpisodeIndexForEligibleTurns(responseRecords, episodeRecords, settings));
     const externalRecords = rawLoaded.records.filter(record => !isRetainedMemoryRecord(record)).length;
-    const estimatedEmbeddingChunks = requiresFullRebuild ? syncEstimate.chunks : syncEstimate.chunks + recordsNeedingEmbedding;
-    const estimatedTokens = requiresFullRebuild ? syncEstimate.tokens : syncEstimate.tokens + repairTokens;
-    const embeddingWorkPending = requiresFullRebuild
-      || estimatedEmbeddingChunks > 0
-      || diff.missing.length > 0
-      || diff.changed.length > 0
-      || recordsNeedingEmbedding > 0;
+    const estimatedEmbeddingChunks = requiresFullRebuild
+      ? rebuildEstimate.newEmbeddingVectors
+      : Number(syncEstimate?.chunks || 0) + recordsNeedingEmbedding;
+    const estimatedTokens = requiresFullRebuild
+      ? rebuildEstimate.newEmbeddingTokens
+      : Number(syncEstimate?.tokens || 0) + repairTokens;
+    const embeddingWorkPending = !storageManifestCorrupt && estimatedEmbeddingChunks > 0;
     // Reading first reconciles the plugin argument, save-synced backup, and
     // device-local cache without rewriting provider/model settings.
     await readEmbeddingKey().catch(error => warn('embedding credential reconciliation failed during maintenance inspection', error));
@@ -22568,6 +23498,30 @@ ${cleanedText}`, 80),
       storageManifestCorrupt,
       storageForeignScopeKey,
       storageRecordCountMismatch,
+      storageArchiveRefInvalid,
+      archiveIntegrityPresent: archiveIntegrity.present === true,
+      archiveIntegrityChecked: archiveIntegrity.checked === true,
+      archiveIntegrityVerified: archiveIntegrity.verified === true,
+      archiveIntegrityReason: text(archiveIntegrity.reason || ''),
+      archiveIntegrityRecords: Math.max(0, Number(archiveIntegrity.records || 0) || 0),
+      archiveIntegrityLayers: Math.max(0, Number(archiveIntegrity.layers || 0) || 0),
+      archiveIntegrityMissingShards: Math.max(0, Number(archiveIntegrity.missingShards || 0) || 0),
+      archiveIntegrityCorruptShards: Math.max(0, Number(archiveIntegrity.corruptShards || 0) || 0),
+      archiveIntegrityMissingVectorPayloads: Math.max(0, Number(archiveIntegrity.missingVectorPayloads || 0) || 0),
+      archiveIntegrityInvalidVectorPayloads: Math.max(0, Number(archiveIntegrity.invalidVectorPayloads || 0) || 0),
+      archiveIntegrityRecordCountMismatch: archiveIntegrity.recordCountMismatch === true,
+      archiveIntegrityMemberCatalogMismatch: archiveIntegrity.memberCatalogMismatch === true,
+      archiveIntegrityFingerprint: text(archiveIntegrity.fingerprint || ''),
+      archiveIntegrityLayerResults: Array.isArray(archiveIntegrity.layerResults) ? archiveIntegrity.layerResults.map(layer => ({ ...layer })) : [],
+      expectedPermanentHistory,
+      readablePermanentHistory,
+      unrecoverablePermanentHistory,
+      missingShardIndexes: Array.isArray(rawLoaded.manifest?.missingShardIndexes) ? rawLoaded.manifest.missingShardIndexes.slice() : [],
+      corruptShardIndexes: Array.isArray(rawLoaded.manifest?.corruptShardIndexes) ? rawLoaded.manifest.corruptShardIndexes.slice() : [],
+      fullRebuildRecoverable: requiresFullRebuild
+        && unrecoverablePermanentHistory === 0
+        && sources.length > 0
+        && (!archiveIntegrity.present || archiveIntegrity.verified === true),
       shardIndexVersion,
       shardIndexExpectedVersion: FLASHBACK_SHARD_INDEX_VERSION,
       shardIndexMismatch,
@@ -22576,6 +23530,12 @@ ${cleanedText}`, 80),
       recordsNeedingEmbedding,
       episodeStale,
       embeddingWorkPending,
+      rebuildTotalChunks: Math.max(0, Number(rebuildEstimate.totalChunks || 0) || 0),
+      estimatedReusableVectors: Math.max(0, Number(rebuildEstimate.reusableVectors || 0) || 0),
+      rebuildEstimatedNewEmbeddingVectors: Math.max(0, Number(rebuildEstimate.newEmbeddingVectors || 0) || 0),
+      rebuildEstimatedEmbeddingTokens: Math.max(0, Number(rebuildEstimate.newEmbeddingTokens || 0) || 0),
+      rebuildEmbeddingCost: rebuildEstimate.cost || estimateEmbeddingCostForTokens(rebuildEstimate.newEmbeddingTokens || 0, settings),
+      estimatedNewEmbeddingVectors: Math.max(0, Number(estimatedEmbeddingChunks || 0) || 0),
       estimatedEmbeddingChunks,
       estimatedEmbeddingTokens: estimatedTokens,
       embeddingCost: estimateEmbeddingCostForTokens(estimatedTokens, settings),
@@ -22604,6 +23564,9 @@ ${cleanedText}`, 80),
       && !plan.storageManifestCorrupt
       && !plan.storageForeignScopeKey
       && !plan.storageRecordCountMismatch
+      && !plan.storageArchiveRefInvalid
+      && (!plan.archiveIntegrityPresent || plan.archiveIntegrityVerified)
+      && !plan.unrecoverablePermanentHistory
       && !plan.shardIndexMismatch
       && !plan.sanitizerVersionMismatch
       && !plan.liveChunkSchemaMismatch
@@ -22611,7 +23574,7 @@ ${cleanedText}`, 80),
       && !plan.embeddingCredentialMissing;
     plan.automatic = automaticMaintenanceStrategyForPlan(plan);
     Object.defineProperty(plan, '_maintenanceContext', {
-      value: { settings, snapshot, scope, rawLoaded },
+      value: { settings, snapshot, scope, rawLoaded, archiveIntegrity },
       enumerable: false,
       configurable: true
     });
@@ -22620,12 +23583,10 @@ ${cleanedText}`, 80),
 
   const maintenanceEmbeddingWorkRequested = (mode = 'auto', plan = {}) => {
     const normalizedMode = normalizeChoice(mode, ['auto', 'sync', 'rebuild', 'reembed'], 'auto');
-    if (normalizedMode === 'rebuild' || normalizedMode === 'reembed') return true;
-    if (normalizedMode === 'sync') return Number(plan.estimatedEmbeddingChunks || 0) > 0 || Number(plan.missingTurns || 0) > 0 || Number(plan.changedTurns || 0) > 0;
-    const stages = Array.isArray(plan.automatic?.stages) ? plan.automatic.stages : [];
-    return plan.requiresFullRebuild === true
-      || stages.some(stage => ['sync', 'reembed', 'rebuild'].includes(stage))
-      || Number(plan.estimatedEmbeddingChunks || 0) > 0;
+    if (normalizedMode === 'reembed') return Math.max(0, Number(plan.responseRecords || plan.storedRecords || 0) || 0) > 0;
+    if (normalizedMode === 'rebuild') return Number(plan.rebuildEstimatedNewEmbeddingVectors ?? plan.estimatedNewEmbeddingVectors ?? 0) > 0;
+    if (normalizedMode === 'sync') return Number(plan.estimatedEmbeddingChunks || 0) > 0;
+    return Number(plan.estimatedEmbeddingChunks || 0) > 0;
   };
 
   const requireMaintenanceEmbeddingCredential = async (settings = DEFAULTS, plan = {}, mode = 'auto') => {
@@ -22769,6 +23730,68 @@ ${cleanedText}`, 80),
     return total;
   };
 
+  const maintenanceBlockedErrorForPlan = (settings = DEFAULTS, plan = {}, automaticOverride = null) => {
+    const automatic = automaticOverride || plan.automatic || automaticMaintenanceStrategyForPlan(plan);
+    const strategy = text(automatic?.strategy || 'maintenance_blocked');
+    let error;
+    // Storage lineage and immutable-history safety always outrank a missing provider
+    // credential. A blocked operation must explain the real non-recoverable condition
+    // without performing or requesting an embedding probe first.
+    if (strategy === 'manifest_corrupt_manual_recovery' || plan.storageManifestCorrupt === true) {
+      error = new Error('활성 저장 매니페스트가 손상되어 archiveRef와 영구 이전 세션 기록 수를 신뢰할 수 없습니다. 자동 복구는 기존 데이터를 변경하지 않고 차단되었습니다. 디버그 로그와 저장소 백업을 확보한 뒤 명시적인 매니페스트 복구가 필요합니다.');
+      error.code = 'FLASHBACK_STORAGE_MANIFEST_CORRUPT_MANUAL_RECOVERY';
+    } else if (strategy === 'archive_integrity_failed' || (plan.archiveIntegrityPresent === true && plan.archiveIntegrityVerified !== true)) {
+      error = new Error(`불변 이전 세션 아카이브 무결성 검사에 실패하여 자동 변경을 차단했습니다: ${text(plan.archiveIntegrityReason || automatic?.reason || 'archive_integrity_mismatch')}. 현재 로컬 세션 저장소와 아카이브는 변경하지 않았습니다.`);
+      error.code = 'FLASHBACK_ARCHIVE_INTEGRITY_FAILED';
+      error.archiveReason = text(plan.archiveIntegrityReason || automatic?.reason || '');
+      error.archiveMissingShards = Math.max(0, Number(plan.archiveIntegrityMissingShards || 0) || 0);
+      error.archiveCorruptShards = Math.max(0, Number(plan.archiveIntegrityCorruptShards || 0) || 0);
+      error.archiveMissingVectorPayloads = Math.max(0, Number(plan.archiveIntegrityMissingVectorPayloads || 0) || 0);
+    } else if (strategy === 'protected_history_missing' || Number(plan.unrecoverablePermanentHistory || 0) > 0) {
+      error = new Error(`누락 샤드에 영구 이전 세션 기록 ${Number(plan.unrecoverablePermanentHistory || 0)}개가 포함됐을 가능성이 있어 자동 전체 재구축을 차단했습니다. 현재 세션 원문만으로는 해당 기록을 복원할 수 없으며 기존 저장소는 변경하지 않았습니다.`);
+      error.code = 'FLASHBACK_REBUILD_PROTECTED_HISTORY_MISSING';
+      error.expectedPermanentHistory = Number(plan.expectedPermanentHistory || 0);
+      error.readablePermanentHistory = Number(plan.readablePermanentHistory || 0);
+      error.missingShardIndexes = Array.isArray(plan.missingShardIndexes) ? plan.missingShardIndexes.slice() : [];
+    } else if (text(plan.storageForeignScopeKey || '').trim() || strategy === 'scope_collision') {
+      error = new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.');
+      error.code = 'FLASHBACK_STORAGE_SCOPE_COLLISION';
+      error.foreignScopeKey = text(plan.storageForeignScopeKey || '');
+    } else if (strategy === 'live_source_required') {
+      error = new Error('복구에 필요한 현재 채팅 원문을 찾지 못했습니다. 원문이 남아 있는 해당 채팅을 연 뒤 다시 실행해 주세요. 기존 저장소는 변경하지 않았습니다.');
+      error.code = 'FLASHBACK_LIVE_SOURCE_REQUIRED';
+    } else if (strategy === 'credential_required' || plan.embeddingCredentialMissing === true) {
+      error = new Error(`현재 ${settings?.embeddingProvider || '원격'} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`);
+      error.code = 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED';
+    } else {
+      error = new Error('자동 유지보수 안전 조건을 충족하지 못해 작업을 차단했습니다. 기존 저장소는 변경하지 않았습니다.');
+      error.code = 'FLASHBACK_MAINTENANCE_BLOCKED';
+    }
+    error.scopeKey = text(plan.scopeKey || '');
+    error.maintenanceStrategy = strategy;
+    return error;
+  };
+
+  const criticalMaintenanceVerificationError = (plan = {}) => {
+    if (plan.storageManifestCorrupt === true) return maintenanceBlockedErrorForPlan(DEFAULTS, plan, { strategy: 'manifest_corrupt_manual_recovery' });
+    if (text(plan.storageForeignScopeKey || '').trim()) return maintenanceBlockedErrorForPlan(DEFAULTS, plan, { strategy: 'scope_collision' });
+    if (Number(plan.storageMissingShards || 0) > 0 || Number(plan.storageCorruptShards || 0) > 0 || plan.storageRecordCountMismatch === true) {
+      const error = new Error(`유지보수 후 활성 저장소 검증에 실패했습니다: 누락 샤드 ${Number(plan.storageMissingShards || 0)}, 손상 샤드 ${Number(plan.storageCorruptShards || 0)}, 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'}`);
+      error.code = 'FLASHBACK_MAINTENANCE_DURABLE_VERIFY_FAILED';
+      error.scopeKey = text(plan.scopeKey || '');
+      error.missingShardIndexes = Array.isArray(plan.missingShardIndexes) ? plan.missingShardIndexes.slice() : [];
+      error.corruptShardIndexes = Array.isArray(plan.corruptShardIndexes) ? plan.corruptShardIndexes.slice() : [];
+      return error;
+    }
+    if (plan.archiveIntegrityPresent === true && plan.archiveIntegrityVerified !== true) {
+      return maintenanceBlockedErrorForPlan(DEFAULTS, plan, { strategy: 'archive_integrity_failed', reason: plan.archiveIntegrityReason });
+    }
+    if (Number(plan.unrecoverablePermanentHistory || 0) > 0) {
+      return maintenanceBlockedErrorForPlan(DEFAULTS, plan, { strategy: 'protected_history_missing' });
+    }
+    return null;
+  };
+
   const runMemoryMaintenance = async (mode = 'auto', options = {}) => {
     if (Runtime.maintenanceActiveOperationId) {
       const error = new Error('이미 기억 유지보수가 실행 중입니다. 현재 작업이 끝난 뒤 다시 시도해 주세요.');
@@ -22806,7 +23829,7 @@ ${cleanedText}`, 80),
       maintenanceMode: normalizedMode,
       operationId
     }, 'info');
-    const before = preflight?.scopeKey
+    const displayedPlan = preflight?.scopeKey
       ? preflight
       : await inspectMemoryMaintenance({
         requestPermission: true,
@@ -22814,14 +23837,46 @@ ${cleanedText}`, 80),
         snapshot: sharedSnapshot || undefined,
         scope: sharedScope || undefined
       });
-    const planContext = before?._maintenanceContext && typeof before._maintenanceContext === 'object'
+    const displayedContext = displayedPlan?._maintenanceContext && typeof displayedPlan._maintenanceContext === 'object'
+      ? displayedPlan._maintenanceContext
+      : {};
+    const settings = normalizeSettings(displayedContext.settings || sharedSettings || await loadSettings(true));
+    const snapshot = displayedContext.snapshot || sharedSnapshot || undefined;
+    const scope = displayedContext.scope?.scopeKey ? displayedContext.scope : sharedScope;
+    // A confirmation dialog may stay open while storage or the archive changes. Re-run
+    // the read-only inspection immediately before the credential probe/mutation and use
+    // the fresh plan as the sole authority.
+    const before = preflight?.scopeKey
+      ? await inspectMemoryMaintenance({
+        requestPermission: false,
+        settings,
+        snapshot,
+        scope: scope || undefined,
+        ensureStorage: false
+      })
+      : displayedPlan;
+    const freshContext = before?._maintenanceContext && typeof before._maintenanceContext === 'object'
       ? before._maintenanceContext
       : {};
-    const settings = normalizeSettings(planContext.settings || sharedSettings || await loadSettings(true));
-    const snapshot = planContext.snapshot || sharedSnapshot || undefined;
-    const scope = planContext.scope?.scopeKey ? planContext.scope : sharedScope;
+    const operationSnapshot = freshContext.snapshot || snapshot || undefined;
+    const operationScope = freshContext.scope?.scopeKey ? freshContext.scope : scope;
+    const automatic = before.automatic || automaticMaintenanceStrategyForPlan(before);
+    // Integrity/scope/live-source blocks are authoritative and must be evaluated
+    // before any one-vector provider probe. Credential-only blocking remains the
+    // responsibility of requireMaintenanceEmbeddingCredential().
+    if (automatic.blocked && automatic.strategy !== 'credential_required') {
+      throw maintenanceBlockedErrorForPlan(settings, before, automatic);
+    }
+    if (['sync', 'reembed'].includes(normalizedMode) && before.requiresFullRebuild === true) {
+      const error = new Error('현재 저장소는 전체 재구축이 필요한 상태이므로 선택한 고급 작업을 먼저 실행할 수 없습니다. 자동 점검·복구 또는 현재 채팅 전체 재구축을 사용해 주세요. 기존 저장소는 변경하지 않았습니다.');
+      error.code = 'FLASHBACK_MAINTENANCE_MODE_REQUIRES_REBUILD';
+      error.scopeKey = text(before.scopeKey || '');
+      error.requestedMode = normalizedMode;
+      throw error;
+    }
     const embeddingPreflight = await requireMaintenanceEmbeddingCredential(settings, before, normalizedMode);
-    const operationSettings = { settings, snapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync', allowHashFallback: false };
+    if (automatic.blocked) throw maintenanceBlockedErrorForPlan(settings, before, automatic);
+    const operationSettings = { settings, snapshot: operationSnapshot, maintenanceOperationId: operationId, activityKind: 'maintenance_sync', allowHashFallback: false };
     await persistMaintenanceJournal({
       operationId,
       status: 'running',
@@ -22831,7 +23886,9 @@ ${cleanedText}`, 80),
       stages: before.automatic?.stages || [],
       progress: {
         sources: before.liveTurns,
-        chunks: before.estimatedEmbeddingChunks,
+        chunks: normalizedMode === 'rebuild'
+          ? Number(before.rebuildEstimatedNewEmbeddingVectors || 0)
+          : (normalizedMode === 'reembed' ? Number(before.responseRecords || 0) : Number(before.estimatedEmbeddingChunks || 0)),
         embeddedBatches: 0,
         embeddedChunks: 0,
         savedShards: 0
@@ -22848,21 +23905,8 @@ ${cleanedText}`, 80),
       operation = await rebuildCurrentChatMemory(rebuildOptions);
       } else if (normalizedMode === 'reembed') {
         await persistMaintenanceJournal({ operationId, status: 'running', stage: 'reembed', scopeKey: before.scopeKey || '', strategy: 'reembed', stages: ['reembed'] });
-        operation = await reembedAllRecords({ settings, scope, maintenanceOperationId: operationId, allowHashFallback: false });
+        operation = await reembedAllRecords({ settings, scope: operationScope, maintenanceOperationId: operationId, allowHashFallback: false });
     } else {
-      const automatic = before.automatic || automaticMaintenanceStrategyForPlan(before);
-      if (automatic.blocked) {
-        const credentialBlocked = automatic.strategy === 'credential_required' || before.embeddingCredentialMissing === true;
-        const error = credentialBlocked
-          ? new Error(`현재 ${settings?.embeddingProvider || '원격'} 임베딩 API 키 또는 액세스 토큰이 없습니다. 기존 벡터는 변경하지 않았습니다. 키를 저장한 뒤 다시 실행해 주세요.`)
-          : (before.storageForeignScopeKey
-            ? new Error('저장 키가 다른 채팅 범위와 충돌하여 자동 복구를 안전하게 실행할 수 없습니다. 다른 범위의 데이터는 변경되지 않았습니다.')
-            : new Error('구형 정제기로 저장된 기억을 복구하려면 원문이 남아 있는 현재 채팅을 먼저 열어야 합니다.'));
-        error.code = credentialBlocked ? 'FLASHBACK_EMBEDDING_CREDENTIAL_REQUIRED' : (before.storageForeignScopeKey ? 'FLASHBACK_STORAGE_SCOPE_COLLISION' : 'FLASHBACK_LIVE_SOURCE_REQUIRED');
-        error.scopeKey = before.scopeKey || '';
-        if (before.storageForeignScopeKey) error.foreignScopeKey = before.storageForeignScopeKey;
-        throw error;
-      }
       const needsSync = automatic.stages.includes('sync');
       const needsVectorRepair = automatic.stages.includes('reembed');
       const needsCleanup = automatic.stages.includes('cleanup');
@@ -22906,7 +23950,7 @@ ${cleanedText}`, 80),
           await persistMaintenanceJournal({ operationId, status: 'running', stage: 'cleanup', scopeKey: before.scopeKey || '', strategy: 'targeted_repair', stages });
           cleanup = await cleanAndReembedAllRecords(null, {
             settings,
-            scope,
+            scope: operationScope,
             retireExternal: true,
             rebuildEpisodes: true,
             forceEpisodeRebuild: needsSync || needsVectorRepair || before.episodeStale || before.shardIndexMismatch,
@@ -22928,10 +23972,22 @@ ${cleanedText}`, 80),
     const after = await inspectMemoryMaintenance({
       requestPermission: false,
       settings,
-      snapshot,
-      scope,
+      snapshot: operationSnapshot,
+      scope: operationScope,
       ensureStorage: false
     });
+    const criticalVerificationError = criticalMaintenanceVerificationError(after);
+    if (criticalVerificationError) throw criticalVerificationError;
+    if (text(before.archiveIntegrityFingerprint || '')
+      && text(after.archiveIntegrityFingerprint || '')
+      && text(before.archiveIntegrityFingerprint || '') !== text(after.archiveIntegrityFingerprint || '')) {
+      const error = new Error('유지보수 중 불변 이전 세션 아카이브 참조 또는 내용이 변경되어 완료 처리를 차단했습니다. 로컬 유지보수 결과는 검증 가능하지만 아카이브 계보를 다시 확인해야 합니다.');
+      error.code = 'FLASHBACK_ARCHIVE_CHANGED_DURING_MAINTENANCE';
+      error.scopeKey = text(after.scopeKey || before.scopeKey || '');
+      error.beforeArchiveFingerprint = text(before.archiveIntegrityFingerprint || '');
+      error.afterArchiveFingerprint = text(after.archiveIntegrityFingerprint || '');
+      throw error;
+    }
     const completedAt = Date.now();
     const operationTotals = maintenanceOperationTotals(operation);
     const result = {
@@ -23046,7 +24102,10 @@ ${cleanedText}`, 80),
       full_rebuild: '현재 채팅 전체 재구축',
       live_source_required: '현재 채팅 원문 필요',
       scope_collision: '저장 범위 충돌 — 자동 변경 차단',
-      credential_required: '임베딩 API 키 필요 — 기존 벡터 보존'
+      credential_required: '임베딩 API 키 필요 — 기존 벡터 보존',
+      protected_history_missing: '영구 이전 세션 기록 보호 — 자동 변경 차단',
+      manifest_corrupt_manual_recovery: '매니페스트 손상 — 수동 복구 필요',
+      archive_integrity_failed: '이전 세션 아카이브 이상 — 자동 변경 차단'
     };
     const stageLabels = {
       sync: '누락·변경 동기화',
@@ -23059,6 +24118,27 @@ ${cleanedText}`, 80),
     return `${labels[automatic.strategy] || automatic.strategy || '-'}${stages.length ? ` (${stages.join(' → ')})` : ''}`;
   };
 
+  const maintenanceArchiveStatusText = (plan = {}) => {
+    if (plan.storageManifestCorrupt) return '검사 불가 · 활성 매니페스트 손상으로 archiveRef를 신뢰할 수 없음';
+    if (plan.storageArchiveRefInvalid) return '이상 · archiveRef 형식 손상 · 자동 변경 차단';
+    if (plan.archiveIntegrityPresent !== true) return '없음';
+    if (plan.archiveIntegrityVerified === true) {
+      return `정상 · ${formatNumber(plan.archiveIntegrityLayers)}계층 · ${formatNumber(plan.archiveIntegrityRecords)}개 기록`;
+    }
+    return `이상 · ${text(plan.archiveIntegrityReason || 'archive_integrity_mismatch')} · 누락 샤드 ${formatNumber(plan.archiveIntegrityMissingShards)} · 손상 샤드 ${formatNumber(plan.archiveIntegrityCorruptShards)} · 벡터 payload 누락 ${formatNumber(plan.archiveIntegrityMissingVectorPayloads)}`;
+  };
+
+  const maintenanceJudgementText = (plan = {}) => {
+    if (plan.healthy) return '판정: 현재 데이터가 정상입니다.';
+    if (plan.storageManifestCorrupt) return '판정: 매니페스트가 손상되어 자동 재구축을 가장하지 않고 수동 복구가 필요합니다.';
+    if (plan.storageArchiveRefInvalid) return '판정: 이전 세션 archiveRef 형식이 손상되어 모든 자동 변경을 차단했습니다.';
+    if (plan.archiveIntegrityPresent === true && plan.archiveIntegrityVerified !== true) return '판정: 이전 세션 아카이브 보호를 위해 모든 자동 변경을 차단했습니다.';
+    if (plan.embeddingCredentialMissing) return '판정: 임베딩 키가 없어 기존 벡터를 보존하고 자동 복구를 차단했습니다.';
+    if (plan.unrecoverablePermanentHistory) return '판정: 누락 샤드에 영구 이전 세션 기록이 포함됐을 가능성이 있어 자동 변경을 차단했습니다.';
+    if (plan.storageForeignScopeKey) return '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.';
+    return '판정: 자동 점검·복구로 정리할 항목이 있습니다.';
+  };
+
   const maintenancePlanText = (plan = {}) => [
     `현재 채팅 턴 ${formatNumber(plan.liveTurns)}개 · 저장 턴 ${formatNumber(plan.storedTurns)}개`,
     `누락 ${formatNumber(plan.missingTurns)} · 변경 ${formatNumber(plan.changedTurns)} · 오래된/고아 ${formatNumber(plan.staleStoredTurns)}`,
@@ -23066,27 +24146,33 @@ ${cleanedText}`, 80),
     `정제기 버전 불일치 ${formatNumber(plan.sanitizerVersionMismatch)}${plan.requiresFullRebuild ? ' · 전체 재구축 필요' : ''}`,
     `문장 청크 v${formatNumber(plan.narrativeChunkSchemaVersion || NARRATIVE_CHUNK_SCHEMA_VERSION)} · 현재 채팅 구형 청크 ${formatNumber(plan.liveChunkSchemaMismatch)} · 인계 기록 구형 청크 ${formatNumber(plan.inheritedChunkSchemaMismatch)}`,
     `리콜 샤드 인덱스 v${formatNumber(plan.shardIndexVersion)} / v${formatNumber(plan.shardIndexExpectedVersion || FLASHBACK_SHARD_INDEX_VERSION)} · ${plan.shardIndexMismatch ? '재구축 필요' : '정상'}`,
-    `저장 무결성: 매니페스트 ${plan.storageManifestCorrupt ? '손상' : '정상'} · 누락 샤드 ${formatNumber(plan.storageMissingShards)} · 손상 샤드 ${formatNumber(plan.storageCorruptShards)} · 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'} · 범위 충돌 ${plan.storageForeignScopeKey ? '예' : '아니오'}`,
+    `저장 무결성: 매니페스트 ${plan.storageManifestCorrupt ? '손상' : '정상'} · archiveRef ${plan.storageArchiveRefInvalid ? '손상' : '정상'} · 누락 샤드 ${formatNumber(plan.storageMissingShards)}${Array.isArray(plan.missingShardIndexes) && plan.missingShardIndexes.length ? ` [${plan.missingShardIndexes.join(', ')}]` : ''} · 손상 샤드 ${formatNumber(plan.storageCorruptShards)} · 개수 불일치 ${plan.storageRecordCountMismatch ? '예' : '아니오'} · 범위 충돌 ${plan.storageForeignScopeKey ? '예' : '아니오'}`,
+    `영구 이전 세션 기록: 기대 ${formatNumber(plan.expectedPermanentHistory)} · 읽기 가능 ${formatNumber(plan.readablePermanentHistory)} · 복원 불가 가능성 ${formatNumber(plan.unrecoverablePermanentHistory)}`,
+    `이전 세션 아카이브: ${maintenanceArchiveStatusText(plan)}`,
     `벡터 복구 ${formatNumber(plan.recordsNeedingEmbedding)} · 프로바이더 불일치 ${formatNumber(plan.providerMismatch)}`,
     `임베딩 키 ${plan.embeddingCredentialRequired ? (plan.embeddingCredential?.present ? `확인됨 · ${plan.embeddingCredential?.durableAcrossUpdate ? '업데이트 보존 경로 있음' : '현재 기기 전용'}` : (plan.embeddingWorkPending ? '없음 · 원격 복구 차단' : '없음 · 현재 기억 데이터는 유지')) : '필요 없음'}`,
     `에피소드 인덱스 ${plan.episodeStale ? '갱신 필요' : '정상'}`,
     `자동 복구 경로: ${maintenanceStrategyText(plan.automatic)}`,
-    `예상 임베딩 ${formatNumber(plan.estimatedEmbeddingChunks)}개 / ${formatNumber(plan.estimatedEmbeddingTokens)} tokens / ${formatCostSummary(plan.embeddingCost)}`,
-    plan.healthy
-      ? '판정: 현재 데이터가 정상입니다.'
-      : (plan.embeddingCredentialMissing
-        ? '판정: 임베딩 키가 없어 기존 벡터를 보존하고 자동 복구를 차단했습니다.'
-        : (plan.storageForeignScopeKey ? '판정: 다른 채팅 데이터 보호를 위해 자동 변경을 차단했습니다.' : '판정: 자동 점검·복구로 정리할 항목이 있습니다.'))
+    plan.requiresFullRebuild
+      ? `전체 재구축 청크 ${formatNumber(plan.rebuildTotalChunks)}개 · 기존 벡터 재사용 예상 ${formatNumber(plan.estimatedReusableVectors)}개 · 신규 임베딩 예상 ${formatNumber(plan.rebuildEstimatedNewEmbeddingVectors)}개 / ${formatNumber(plan.rebuildEstimatedEmbeddingTokens)} tokens / ${formatCostSummary(plan.rebuildEmbeddingCost)}`
+      : `신규 임베딩 예상 ${formatNumber(plan.estimatedEmbeddingChunks)}개 / ${formatNumber(plan.estimatedEmbeddingTokens)} tokens / ${formatCostSummary(plan.embeddingCost)}`,
+    maintenanceJudgementText(plan)
   ].join('\n');
 
-  const maintenanceResultText = (result = {}) => [
+  const maintenanceResultText = (result = {}) => {
+    const totals = maintenanceOperationTotals(result.operation || {});
+    return [
     `기억 유지보수 완료 · 모드 ${result.maintenanceMode || '-'}`,
     `작업 ID: ${result.operationId || '-'} · 소요 ${formatNumber(Math.round(Number(result.durationMs || 0) / 1000))}초`,
     `자동 전략: ${result.operation?.strategy || result.maintenanceMode || '-'}`,
+    `활성 샤드 복구: ${formatNumber(result.operation?.recoveredMissingShards || result.operation?.rebuild?.recoveredMissingShards || 0)}개${Array.isArray(result.operation?.recoveredMissingShardIndexes || result.operation?.rebuild?.recoveredMissingShardIndexes) && (result.operation?.recoveredMissingShardIndexes || result.operation?.rebuild?.recoveredMissingShardIndexes).length ? ` [${(result.operation?.recoveredMissingShardIndexes || result.operation?.rebuild?.recoveredMissingShardIndexes).join(', ')}]` : ''}`,
     `이전: 누락 ${formatNumber(result.before?.missingTurns)} · 변경 ${formatNumber(result.before?.changedTurns)} · 정제 ${formatNumber(result.before?.dirtyRecords)} · 벡터 ${formatNumber(result.before?.recordsNeedingEmbedding)}`,
     `현재: 누락 ${formatNumber(result.after?.missingTurns)} · 변경 ${formatNumber(result.after?.changedTurns)} · 정제 ${formatNumber(result.after?.dirtyRecords)} · 정제기 불일치 ${formatNumber(result.after?.sanitizerVersionMismatch)} · 벡터 ${formatNumber(result.after?.recordsNeedingEmbedding)}`,
+    `벡터 작업: 기존 재사용 ${formatNumber(totals.reusedVectors)} · 신규 임베딩 ${formatNumber(totals.embeddedVectors)} · 배치 ${formatNumber(totals.embeddedBatches)}`,
+    `이전 세션 아카이브: ${maintenanceArchiveStatusText(result.after || {})}`,
     result.healthy ? '최종 판정: 정상' : '최종 판정: 추가 확인 필요'
   ].join('\n');
+  };
 
   const renderCostLine = (label, cost, emptyText = '아직 없음') => {
     if (!cost || typeof cost !== 'object' || !Number(cost.tokens || 0)) {
@@ -26032,6 +27118,12 @@ ${cleanedText}`, 80),
     clearActivityLog,
     _test: { pushActivityLog, activityLogSnapshot, normalizeMaintenanceJournal, hashEmbedding, splitTextIntoChunks, reconstructChunkGroupText, lexicalOverlap, buildSparseFieldsForRecord, sparseProjectionForRecord, scoreBm25fCandidates, reciprocalRankFusion, classifyTemporalIntent, classifyTruthIntent, applyRecallHardGates, applyRecallTemporalHardGate, resolveRecallLane, recallLaneLimits, computeMemoryHeat, buildCurrentUserStateOverlay, generateRecallCandidateArms, selectRecallByLanes, ensureRecallIntentCoverage, collectLiveStructuredStateFacts, extractLatestUserInput, resolveFlashbackCurrentTurn, latestFlashbackCurrentInputRange, hasFlashbackChatProvenance, latestFlashbackProvenanceUserTurn, hasUnresolvedPromptTemplate, findFlashbackTerminalAssistantPrefillIndex, isLikelyMetaUserMessage, stripNestedThoughtBlocks, lastVisibleResponseBoundary, stripExternalRuntimeArtifacts, stripSourceArtifacts, formatRecallBlock, formatFlashbackDynamicEvidenceBlock, buildFlashbackStaticEvidenceContract, flashbackStaticProfileId, injectFlashbackMessages, findStableSystemPrefixEnd, getCachedQueryEmbedding, queryEmbeddingCacheKey, invalidateQueryEmbeddingCache, normalizeQueryForEmbeddingCache, estimateTokens, embeddingPricingFor, estimateEmbeddingCostForTokens, estimateEmbeddingCostForRecords, statsForRecords, debugRecords: debugRecordsSnapshot, normalizeSettings, repairZeroInitializedSettings, readArgumentSettings, applyArgumentOverrides, settingsOverrideDiff, readEmbeddingKey, saveEmbeddingKeyLocal, saveEmbeddingCredential, inspectEmbeddingKeyPersistence, setPluginArgumentValue, embeddingArgumentBackendState, embeddingSyncedBackendState, embeddingLocalBackendState, selectEmbeddingCredential, providerRequiresEmbeddingCredential, maintenanceEmbeddingWorkRequested, requireMaintenanceEmbeddingCredential, embedTexts, inspectLastEmbedFallback: () => Runtime.lastEmbedUsedFallback === true, normalizeStoredChatMessages, liveChatStateFromNormalized, liveChatStateFromResponseGroups, changedConversationPairIndexes, collectLiveChatSourcesFromSnapshot, diffLiveChatSourcesAgainstRecords, sameMaintenanceTurnText, recordMemorySanitizerVersion, recordNeedsLiveSanitizerRebuild, automaticMaintenanceStrategyForPlan, classifyRequestType, flashbackModelMainRequestEvidence, requestKindCore: FlashbackRequestKindCore, classifyRecallQuery, adaptiveRecallProfile, previousTurnRecallProfile, buildDiscriminativeRecallAnchors, selectDiverseRecall, applyRecallQualityBalance, compareRecallItemsFinal, buildRecallQuery, computeImportanceDensity, extractEntityAnchors, buildLatestStateByEntity, applyCurrentUserOverlaySuppressions, collectCurrentStateFacts, structuredStateFactsFromMetadata, extractQueryStateProperties, buildRecallShardSummary, selectRecallShardIndexes, previousTurnSourceShardIndexes, detectEpisodeBoundaries, buildEpisodeIndexRecords, sanitizeAssistantForMemory, extractMemoryMetadata, cleanRecordForMemory, collectCurrentSceneTailCandidates, collectEntityFocusedCandidates, applyPerSourceDiversityLimit, injectMessage, finalizedAssistantCandidate, finalizedAssistantMatchesPendingBaselineVariant, serializePendingCaptureJournalEntry, normalizePendingCaptureJournalEnvelope, persistPendingCaptureJournalEntry, loadPendingCaptureJournalEntries, recoverPendingCapturesFromJournal, finiteTurnIndex, latestResponseTurnIndex, latestLiveResponseTurnIndex, computeStoryRecency, storyOrderValue, buildRecentResponseRanks, buildStoredTurnVectorGroups, selectPreviousTurnVectorContext, recallSemanticSignals, manualRecordDeleteKey, manualEditorShardIndexes, currentScopeStats, isGuiRenderActive, maybeScheduleConversationDriftCheck, isRetainedMemoryRecord, isPermanentSessionHistoryRecord, isInheritedScopeMemoryRecord, normalizeInheritedScopeRecordForActiveHistory, memorySessionBridgeMarker, resolveScopeFromSnapshot, sameCharacterChatIdentity, findSameChatPersonaScopeSource, findCloneSource, rebindRecordForSameChatPersonaRecovery, cloneRecordForNativeChatCopy, liveRecordForNativeChatCopy, repairMisclassifiedNativeCopyScope, cloneScopeStorage, ensureScopeStorageReady, ensureFlashbackArchiveForHandoff, createImmutableFlashbackHandoffArchive, archiveAndCompactFlashbackSourceScope, flashbackSourceIntegritySnapshot, compareFlashbackSourceIntegrity, restoreLegacyCompactedSourceScope, readFlashbackHandoffLedger, writeFlashbackHandoffReceipt, verifyFlashbackArchiveRef, loadFlashbackArchiveChain, loadFlashbackArchiveManifestSummary, normalizeFlashbackArchiveRef, flashbackArchiveRecordIdentity, loadScopeManifest, saveScopeManifest, buildFlashbackVectorShardPayload, hydrateFlashbackVectorRecords, persistFlashbackVectorShard, encodeFlashbackShardEnvelope, decodeFlashbackShardEnvelope, flashbackArchiveGzipSupported, retireExternalRecordsForScope, reconcileFlashbackTurnWorldline, debugWorldlineSnapshot, flashbackPairIdentity, flashbackLiveWorldlineHash, responseGroupsForWorldline, protectPendingGenerationWorldlineTarget, prepareFlashbackWorldlineReplacement, synchronizeFlashbackTurnWorldline, loadTurnWorldline, loadScopeRecords, loadScopeRecordsForRecall, invalidateRecallShardCache, saveAllRecords, pendingThresholds: Object.freeze({ fallbackMinOverlap: PENDING_FALLBACK_MIN_OVERLAP, shortMarkedFallbackMinOverlap: PENDING_SHORT_MARKED_FALLBACK_MIN_OVERLAP, shortLatestScoreSlack: PENDING_SHORT_LATEST_SCORE_SLACK, shortUnconfirmedGraceMs: PENDING_SHORT_UNCONFIRMED_GRACE_MS, singleShortZeroOverlapMs: PENDING_SINGLE_SHORT_ZERO_OVERLAP_MS }) }
   });
+  publicApi._test.inspectFlashbackVectorPayloadMetadata = inspectFlashbackVectorPayloadMetadata;
+  publicApi._test.inspectFlashbackArchiveIntegrityForMaintenance = inspectFlashbackArchiveIntegrityForMaintenance;
+  publicApi._test.estimateFullRebuildVectorReuse = estimateFullRebuildVectorReuse;
+  publicApi._test.maintenanceBlockedErrorForPlan = maintenanceBlockedErrorForPlan;
+  publicApi._test.criticalMaintenanceVerificationError = criticalMaintenanceVerificationError;
+  publicApi._test.fullRebuildStorageState = fullRebuildStorageState;
   publicApi._test.resolvePendingCaptureJournalMode = resolvePendingCaptureJournalMode;
   publicApi._test.finalizedCaptureMonitorExpiry = finalizedCaptureMonitorExpiry;
   publicApi._test.markFinalizedCaptureResponseComplete = markFinalizedCaptureResponseComplete;
